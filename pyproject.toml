@@ -1,0 +1,233 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quantflow"
+version = "0.1.0"
+description = "AI-powered algorithmic trading platform for Binance"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "QuantFlow Engineering" }]
+
+dependencies = [
+  # --- Web / API ---
+  "fastapi>=0.115.0",
+  "uvicorn[standard]>=0.32.0",
+  "pydantic>=2.9.0",
+  "pydantic-settings>=2.6.0",
+  "python-multipart>=0.0.12",
+  # --- Persistence ---
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30.0",
+  "psycopg[binary]>=3.2.3",
+  "alembic>=1.14.0",
+  # --- Cache / queue ---
+  "redis[hiredis]>=5.2.0",
+  # --- Exchange ---
+  "ccxt>=4.4.30",
+  "websockets>=13.1",
+  "httpx>=0.27.2",
+  # --- Data ---
+  "pandas>=2.2.3",
+  "numpy>=1.26.4,<3",
+  "polars>=1.14.0",
+  "pyarrow>=18.0.0",
+  # --- Reporting ---
+  "plotly>=5.24.1",
+  "jinja2>=3.1.4",
+  # --- Cross-cutting ---
+  "structlog>=24.4.0",
+  "orjson>=3.10.11",
+  "tenacity>=9.0.0",
+  "typer>=0.13.0",
+  "rich>=13.9.0",
+  "prometheus-client>=0.21.0",
+  "apscheduler>=3.10.4",
+  "python-dateutil>=2.9.0",
+]
+
+[project.optional-dependencies]
+# Research / optimisation extras. Kept out of the runtime image so the
+# production container stays small and the dependency graph stays resolvable.
+ai = [
+  "optuna>=4.1.0",
+  "scikit-learn>=1.5.2",
+  "scipy>=1.14.1",
+  "joblib>=1.4.2",
+]
+# Third-party backtesting frameworks. Pinned loosely and isolated because both
+# libraries carry heavy, frequently-conflicting transitive pins.
+research = [
+  "vectorbt>=0.27.2",
+  "backtrader>=1.9.78.123",
+]
+dev = [
+  "pytest>=8.3.3",
+  "pytest-asyncio>=0.24.0",
+  "pytest-cov>=6.0.0",
+  "pytest-randomly>=3.16.0",
+  "hypothesis>=6.119.0",
+  "respx>=0.21.1",
+  "freezegun>=1.5.1",
+  "ruff>=0.8.0",
+  "black>=24.10.0",
+  "mypy>=1.13.0",
+  "types-python-dateutil>=2.9.0",
+  "pandas-stubs>=2.2.3",
+  "fakeredis>=2.26.1",
+  "anyio>=4.6.2",
+]
+
+[project.scripts]
+quantflow = "quantflow.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quantflow"]
+
+# --------------------------------------------------------------------------- #
+# Ruff
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",    # pycodestyle
+  "F",         # pyflakes
+  "I",         # isort
+  "N",         # pep8-naming
+  "UP",        # pyupgrade
+  "B",         # bugbear
+  "C4",        # comprehensions
+  "DTZ",       # timezone-aware datetimes (critical for trading)
+  "T20",       # no print
+  "PT",        # pytest style
+  "RET",       # return simplification
+  "SIM",       # simplify
+  "ARG",       # unused arguments
+  "PTH",       # pathlib
+  "ERA",       # commented-out code
+  "PL",        # pylint
+  "TRY",       # exception anti-patterns
+  "RUF",
+  "ASYNC",     # async anti-patterns
+  "S",         # bandit security
+  "D",         # docstrings
+]
+ignore = [
+  "D100",    # module docstring optional on private modules
+  "D104",    # package docstring optional
+  "D105",    # magic methods — behaviour is documented on the class
+  "D107",    # __init__ docstring (documented on the class)
+  "D203",    # conflicts with D211
+  "D213",    # conflicts with D212
+  "D401",    # imperative mood — property docstrings are naturally noun phrases
+  "D407",    # dashed underline after section (Google style, not numpy)
+  "PLC0415", # local imports are used deliberately to break import cycles
+  "PLR0913", # argument count — DI constructors legitimately take many
+  "TRY003",  # long messages outside exception class
+  "S101",    # assert (used in tests and internal invariants)
+  "RUF002",  # en/em dashes are intentional in prose docstrings
+  "RUF003",  # ... and in comments
+  "COM812",  # conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "PLR2004", "S105", "S106", "ARG001", "ARG002", "PLR0915"]
+"src/quantflow/cli/**" = ["T20", "B008"]
+"src/quantflow/api/**" = ["B008"]  # FastAPI Depends() in defaults is the idiom
+"scripts/**" = ["T20", "D"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["quantflow"]
+
+[tool.ruff.lint.pylint]
+max-args = 10
+
+# --------------------------------------------------------------------------- #
+# Black
+# --------------------------------------------------------------------------- #
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+extend-exclude = "migrations/versions"
+
+# --------------------------------------------------------------------------- #
+# Mypy — strict
+# --------------------------------------------------------------------------- #
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+strict = true
+warn_unreachable = true
+warn_no_return = true
+disallow_any_generics = true
+disallow_untyped_defs = true
+no_implicit_reexport = true
+show_error_codes = true
+pretty = true
+plugins = ["pydantic.mypy"]
+exclude = ["migrations/versions", "^build/"]
+
+[[tool.mypy.overrides]]
+module = [
+  "ccxt.*", "plotly.*", "vectorbt.*", "backtrader.*", "optuna.*",
+  "sklearn.*", "scipy.*", "apscheduler.*", "fakeredis.*", "hiredis.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = true
+disable_error_code = ["no-untyped-def"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+# --------------------------------------------------------------------------- #
+# Pytest
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = [
+  "--strict-markers",
+  "--strict-config",
+  "-ra",
+  "--import-mode=importlib",
+]
+markers = [
+  "integration: requires Postgres/Redis (docker compose up db redis)",
+  "network: hits a live external endpoint; excluded from CI",
+  "slow: long-running test",
+]
+filterwarnings = [
+  "error",
+  "ignore::DeprecationWarning:pkg_resources.*",
+  "ignore::DeprecationWarning:pandas.*",
+]
+
+[tool.coverage.run]
+source = ["src/quantflow"]
+branch = true
+omit = ["*/migrations/*", "*/__main__.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@(abc\\.)?abstractmethod",
+  "class .*\\(Protocol\\):",
+]
