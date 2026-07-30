@@ -1,0 +1,144 @@
+name: quantflow
+
+x-app-env: &app-env
+  QF_ENV: ${QF_ENV:-development}
+  QF_LOG_FORMAT: ${QF_LOG_FORMAT:-json}
+  QF_LOG_LEVEL: ${QF_LOG_LEVEL:-INFO}
+  QF_DATABASE__HOST: db
+  QF_DATABASE__PORT: 5432
+  QF_DATABASE__USER: ${QF_DATABASE__USER:-quantflow}
+  QF_DATABASE__PASSWORD: ${QF_DATABASE__PASSWORD:-quantflow}
+  QF_DATABASE__NAME: ${QF_DATABASE__NAME:-quantflow}
+  QF_REDIS__HOST: redis
+  QF_REDIS__PORT: 6379
+  QF_STORAGE__DATA_DIR: /app/data
+  QF_STORAGE__REPORT_DIR: /app/reports
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  image: quantflow:local
+  env_file:
+    - path: .env
+      required: false
+  environment: *app-env
+  volumes:
+    - qf-data:/app/data
+    - qf-reports:/app/reports
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  # TimescaleDB is a Postgres extension, so this is a drop-in Postgres 16 that
+  # additionally allows the candles table to become a hypertable.
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_USER: ${QF_DATABASE__USER:-quantflow}
+      POSTGRES_PASSWORD: ${QF_DATABASE__PASSWORD:-quantflow}
+      POSTGRES_DB: ${QF_DATABASE__NAME:-quantflow}
+      # Sensible defaults for a time-series workload on a developer machine.
+      TIMESCALEDB_TELEMETRY: "off"
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=16MB
+    ports:
+      - "${QF_DB_PORT:-5432}:5432"
+    volumes:
+      - qf-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${QF_DATABASE__USER:-quantflow} -d ${QF_DATABASE__NAME:-quantflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "512mb"
+      # Never evict: this Redis holds locks and the live event bus, and silently
+      # dropping a lock key under memory pressure would be a correctness bug.
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "${QF_REDIS_PORT:-6379}:6379"
+    volumes:
+      - qf-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    <<: *app-base
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app-base
+    command:
+      - uvicorn
+      - quantflow.api.app:create_app
+      - --factory
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --no-access-log
+    ports:
+      - "${QF_API_HOST_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    <<: *app-base
+    command: ["python", "-m", "quantflow.workers.runner"]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+
+volumes:
+  qf-postgres:
+  qf-redis:
+  qf-data:
+  qf-reports:
