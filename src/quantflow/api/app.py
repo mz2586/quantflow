@@ -19,10 +19,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from quantflow import __version__
 from quantflow.api import middleware
 from quantflow.api.deps import AppState
-from quantflow.api.routers import backtest, marketdata, portfolio, risk, system
+from quantflow.api.routers import analytics, backtest, marketdata, portfolio, risk, system
 from quantflow.cache.redis import Cache, EventBus
 from quantflow.core.config import Settings, get_settings
 from quantflow.core.logging import configure_logging, get_logger
+from quantflow.notifications.dispatcher import build_dispatcher
 from quantflow.persistence.database import Database
 from quantflow.risk.engine import RiskEngine
 from quantflow.strategy.registry import load_builtin_strategies
@@ -73,7 +74,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("startup.redis_failed", error=str(exc))
         state.cache = None
 
-    state.risk = RiskEngine(settings.risk, database=state.database)
+    dispatcher = build_dispatcher(settings.notifications)
+    state.extras["dispatcher"] = dispatcher
+    state.risk = RiskEngine(settings.risk, database=state.database, notifier=dispatcher)
     await state.risk.start()
 
     logger.info(
@@ -98,6 +101,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if state.database is not None:
             with contextlib.suppress(Exception):
                 await state.database.aclose()
+        with contextlib.suppress(Exception):
+            await dispatcher.aclose()
         logger.info("api.stopped")
 
 
@@ -144,6 +149,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(portfolio.router, prefix=prefix)
     app.include_router(risk.router, prefix=prefix)
     app.include_router(backtest.router, prefix=prefix)
+    app.include_router(analytics.router, prefix=prefix)
 
     _install_websocket(app, prefix)
     return app

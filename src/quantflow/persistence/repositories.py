@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from itertools import pairwise
@@ -51,6 +52,30 @@ from quantflow.persistence.models import (
 )
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class RiskEvent:
+    """A risk decision, detached from the ORM.
+
+    Repositories return this rather than the ORM record: a `RiskEventRecord` read inside a
+    session is expired the moment that session rolls back, so any attribute touched
+    afterwards raises `DetachedInstanceError`. Returning plain data makes the boundary
+    explicit and the result safe to hold.
+    """
+
+    rule: str
+    severity: str
+    message: str
+    created_at: datetime
+    symbol: str | None = None
+    observed_value: Decimal | None = None
+    limit_value: Decimal | None = None
+    blocked_order: bool = False
+    halted_trading: bool = False
+    session_id: str | None = None
+    context: dict[str, str] = field(default_factory=dict)
+
 
 #: Batch size for bulk candle upserts. asyncpg caps a single statement at 32767 bind
 #: parameters (a tighter limit than Postgres's own 65535). A candle binds 10 parameters,
@@ -764,13 +789,13 @@ class RiskEventRepository(Repository[RiskEventRecord]):
 
     async def list_recent(
         self, *, limit: int = 100, session_id: str | None = None
-    ) -> list[RiskEventRecord]:
-        """Recent risk events, newest first."""
+    ) -> list[RiskEvent]:
+        """Recent risk events, newest first, safe to use after the session closes."""
         statement = select(RiskEventRecord)
         if session_id is not None:
             statement = statement.where(RiskEventRecord.session_id == session_id)
         statement = statement.order_by(RiskEventRecord.created_at.desc()).limit(limit)
-        return list(await self._scalars(statement))
+        return [_to_risk_event(record) for record in await self._scalars(statement)]
 
     async def get_kill_switch(self) -> KillSwitchRecord:
         """Load the kill-switch row, creating it disengaged if absent."""
@@ -827,6 +852,22 @@ class BacktestRepository(Repository[BacktestRunRecord]):
 # --------------------------------------------------------------------------- #
 # Record -> domain mapping
 # --------------------------------------------------------------------------- #
+def _to_risk_event(record: RiskEventRecord) -> RiskEvent:
+    return RiskEvent(
+        rule=record.rule,
+        severity=record.severity,
+        message=record.message,
+        created_at=record.created_at,
+        symbol=record.symbol,
+        observed_value=record.observed_value,
+        limit_value=record.limit_value,
+        blocked_order=record.blocked_order,
+        halted_trading=record.halted_trading,
+        session_id=record.session_id,
+        context=dict(record.context),
+    )
+
+
 def _to_candle(record: CandleRecord) -> Candle:
     return Candle(
         symbol=Symbol.parse(record.symbol),

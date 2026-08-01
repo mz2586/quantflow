@@ -98,6 +98,7 @@ class RiskEngine:
         "_database",
         "_halted_until",
         "_kill_switch",
+        "_notifier",
         "_order_timestamps",
         "_rules",
         "_session_id",
@@ -115,8 +116,11 @@ class RiskEngine:
         database: Database | None = None,
         clock: Clock | None = None,
         session_id: str | None = None,
+        notifier: Any | None = None,
     ) -> None:
         self._settings = settings
+        #: Optional dispatcher. Alerting is best-effort and must never affect a decision.
+        self._notifier = notifier
         self._clock = clock or SystemClock()
         self._sizer = sizer or build_sizer(settings)
         self._rules = rules if rules is not None else build_default_rules()
@@ -245,6 +249,7 @@ class RiskEngine:
             self.halt_for_the_day(reason)
 
         await self._persist(denials, context)
+        await self._alert(denials, context, halted=should_halt)
 
         logger.warning(
             "risk.order_denied",
@@ -395,6 +400,34 @@ class RiskEngine:
         distance = price * self._settings.default_stop_loss_pct
         stop = price - distance if side is OrderSide.BUY else price + distance
         return max(stop, ZERO + price * Decimal("0.0001"))
+
+    async def _alert(
+        self,
+        denials: tuple[RiskVerdict, ...],
+        context: RiskContext,
+        *,
+        halted: bool,
+    ) -> None:
+        """Notify the operator about a refusal.
+
+        Only the most severe denial is sent: an order blocked by five rules at once is one
+        event to a human, not five. Failures are swallowed — an unreachable notification
+        service must never change a risk outcome.
+        """
+        if self._notifier is None:
+            return
+        worst = max(denials, key=lambda verdict: verdict.severity.rank)
+        try:
+            await self._notifier.notify_risk(
+                rule=worst.rule,
+                message=worst.message,
+                symbol=str(context.request.symbol),
+                observed=worst.observed,
+                limit=worst.limit,
+                halted=halted,
+            )
+        except Exception as exc:
+            logger.warning("risk.alert_failed", error=str(exc))
 
     async def _persist(self, denials: tuple[RiskVerdict, ...], context: RiskContext) -> None:
         """Write the refusals to the audit trail.

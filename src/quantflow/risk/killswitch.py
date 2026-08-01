@@ -44,11 +44,18 @@ class KillSwitch:
     and the database so the latch survives a restart.
     """
 
-    __slots__ = ("_clock", "_database", "_state")
+    __slots__ = ("_clock", "_database", "_notifier", "_state")
 
-    def __init__(self, database: Database | None = None, *, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        database: Database | None = None,
+        *,
+        clock: Clock | None = None,
+        notifier: object | None = None,
+    ) -> None:
         self._database = database
         self._clock = clock or SystemClock()
+        self._notifier = notifier
         self._state = KillSwitchState(engaged=False)
 
     @property
@@ -120,6 +127,8 @@ class KillSwitch:
                     )
             except Exception as exc:
                 logger.exception("killswitch.persist_failed", error=str(exc))
+
+        await self._notify(engaged=True, reason=reason, actor=actor)
         return self._state
 
     async def clear(self, *, actor: str = "operator") -> KillSwitchState:
@@ -131,7 +140,20 @@ class KillSwitch:
         if self._database is not None:
             async with self._database.unit_of_work() as uow:
                 await uow.risk_events.set_kill_switch(engaged=False, actor=actor)
+
+        await self._notify(engaged=False, reason=previous_reason, actor=actor)
         return self._state
+
+    async def _notify(self, *, engaged: bool, reason: str | None, actor: str) -> None:
+        """Alert the operator. Best-effort: never blocks or fails the state change."""
+        if self._notifier is None:
+            return
+        try:
+            await self._notifier.notify_kill_switch(  # type: ignore[attr-defined]
+                engaged=engaged, reason=reason, actor=actor
+            )
+        except Exception as exc:
+            logger.warning("killswitch.alert_failed", error=str(exc))
 
     def require_clear(self) -> None:
         """Assert trading is permitted.

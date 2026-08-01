@@ -452,8 +452,16 @@ class InstrumentRule(RiskRule):
         """Deny an order the venue would reject on lot, tick or notional grounds."""
         from quantflow.core.errors import ValidationError
 
+        # A market order has no price of its own; the reference is a mark or last price
+        # that need not sit on the tick grid. Only an order carrying an explicit limit or
+        # trigger price is checked against it.
+        explicit_price = context.request.price or context.request.trigger_price
         try:
-            context.instrument.validate_order(context.request.quantity, context.reference_price)
+            context.instrument.validate_order(
+                context.request.quantity,
+                explicit_price or context.reference_price,
+                check_price_tick=explicit_price is not None,
+            )
         except ValidationError as exc:
             return RiskVerdict.deny(
                 self.name,

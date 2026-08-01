@@ -134,8 +134,18 @@ class Instrument:
         """Quote-currency value of ``quantity`` at ``price``."""
         return abs(quantity) * price * self.contract_size
 
-    def validate_order(self, quantity: Decimal, price: Decimal) -> None:
+    def validate_order(
+        self, quantity: Decimal, price: Decimal, *, check_price_tick: bool = True
+    ) -> None:
         """Assert an order satisfies every venue rule.
+
+        Args:
+            quantity: Order size.
+            price: The order's price, or a reference price for notional checks.
+            check_price_tick: Whether ``price`` must sit on the venue's tick grid. Pass
+                ``False`` for a **market** order: it has no price of its own, so the
+                reference is a mark, mid or last price that legitimately need not be
+                tick-aligned. Validating it would reject perfectly valid market orders.
 
         Raises:
             ValidationError: with the specific rule that failed.
@@ -162,7 +172,7 @@ class Instrument:
                 symbol=str(self.symbol),
                 rule="quantity_step",
             )
-        if price % self.price_tick != ZERO:
+        if check_price_tick and price % self.price_tick != ZERO:
             raise ValidationError(
                 f"price {price} is not a multiple of tick {self.price_tick}",
                 symbol=str(self.symbol),

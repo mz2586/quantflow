@@ -54,9 +54,12 @@ def _redact_secrets(_logger: WrappedLogger, _method: str, event_dict: EventDict)
     return event_dict
 
 
-def _redact_mapping(mapping: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
+def _redact_mapping(mapping: MutableMapping[Any, Any]) -> MutableMapping[Any, Any]:
     for key, value in list(mapping.items()):
-        normalised = key.lower()
+        # Keys are not always strings: a logged mapping can legitimately be keyed by an
+        # int (a cluster id, an order index). Coercing rather than assuming avoids
+        # crashing the logger on an otherwise harmless log call.
+        normalised = key.lower() if isinstance(key, str) else str(key).lower()
         if any(fragment in normalised for fragment in SENSITIVE_KEY_FRAGMENTS):
             mapping[key] = REDACTED
         elif isinstance(value, MutableMapping):

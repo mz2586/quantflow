@@ -268,9 +268,12 @@ class SimulatedBroker:
 
         """
         instrument = self.instrument_for(request.symbol)
-        check_price = request.price or request.trigger_price or reference_price
+        explicit_price = request.price or request.trigger_price
+        check_price = explicit_price or reference_price
         if check_price is not None:
-            instrument.validate_order(request.quantity, check_price)
+            instrument.validate_order(
+                request.quantity, check_price, check_price_tick=explicit_price is not None
+            )
         order = Order.from_request(request, now=now)
         order = order.acknowledge(f"sim-{uuid.uuid4().hex[:12]}", now=now)
         self._open_orders[order.order_id] = order

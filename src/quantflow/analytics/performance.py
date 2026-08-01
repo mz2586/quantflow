@@ -210,10 +210,16 @@ class ConcentrationAnalysis:
     """How much of the result came from how few trades."""
 
     top_trade_share: Decimal
-    """Share of total net profit contributed by the single best trade."""
+    """Share of total net profit contributed by the single best trade.
+
+    Zero when the overall result is a loss — a "share of profit" is undefined then, which
+    is why :attr:`total_net_pnl` is carried separately rather than being inferred.
+    """
     top_five_share: Decimal
     profit_without_best: Decimal
     """Total net PnL excluding the single best trade."""
+    total_net_pnl: Decimal = ZERO
+    """Net PnL across every trade, reported even when negative."""
 
     @property
     def is_concentrated(self) -> bool:
@@ -229,23 +235,38 @@ class ConcentrationAnalysis:
         """Whether the strategy is still profitable with its best trade removed."""
         return self.profit_without_best > ZERO
 
+    @property
+    def rests_on_one_trade(self) -> bool:
+        """Whether the entire result is one trade.
+
+        True when the overall result is profitable but turns negative once the single best
+        trade is removed. That is not a demonstrated edge; it is one trade that worked.
+        """
+        return self.total_net_pnl > ZERO and self.profit_without_best <= ZERO
+
 
 def concentration(trades: Sequence[ClosedTrade]) -> ConcentrationAnalysis:
     """Measure how dependent the result is on a handful of trades."""
     if not trades:
-        return ConcentrationAnalysis(ZERO, ZERO, ZERO)
+        return ConcentrationAnalysis(ZERO, ZERO, ZERO, ZERO)
 
     pnls = sorted((trade.net_pnl for trade in trades), reverse=True)
     total = sum(pnls, ZERO)
-    if total <= ZERO:
-        return ConcentrationAnalysis(ZERO, ZERO, total - (pnls[0] if pnls else ZERO))
-
     best = pnls[0]
-    top_five = sum(pnls[:5], ZERO)
+
+    # A "share of profit" is undefined when the total is a loss, but the rest of the
+    # analysis still matters — reporting nothing there would hide a result that is only
+    # positive because of one outlier.
+    shares = (
+        (safe_divide(best, total), safe_divide(sum(pnls[:5], ZERO), total))
+        if total > ZERO
+        else (ZERO, ZERO)
+    )
     return ConcentrationAnalysis(
-        top_trade_share=safe_divide(best, total),
-        top_five_share=safe_divide(top_five, total),
+        top_trade_share=shares[0],
+        top_five_share=shares[1],
         profit_without_best=total - best,
+        total_net_pnl=total,
     )
 
 
@@ -351,7 +372,7 @@ class PerformanceReview:
     months: list[Attribution] = field(default_factory=list)
     streak: StreakAnalysis = field(default_factory=lambda: StreakAnalysis(0, 0, 0))
     concentration: ConcentrationAnalysis = field(
-        default_factory=lambda: ConcentrationAnalysis(ZERO, ZERO, ZERO)
+        default_factory=lambda: ConcentrationAnalysis(ZERO, ZERO, ZERO, ZERO)
     )
     drawdowns: list[DrawdownEpisode] = field(default_factory=list)
 
@@ -370,9 +391,7 @@ class PerformanceReview:
                 f"{self.concentration.top_trade_share:.0%} of total profit. Without it the "
                 f"result is {self.concentration.profit_without_best:,.2f}."
             )
-        if self.concentration.top_trade_share > ZERO and not (
-            self.concentration.survives_without_best_trade
-        ):
+        if self.concentration.rests_on_one_trade:
             notes.append(
                 "Removing the single best trade turns the result negative; this is one "
                 "lucky trade rather than a demonstrated edge."
@@ -408,7 +427,9 @@ class PerformanceReview:
                 "top_trade_share": str(self.concentration.top_trade_share),
                 "top_five_share": str(self.concentration.top_five_share),
                 "profit_without_best": str(self.concentration.profit_without_best),
+                "total_net_pnl": str(self.concentration.total_net_pnl),
                 "is_concentrated": self.concentration.is_concentrated,
+                "rests_on_one_trade": self.concentration.rests_on_one_trade,
             },
             "drawdowns": [
                 {
