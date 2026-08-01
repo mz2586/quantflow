@@ -80,6 +80,7 @@ class BinanceGateway:
         "_client",
         "_clock",
         "_connected",
+        "_data_client",
         "_instruments",
         "_limiter",
         "_local_by_venue_id",
@@ -94,6 +95,16 @@ class BinanceGateway:
             settings.rate_limit_per_second, settings.rate_limit_burst, clock=self._clock
         )
         self._client = self._build_client(settings)
+        # Binance's testnet has almost no history and synthetic prices, so public data is
+        # read from production unless explicitly disabled. This client carries no
+        # credentials — public endpoints do not need them.
+        self._data_client = (
+            self._build_client(
+                settings.model_copy(update={"testnet": False, "api_key": None, "api_secret": None})
+            )
+            if settings.use_production_market_data
+            else self._client
+        )
         self._connected = False
         #: Maps a venue order id back to our own order id, so a fetched order reconciles.
         self._local_by_venue_id: dict[str, str] = {}
@@ -164,8 +175,10 @@ class BinanceGateway:
         )
 
     async def aclose(self) -> None:
-        """Close the underlying HTTP session."""
+        """Close the underlying HTTP sessions."""
         await self._client.close()
+        if self._data_client is not self._client:
+            await self._data_client.close()
         self._connected = False
         logger.debug("exchange.closed", exchange=self.name)
 
@@ -217,7 +230,7 @@ class BinanceGateway:
     # ------------------------------------------------------------------ #
     async def load_instruments(self) -> dict[Symbol, Instrument]:
         """Load every tradable instrument's rules."""
-        markets = await self._call("load_markets", self._client.load_markets, True)
+        markets = await self._call("load_markets", self._data_client.load_markets, True)
         loaded: dict[Symbol, Instrument] = {}
         for market in (markets or {}).values():
             instrument = parse_instrument(market)
@@ -256,7 +269,7 @@ class BinanceGateway:
         capped = min(limit, MAX_CANDLES_PER_REQUEST)
         rows = await self._call(
             "fetch_candles",
-            self._client.fetch_ohlcv,
+            self._data_client.fetch_ohlcv,
             self._ccxt_symbol(symbol),
             timeframe.value,
             to_epoch_ms(since) if since else None,
@@ -266,20 +279,22 @@ class BinanceGateway:
 
     async def fetch_ticker(self, symbol: Symbol) -> Ticker:
         """Fetch the current best bid/ask and last price."""
-        raw = await self._call("fetch_ticker", self._client.fetch_ticker, self._ccxt_symbol(symbol))
+        raw = await self._call(
+            "fetch_ticker", self._data_client.fetch_ticker, self._ccxt_symbol(symbol)
+        )
         return _parse_ticker(symbol, raw, self._clock.now())
 
     async def fetch_order_book(self, symbol: Symbol, *, depth: int = 20) -> OrderBook:
         """Fetch an L2 order-book snapshot."""
         raw = await self._call(
-            "fetch_order_book", self._client.fetch_order_book, self._ccxt_symbol(symbol), depth
+            "fetch_order_book", self._data_client.fetch_order_book, self._ccxt_symbol(symbol), depth
         )
         return _parse_order_book(symbol, raw, self._clock.now())
 
     async def fetch_recent_trades(self, symbol: Symbol, *, limit: int = 100) -> list[Trade]:
         """Fetch recent public trades."""
         rows = await self._call(
-            "fetch_trades", self._client.fetch_trades, self._ccxt_symbol(symbol), None, limit
+            "fetch_trades", self._data_client.fetch_trades, self._ccxt_symbol(symbol), None, limit
         )
         return [_parse_public_trade(symbol, row) for row in rows or []]
 

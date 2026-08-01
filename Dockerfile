@@ -4,11 +4,15 @@
 # --------------------------------------------------------------------------- #
 FROM python:3.12-slim-bookworm AS builder
 
+# UV_HTTP_TIMEOUT: Polars and PyArrow ship wheels well over 100 MB, and uv's 30s
+# default is not enough for them on a slow or contended connection. The resulting failure
+# reads as a network error rather than a timeout, so it is worth being generous here.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_LINK_MODE=copy \
-    UV_COMPILE_BYTECODE=1
+    UV_COMPILE_BYTECODE=1 \
+    UV_HTTP_TIMEOUT=600
 
 # build-essential is needed for any sdist-only wheels; it never reaches the runtime image.
 RUN apt-get update \

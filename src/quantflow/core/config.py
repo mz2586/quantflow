@@ -18,6 +18,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     Field,
     SecretStr,
     ValidationInfo,
@@ -30,6 +31,24 @@ from quantflow.core.errors import ConfigurationError
 
 #: Not a credential: an intent token the operator must set to arm live order flow.
 LIVE_CONFIRMATION_TOKEN = "I_UNDERSTAND_THE_RISK"  # noqa: S105
+
+
+def _empty_secret_to_none(value: Any) -> Any:
+    """Treat a blank secret as absent.
+
+    `.env` files carry empty placeholders (`QF_EXCHANGE__API_KEY=`), which Pydantic would
+    otherwise turn into a present-but-empty SecretStr. The system would then believe it
+    has credentials, attempt to sign requests with an empty key, and fail at the venue
+    with an error that points nowhere near the real cause.
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, SecretStr) and not value.get_secret_value().strip():
+        return None
+    return value
+
+
+OptionalSecret = Annotated[SecretStr | None, BeforeValidator(_empty_secret_to_none)]
 
 Fraction = Annotated[Decimal, Field(gt=Decimal("0"), le=Decimal("1"))]
 PositiveDecimal = Annotated[Decimal, Field(gt=Decimal("0"))]
@@ -138,7 +157,7 @@ class RedisSettings(BaseModel):
     host: str = "localhost"
     port: int = Field(default=6379, ge=1, le=65535)
     db: int = Field(default=0, ge=0, le=15)
-    password: SecretStr | None = None
+    password: OptionalSecret = None
     max_connections: int = Field(default=50, ge=1)
     socket_timeout_seconds: float = Field(default=5.0, gt=0)
     key_prefix: str = "qf"
@@ -162,9 +181,14 @@ class ExchangeSettings(BaseModel):
     model_config = {"frozen": True}
 
     name: str = "binance"
-    api_key: SecretStr | None = None
-    api_secret: SecretStr | None = None
+    api_key: OptionalSecret = None
+    api_secret: OptionalSecret = None
     testnet: bool = True
+    #: Read public market data from production even when trading on testnet. Binance's
+    #: testnet carries almost no history and its prices are synthetic, so backtesting or
+    #: warming up a strategy on it produces results that mean nothing. Public endpoints
+    #: need no credentials, so this costs nothing and is on by default.
+    market_data_from_production: bool = True
     market_type: MarketType = MarketType.SPOT
     rate_limit_per_second: float = Field(default=10.0, gt=0, le=100)
     rate_limit_burst: int = Field(default=20, ge=1)
@@ -179,6 +203,11 @@ class ExchangeSettings(BaseModel):
         """Whether both an API key and secret are configured."""
         return self.api_key is not None and self.api_secret is not None
 
+    @property
+    def use_production_market_data(self) -> bool:
+        """Whether public market data should come from the production venue."""
+        return self.testnet and self.market_data_from_production
+
 
 class TradingSettings(BaseModel):
     """Trading mode and account baseline."""
@@ -188,7 +217,7 @@ class TradingSettings(BaseModel):
     mode: TradingMode = TradingMode.PAPER
     base_currency: str = Field(default="USDT", min_length=2, max_length=10)
     starting_equity: PositiveDecimal = Decimal("10000")
-    live_confirmation: SecretStr | None = None
+    live_confirmation: OptionalSecret = None
     symbols: tuple[str, ...] = ("BTC/USDT", "ETH/USDT")
     default_timeframe: str = "1h"
 
@@ -258,7 +287,7 @@ class NotificationSettings(BaseModel):
     model_config = {"frozen": True}
 
     telegram_enabled: bool = False
-    telegram_bot_token: SecretStr | None = None
+    telegram_bot_token: OptionalSecret = None
     telegram_chat_id: str | None = None
     telegram_timeout_seconds: float = Field(default=10.0, gt=0)
     min_severity: Severity = Severity.INFO
@@ -277,13 +306,13 @@ class AISettings(BaseModel):
     model_config = {"frozen": True}
 
     provider: Literal["anthropic", "none"] = "none"
-    anthropic_api_key: SecretStr | None = None
+    anthropic_api_key: OptionalSecret = None
     model: str = "claude-sonnet-5"
     max_tokens: int = Field(default=4096, ge=256, le=64_000)
     temperature: float = Field(default=0.2, ge=0.0, le=1.0)
     timeout_seconds: float = Field(default=90.0, gt=0)
     news_provider: Literal["none", "cryptopanic"] = "none"
-    news_api_key: SecretStr | None = None
+    news_api_key: OptionalSecret = None
     optuna_trials: int = Field(default=100, ge=1, le=10_000)
     optuna_seed: int = 42
 
@@ -345,8 +374,8 @@ class Settings(BaseSettings):
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_workers: int = Field(default=1, ge=1, le=32)
     api_prefix: str = "/api/v1"
-    api_key: SecretStr | None = None
-    secret_key: SecretStr | None = None
+    api_key: OptionalSecret = None
+    secret_key: OptionalSecret = None
     # NoDecode: pydantic-settings would otherwise try to JSON-decode the env value
     # before our comma-splitting validator runs.
     cors_origins: Annotated[tuple[str, ...], NoDecode] = ("http://localhost:5173",)

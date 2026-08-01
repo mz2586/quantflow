@@ -81,6 +81,68 @@ class TestSecretHandling:
         assert RedisSettings(host="h", port=1, db=2).url == "redis://h:1/2"
 
 
+class TestBlankSecrets:
+    """A blank `.env` placeholder must read as *absent*, not as an empty credential.
+
+    Otherwise the system believes it has API keys, signs requests with an empty string,
+    and fails at the venue with an error that points nowhere near the real cause.
+    """
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_blank_exchange_credentials_are_absent(self, blank: str) -> None:
+        from quantflow.core.config import ExchangeSettings
+
+        settings = ExchangeSettings(api_key=blank, api_secret=blank)  # type: ignore[arg-type]
+        assert settings.api_key is None
+        assert settings.api_secret is None
+        assert not settings.has_credentials
+
+    def test_real_credentials_are_present(self) -> None:
+        from quantflow.core.config import ExchangeSettings
+
+        settings = ExchangeSettings(api_key="abc", api_secret="def")  # type: ignore[arg-type]
+        assert settings.has_credentials
+
+    def test_blank_ai_key_disables_the_provider(self) -> None:
+        # A blank key with provider='anthropic' would otherwise pass validation and then
+        # fail on the first API call.
+        with pytest.raises(PydanticValidationError, match="anthropic_api_key"):
+            AISettings(provider="anthropic", anthropic_api_key="")  # type: ignore[arg-type]
+
+    def test_blank_live_confirmation_does_not_arm(self) -> None:
+        with pytest.raises(PydanticValidationError, match="LIVE_CONFIRMATION"):
+            TradingSettings(mode=TradingMode.LIVE, live_confirmation="  ")  # type: ignore[arg-type]
+
+    def test_blank_env_var_is_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("QF_EXCHANGE__API_KEY", "")
+        monkeypatch.setenv("QF_EXCHANGE__API_SECRET", "")
+        assert not _settings().exchange.has_credentials
+
+
+class TestMarketDataRouting:
+    """Binance's testnet carries almost no history and synthetic prices.
+
+    Backtesting or warming up against it produces results that mean nothing, so public
+    data is read from production by default even when trading on testnet.
+    """
+
+    def test_testnet_reads_production_market_data_by_default(self) -> None:
+        from quantflow.core.config import ExchangeSettings
+
+        assert ExchangeSettings(testnet=True).use_production_market_data
+
+    def test_production_needs_no_redirect(self) -> None:
+        from quantflow.core.config import ExchangeSettings
+
+        assert not ExchangeSettings(testnet=False).use_production_market_data
+
+    def test_redirect_can_be_disabled(self) -> None:
+        from quantflow.core.config import ExchangeSettings
+
+        settings = ExchangeSettings(testnet=True, market_data_from_production=False)
+        assert not settings.use_production_market_data
+
+
 class TestLiveTradingArming:
     def test_live_mode_without_token_is_rejected(self) -> None:
         with pytest.raises(PydanticValidationError, match="LIVE_CONFIRMATION"):
