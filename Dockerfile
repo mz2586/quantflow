@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1.7
+# No `# syntax=` directive: pinning an external frontend means every build pulls an
+# image from Docker Hub before it can start, which fails on a flaky network. Docker's
+# built-in BuildKit frontend already supports the cache mounts used below.
 # --------------------------------------------------------------------------- #
 # Stage 1 — builder: resolve and install dependencies into a self-contained venv
 # --------------------------------------------------------------------------- #
@@ -33,9 +35,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && VIRTUAL_ENV=/opt/venv uv pip install --python /opt/venv/bin/python ".[ai]"
 
 # Source layer.
+# --reinstall-package is essential: the dependency layer above already installed
+# quantflow 0.1.0 from the stub, and uv would otherwise treat this identical version as
+# satisfied and skip it — shipping an image whose package contains only the stub.
 COPY src/ ./src/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    VIRTUAL_ENV=/opt/venv uv pip install --python /opt/venv/bin/python --no-deps .
+    VIRTUAL_ENV=/opt/venv uv pip install --python /opt/venv/bin/python \
+    --no-deps --reinstall-package quantflow .
 
 # --------------------------------------------------------------------------- #
 # Stage 2 — runtime: no compilers, no uv, non-root
