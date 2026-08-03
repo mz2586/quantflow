@@ -13,7 +13,7 @@ import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import typer
 from rich.console import Console
@@ -24,7 +24,13 @@ from quantflow.core.config import Settings, get_settings
 from quantflow.core.errors import QuantFlowError
 from quantflow.core.logging import configure_logging
 from quantflow.domain.enums import Timeframe
-from quantflow.domain.instruments import Symbol
+from quantflow.domain.instruments import Instrument, Symbol
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from quantflow.domain.market import Candle
+    from quantflow.research import RankedEntry, ResearchOutcome
 
 console = Console()
 
@@ -37,11 +43,15 @@ data_app = typer.Typer(help="Download and inspect market data.", no_args_is_help
 backtest_app = typer.Typer(help="Run and inspect backtests.", no_args_is_help=True)
 trade_app = typer.Typer(help="Run a trading engine.", no_args_is_help=True)
 risk_app = typer.Typer(help="Inspect and control risk state.", no_args_is_help=True)
+research_app = typer.Typer(
+    help="Rank strategies against fixed acceptance thresholds.", no_args_is_help=True
+)
 
 app.add_typer(data_app, name="data")
 app.add_typer(backtest_app, name="backtest")
 app.add_typer(trade_app, name="trade")
 app.add_typer(risk_app, name="risk")
+app.add_typer(research_app, name="research")
 
 
 def _settings() -> Settings:
@@ -546,6 +556,189 @@ def report_path_for(directory: Path, run_id: str) -> Path:
 def summarise(values: dict[str, Any]) -> str:
     """Render a mapping as a compact single line, for CLI output."""
     return ", ".join(f"{key}={value}" for key, value in sorted(values.items()))
+
+
+# --------------------------------------------------------------------------- #
+# research
+# --------------------------------------------------------------------------- #
+async def _load_research_data(
+    settings: Settings,
+    symbols: Sequence[Symbol],
+    timeframe: Timeframe,
+    start_at: datetime,
+    end_at: datetime,
+) -> tuple[dict[Symbol, Sequence[Candle]], dict[Symbol, Instrument]]:
+    """Fetch candles and instruments for every symbol in the sweep."""
+    from quantflow.persistence.database import Database
+    from quantflow.persistence.repositories import CandleRepository, InstrumentRepository
+
+    data: dict[Symbol, Sequence[Candle]] = {}
+    instruments: dict[Symbol, Instrument] = {}
+    database = Database.from_settings(settings)
+    try:
+        async with database.read_session() as session:
+            candle_repo = CandleRepository(session)
+            instrument_repo = InstrumentRepository(session)
+            for symbol in symbols:
+                data[symbol] = await candle_repo.fetch(
+                    symbol, timeframe, start=start_at, end=end_at
+                )
+                instruments[symbol] = await instrument_repo.get(symbol) or Instrument(symbol=symbol)
+    finally:
+        await database.aclose()
+    return data, instruments
+
+
+def _render_leaderboard(board: Sequence[RankedEntry]) -> Table:
+    """The leaderboard as a terminal table."""
+    table = Table(show_header=True, title="Leaderboard")
+    table.add_column("#", justify="right")
+    table.add_column("Strategy", style="cyan")
+    table.add_column("Verdict")
+    for column in ("Net return", "PF", "Sharpe", "Max DD", "Win rate", "Trades", "vs hold"):
+        table.add_column(column, justify="right")
+
+    for entry in board:
+        item = entry.entry
+        verdict = (
+            "benchmark"
+            if item.is_benchmark
+            else ("[green]accepted[/]" if item.accepted else "[red]rejected[/]")
+        )
+        table.add_row(
+            str(entry.position),
+            item.strategy_id,
+            verdict,
+            f"{item.net_return:.2%}",
+            f"{item.profit_factor:.2f}",
+            f"{item.sharpe_ratio:.2f}",
+            f"{item.max_drawdown:.2%}",
+            f"{item.win_rate:.2%}",
+            str(item.trade_count),
+            "-" if item.excess_return is None else f"{item.excess_return:+.2%}",
+        )
+    return table
+
+
+def _write_research_reports(outcome: ResearchOutcome, directory: Path, stem: str) -> list[Path]:
+    """Write the Markdown, HTML and JSON reports.
+
+    Synchronous, and called outside the event loop on purpose: blocking file IO inside a
+    coroutine stalls the loop for no benefit at all.
+    """
+    from quantflow.research import build_html, build_json, build_markdown
+
+    directory.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for suffix, builder in (("md", build_markdown), ("html", build_html), ("json", build_json)):
+        path = directory / f"{stem}.{suffix}"
+        path.write_text(builder(outcome), encoding="utf-8")
+        written.append(path)
+    return written
+
+
+@research_app.command("run")
+def research_run(
+    symbols: Annotated[
+        str, typer.Option(help="Comma-separated pairs to test every strategy on")
+    ] = "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT",
+    timeframe: Annotated[str, typer.Option()] = "1h",
+    start: Annotated[str, typer.Option(help="ISO start date")] = "2021-01-01",
+    end: Annotated[str | None, typer.Option(help="ISO end date")] = None,
+    equity: Annotated[float, typer.Option(help="Starting equity per run")] = 10000.0,
+    costs: Annotated[
+        str, typer.Option(help="Cost model: realistic, pessimistic or zero_cost")
+    ] = "realistic",
+    strategies: Annotated[
+        str | None, typer.Option(help="Comma-separated strategy ids; default is all")
+    ] = None,
+    report: Annotated[bool, typer.Option(help="Write Markdown, HTML and JSON reports")] = True,
+) -> None:
+    """Backtest every strategy over every symbol and rank the survivors."""
+    from decimal import Decimal
+
+    from quantflow.research import ResearchConfig, ResearchRunner, build_cost_model, leaderboard
+
+    settings = _settings()
+    parsed_symbols = tuple(
+        _parse_symbol(item.strip()) for item in symbols.split(",") if item.strip()
+    )
+    parsed_timeframe = Timeframe.parse(timeframe)
+    start_at = _parse_date(start)
+    end_at = _parse_date(end) if end else datetime.now(UTC)
+    requested = (
+        tuple(item.strip() for item in strategies.split(",") if item.strip()) if strategies else ()
+    )
+    cost_model = build_cost_model(costs)
+
+    async def load() -> tuple[dict[Symbol, Sequence[Candle]], dict[Symbol, Instrument]]:
+        return await _load_research_data(
+            settings, parsed_symbols, parsed_timeframe, start_at, end_at
+        )
+
+    try:
+        data, instruments = asyncio.run(load())
+    except QuantFlowError as exc:
+        _fail(exc)
+
+    empty = [str(symbol) for symbol, candles in data.items() if not candles]
+    if empty:
+        console.print(
+            f"[red]No stored candles for {', '.join(empty)}.[/] "
+            "Run 'quantflow data download' first."
+        )
+        raise typer.Exit(code=1)
+
+    config = ResearchConfig(
+        symbols=parsed_symbols,
+        timeframe=parsed_timeframe,
+        starting_equity=Decimal(str(equity)),
+        costs=cost_model,
+        strategy_ids=requested,
+    )
+    console.print(
+        f"Testing over {len(parsed_symbols)} symbols, "
+        f"{sum(len(candles) for candles in data.values()):,} bars, "
+        f"costs=[cyan]{cost_model.name}[/]"
+    )
+
+    try:
+        outcome = asyncio.run(ResearchRunner(config).run(data, instruments))
+    except QuantFlowError as exc:
+        _fail(exc)
+
+    board = leaderboard(outcome)
+    console.print(_render_leaderboard(board))
+
+    passed = [entry for entry in board if entry.entry.accepted and not entry.entry.is_benchmark]
+    if passed:
+        names = ", ".join(entry.entry.strategy_id for entry in passed)
+        console.print(f"\n[green]{len(passed)} strategy(ies) passed every threshold:[/] {names}")
+    else:
+        console.print(
+            "\n[yellow]No strategy passed every threshold on every symbol.[/] "
+            "See the report for per-strategy reasons."
+        )
+    if outcome.failures:
+        console.print(f"[red]{len(outcome.failures)} run(s) failed.[/]")
+
+    if report:
+        stem = f"research-{parsed_timeframe.value}-{cost_model.name}"
+        for path in _write_research_reports(outcome, Path(settings.storage.report_dir), stem):
+            console.print(f"Report: [cyan]{path}[/]")
+
+
+@research_app.command("thresholds")
+def research_thresholds() -> None:
+    """Show the acceptance thresholds a strategy must clear."""
+    from quantflow.research import DEFAULT_THRESHOLDS
+
+    table = Table(show_header=True, title="Acceptance thresholds")
+    table.add_column("Criterion", style="cyan")
+    table.add_column("Requirement", justify="right")
+    for name, requirement in DEFAULT_THRESHOLDS.describe().items():
+        table.add_row(name, requirement)
+    console.print(table)
 
 
 if __name__ == "__main__":  # pragma: no cover
