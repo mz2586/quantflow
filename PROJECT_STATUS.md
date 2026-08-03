@@ -1,149 +1,231 @@
 # QuantFlow — Project Status
 
-**Updated:** 2026-07-31
-**Build:** 737 tests passing · Ruff clean · `mypy --strict` clean · 74 source files
+**Updated:** 2026-08-03 · **Commit:** `f8d1734` · **Version:** 0.1.0
+
+**Live trading is disabled and has never been enabled.** No authenticated order has ever
+been sent. See [Live trading](#4-live-trading-safety-interlock).
 
 ---
 
-## Current task
+## 1. At a glance
 
-Phase 3 groundwork — FastAPI application and the API surface (M7), then the backtesting
-engine (M12).
-
----
-
-## Completed
-
-### M0 — Repository foundation ✅
-`src/` layout, `pyproject.toml` with Ruff + Black + `mypy --strict` + pytest, Makefile,
-GitHub Actions CI (quality / integration / dashboard / docker jobs), `.env.example`
-documenting every setting.
-
-### M1 — Core cross-cutting layer ✅
-- Pydantic v2 settings: nested env vars, production guardrails, secrets as `SecretStr`
-- **Live trading is disarmed by default** and requires an explicit confirmation token
-- `structlog` logging with secret redaction and contextvar correlation ids
-- `Clock` protocol (`SystemClock` / `FrozenClock`) — no code calls `datetime.now` directly
-- Decimal precision helpers with explicit, side-aware rounding
-- Async DI container with singleton caching and reverse-order teardown
-- Typed exception hierarchy rooted at `QuantFlowError`
-
-### M2 — Domain model ✅
-Pure value objects, no IO: `Symbol`, `Instrument`, `Candle`/`CandleSeries` (with gap
-detection), `OrderRequest`/`Order`/`Fill` (enforced OMS transition table, idempotent
-fills), `Position` (FIFO lots, position flips, `ClosedTrade` round-trips),
-`PortfolioSnapshot`, `Signal`. Hypothesis property tests cover the accounting invariants.
-
-### M3 — Persistence ✅
-15 ORM models, `NUMERIC(28,12)` money columns, repositories as the sole record↔domain
-translation point, async engine + `UnitOfWork`, Alembic baseline plus a TimescaleDB
-hypertable migration that no-ops gracefully on plain Postgres.
-
-### M4 — Cache & messaging ✅
-Namespaced Redis facade with a `Decimal`-safe orjson codec, distributed lock with TTL and
-compare-and-delete release, pub/sub event bus, Redis-stream work queue.
-
-### M5 — Exchange integration ✅
-`ExchangeGateway` protocol; Binance REST over CCXT (rate limiting, retry with full jitter,
-error translation, clock-drift check); websocket client with auto-reconnect, stale-socket
-detection and gap detection; shared `SimulatedBroker` with a deliberately pessimistic fill
-model used by **both** backtest and paper trading.
-
-### M6 — Market-data pipeline ✅
-Resumable, idempotent paginated backfill that reports gaps rather than hiding them;
-Hive-partitioned Parquet store via Polars; timeframe resampling that drops partial buckets.
-
-### M8 — Docker & infrastructure ✅ *(brought forward)*
-Multi-stage Dockerfile (non-root, tini, cached dependency layer); compose stack on
-non-conflicting host ports (55432 / 56379 / 8100) so it cannot disturb other local
-Postgres/Redis instances.
-
-### M9 — Strategy engine ✅
-`Strategy` ABC as a **pure decision function** — it cannot place orders or size positions,
-which is what makes bypassing the risk engine structurally impossible. Aligned-output
-indicator library (SMA, EMA, Wilder, RSI, ATR, Bollinger, MACD, Donchian, crossings), a
-registry with JSON-Schema introspection, and three reference strategies: EMA cross, RSI
-mean reversion (trend-filtered), Donchian breakout.
-
-### M10 — Risk engine ✅
-- **Every order passes through `RiskEngine.approve`. There is no other path to a venue.**
-- Sizers: fixed-fractional (stop-anchored), volatility-target, fixed-notional
-- 13 rules covering: mandatory stop loss, max position %, max total exposure, max
-  concurrent positions, max daily loss (halts the day), max drawdown (latches the kill
-  switch), max leverage, order rate, venue rules, cash sufficiency
-- Kill switch is **latched and persistent** — a restart does not clear it, and it *fails
-  closed* if its state cannot be read
-- Exits are exempt from exposure limits, so a limit can never trap an open position
-
-### M11 — Execution & portfolio ✅
-Portfolio manager as the single source of truth (cash and positions move atomically,
-fills idempotent by id, crash recovery, venue reconciliation). Execution engine with a
-fixed order of operations and a redundant pre-submission protection assert, stale-signal
-rejection, and a guard that refuses to submit from a non-live engine to a production
-gateway.
+| | |
+|---|---|
+| Test suite | **1026 passed, 0 failed** (2m 13s) |
+| Dashboard tests | **26 passed** |
+| `mypy --strict` | clean — 118 source files |
+| `ruff` / `black` | clean |
+| `tsc --noEmit` / `eslint` | clean |
+| Coverage | 82% (statement + branch) |
+| Docker stack | api, db, redis, worker healthy; migrate exits 0 |
+| Market data | 10,285 contiguous real 1h bars each for BTC/USDT and ETH/USDT — **0 gaps** |
+| Trading mode | `paper` |
 
 ---
 
-## Remaining
+## 2. Completed modules
 
-| Milestone | Scope | Status |
-| --- | --- | --- |
-| **M7** | FastAPI app, routers, middleware, metrics, health | next |
-| **M12** | Event-driven backtester, metrics, walk-forward, Plotly reports | pending |
-| **M13** | Paper-trading engine on live data | pending |
-| **M14** | Telegram notifications and dispatcher | pending |
-| **M15** | Analytics, trade journal, attribution | pending |
-| **M16** | React + Vite + TS + Tailwind dashboard | pending |
-| **M17** | AI: Optuna optimiser, regime detection, sentiment, LLM journal | pending |
-| **M18** | Auth, coverage gate, runbook, ADRs, threat model | pending |
+Every module below is implemented, typed, tested, and exercised against the running
+stack — not scaffolded.
 
----
+| Module | LOC | What it does |
+|---|---:|---|
+| `core` | 1,426 | Settings (Pydantic v2, nested env), structlog with secret redaction, injected `Clock`, Decimal precision helpers, async DI container, typed error hierarchy |
+| `domain` | 2,074 | Pure model, no IO: `Symbol`/`Instrument`, `Candle`/`CandleSeries` with gap detection, order state machine with idempotent fills, FIFO position lots, portfolio, signals |
+| `persistence` | 1,971 | SQLAlchemy 2 async, Alembic (2 migrations), repositories returning detached-safe frozen dataclasses, chunked UPSERTs sized for asyncpg's 32,767-param cap |
+| `cache` | 498 | Redis with explicit retry/backoff, typed namespacing |
+| `exchange` | 2,158 | CCXT Binance gateway, token-bucket rate limiter, instrument sync, `SimulatedBroker` fill model shared by backtest/paper/live |
+| `marketdata` | 825 | Resumable downloader, resampling, store with gap verification |
+| `strategy` | 1,208 | Registry + 3 strategies (`donchian_breakout`, `ema_cross`, `rsi_reversion`), indicator library. Strategies are **pure decision functions** — they cannot place orders or size positions |
+| `risk` | 1,529 | 13-rule engine, position sizers, latched persistent kill switch |
+| `portfolio` | 370 | Cash + positions applied atomically, idempotent on fill id, FIFO trade attribution |
+| `execution` | 468 | Order lifecycle, retry, reconciliation |
+| `backtest` | 1,910 | Event-driven, no look-ahead, self-contained HTML reports |
+| `paper` | 641 | Live-data paper engine, persisted sessions |
+| `live` | 453 | Live runner behind a five-condition arming interlock (disabled) |
+| `ai` | 1,051 | Regime detection + `AIAdvice` that can only veto or shrink conviction |
+| `analytics` | 494 | Attribution by strategy/symbol/side/hour, streaks, concentration, plain-language warnings |
+| `notifications` | 785 | Dispatcher with severity filter, dedup, rate limiting; Telegram + null transports |
+| `api` | 2,102 | FastAPI: health, readiness, market data, portfolio, risk, strategies, backtest, analytics, websocket, Prometheus metrics |
+| `cli` | 559 | `config`, `serve`, `data`, `backtest`, `trade`, `risk` |
+| `workers` | 165 | Background ingestion + instrument refresh |
+| `dashboard` | 1,346 | React 18 + Vite + TypeScript + Tailwind + Recharts |
 
-## Blockers
+### Risk rules (all 13 active)
 
-**None blocking progress.** Everything below is external and does not gate the remaining
-build; each has a working default.
+`KillSwitch` · `TradingHalted` · `StopLossRequired` · `MaxPositionSize` ·
+`MaxTotalExposure` · `MaxConcurrentPositions` · `MaxLeverage` · `OrderNotional` ·
+`MaxDailyLoss` · `MaxDrawdown` · `OrderRate` · `Instrument` · `SufficientCash`
 
-| Item | Impact | Needed |
-| --- | --- | --- |
-| Binance API credentials | Live/testnet trading and private endpoints are untestable end-to-end. Public market data, backtesting and paper trading all work without them. | `QF_EXCHANGE__API_KEY` / `QF_EXCHANGE__API_SECRET` (testnet keys from testnet.binance.vision are enough) |
-| Telegram bot token | M14 delivery cannot be verified against the real API; transport is tested with a stubbed HTTP layer. | `QF_NOTIFICATIONS__TELEGRAM_BOT_TOKEN` + chat id |
-| Anthropic API key | M17 LLM journal analysis runs against a stub without it. | `QF_AI__ANTHROPIC_API_KEY` |
-| News provider key | Sentiment interface has no live feed. | `QF_AI__NEWS_API_KEY` |
-
-**Decisions I made rather than blocking on** (all reversible, all documented in-code):
-1. VectorBT and Backtrader are **optional extras**, not core dependencies — both carry
-   heavy conflicting transitive pins. Adapters will be provided; the primary backtester is
-   our own so that live and backtest share one execution path.
-2. TimescaleDB over plain Postgres, with graceful degradation.
-3. FIFO lot accounting rather than average cost, for auditable trade-level attribution.
-4. Local host ports moved off 5432/6379 to avoid colliding with your existing containers.
-
----
-
-## Bugs found and fixed by the test suite
-
-These were real defects, not test artefacts:
-
-1. **`TokenBucket` livelocked forever.** Float drift made a "full" bucket hold
-   `0.9999999999999999`, so the `>= 1` check never passed and the acquire loop spun on a
-   ~1e-18 delay. Fixed with an epsilon plus a minimum wait; regression test added.
-2. **Bulk candle upsert exceeded asyncpg's 32767 bind-parameter cap** (a tighter limit
-   than Postgres's own 65535). Chunk size 5000 → 3000.
-3. **`OrderRepository.save` touched an unloaded relationship**, emitting IO outside
-   SQLAlchemy's async greenlet context.
-4. **`Base.metadata` was only populated as a side effect of importing repositories**, so
-   `create_all` could silently produce an empty schema.
-5. **`SimulatedBroker.submit` loaded the instrument but never validated against it** —
-   letting a backtest fill orders Binance would have rejected.
-6. **Order-book level ordering validation was inverted.**
+Every mandated rule from the brief is enforced: stop loss, position sizing, max daily
+loss, max drawdown, max concurrent positions, kill switch.
 
 ---
 
-## Next actions
+## 3. Architecture
 
-1. FastAPI application factory, middleware, health/metrics, market-data and risk routers.
-2. Event-driven backtester reusing the live risk and execution path, with a look-ahead
-   regression test and an analytic fixture whose PnL is known exactly.
-3. Paper-trading engine on the same fill model.
-4. Then Phase 3 (dashboard, notifications) and Phase 4 (AI).
+```
+                        ┌──────────────────────────┐
+                        │   Dashboard (React/TS)   │
+                        │  Vite proxy → API :8100  │
+                        └────────────┬─────────────┘
+                                     │ REST + WebSocket
+                        ┌────────────▼─────────────┐
+                        │      FastAPI (api)       │
+                        │ health · market · risk   │
+                        │ portfolio · analytics    │
+                        └────────────┬─────────────┘
+                                     │
+   ┌─────────────────────────────────┼─────────────────────────────────┐
+   │                                 │                                 │
+┌──▼───────────┐            ┌────────▼────────┐              ┌─────────▼────────┐
+│  Backtest    │            │  Paper engine   │              │  Live runner     │
+│  engine      │            │                 │              │  ✖ DISABLED      │
+└──┬───────────┘            └────────┬────────┘              └─────────┬────────┘
+   │                                 │                                 │
+   └─────────────────┬───────────────┴─────────────────┬───────────────┘
+                     │                                 │
+              ┌──────▼──────┐                   ┌──────▼───────┐
+              │  Strategy   │  Signal           │  Portfolio   │
+              │  (pure fn)  │─────────┐         │  manager     │
+              └─────────────┘         │         └──────▲───────┘
+                                      │                │ fills
+                              ┌───────▼────────┐       │
+                              │   AI engine    │       │
+                              │ veto / shrink  │       │
+                              │ only — never   │       │
+                              │ enlarges       │       │
+                              └───────┬────────┘       │
+                                      │                │
+                        ╔═════════════▼════════════╗   │
+                        ║      RISK ENGINE         ║   │
+                        ║  13 rules · sizing       ║   │
+                        ║  kill switch (latched)   ║   │
+                        ║  ── MANDATORY GATE ──    ║   │
+                        ╚═════════════┬════════════╝   │
+                                      │ approved order │
+                              ┌───────▼────────┐       │
+                              │   Execution    │───────┘
+                              │    engine      │
+                              └───────┬────────┘
+                                      │
+                   ┌──────────────────┼──────────────────┐
+                   │                                     │
+          ┌────────▼─────────┐                 ┌─────────▼─────────┐
+          │ SimulatedBroker  │                 │  Binance (CCXT)   │
+          │ backtest · paper │                 │  ✖ requires arming│
+          └──────────────────┘                 └───────────────────┘
+
+  Infrastructure:  PostgreSQL/TimescaleDB :55432 · Redis :56379 · worker (ingest)
+```
+
+**Invariants enforced by the design, not by convention:**
+
+- No path from signal to venue bypasses the risk engine.
+- AI can only veto or shrink: the conviction multiplier is constrained to `[0,1]` at
+  construction, so no AI field can create, enlarge, or flip a position.
+- Money is `Decimal` throughout; `float` appears only inside vectorised analytics.
+  Money crosses the wire as **strings** — a JSON number would be corrupted by JS floats.
+- All datetimes are UTC-aware, enforced by Ruff `DTZ` plus an injected `Clock`.
+- Backtest exposes only closed bars up to bar *i*; orders match against bar *i+1*.
+- One fill model shared by backtest, paper, and live.
+
+---
+
+## 4. Live trading safety interlock
+
+Live trading requires **all five** conditions simultaneously. Any one missing leaves it
+disarmed:
+
+1. `ENABLE_LIVE_TRADING=true` in the environment
+2. Trading mode set to `live`
+3. An explicit confirmation token
+4. Credentials present
+5. Not pointed at testnet
+
+Current state: **not armed, and never has been.** No authenticated order has been sent.
+
+---
+
+## 5. Remaining modules and work
+
+| # | Item | Notes |
+|---|---|---|
+| 1 | **M18 hardening** | Load testing, chaos/failure injection, backpressure under sustained websocket load |
+| 2 | **AI engine breadth** | `RuleBasedRegimeDetector` is the default and is tested; the Gaussian-mixture detector is opt-in and degrades gracefully, but neither has been validated against out-of-sample performance |
+| 3 | **Dashboard breadth** | Trades are fetched and drive the PnL chart, but there is no per-trade table; no backtest-launch UI; no multi-session comparison |
+| 4 | **Reconciliation** | Execution-engine reconciliation is implemented but has never run against a real venue, because live trading has never been armed |
+| 5 | **Migration drift check** | Migrations are hand-verified; no CI job asserts models and migrations agree |
+| 6 | **Coverage gaps** | `workers/runner.py` 0%, `live/runner.py` 61%, `execution/engine.py` 75% — the three least-exercised paths, and two of them are the ones that would touch real money |
+
+---
+
+## 6. Production blockers
+
+These are genuine external dependencies. None can be resolved by writing code.
+
+| Blocker | Needed to |
+|---|---|
+| **Binance API credentials with trade permission** | Send any real order. Deliberately absent |
+| **Explicit human decision to arm live trading** | Flip the five-condition interlock. Standing instruction is: do not enable |
+| **Telegram bot token + chat id** | Deliver notifications. The dispatcher works; only the `null` transport is enabled |
+| **Strategy validation on out-of-sample data** | The one strategy run end-to-end (`donchian_breakout`) **lost money**: −10.66% over 14 months, 26.1% win rate, fees consumed 140% of gross profit, longest losing streak 14 trades. It is not fit to trade capital as configured |
+| **Offsite backup + restore drill** | `pg_dump` runs; a restore has never been rehearsed |
+| **Secret management** | Secrets come from `.env`. Production needs a real secret store |
+| **TLS / auth on the API** | The API is unauthenticated and HTTP-only. Safe on localhost, not deployable as-is |
+
+The fourth row is the substantive one. The platform is sound; **the strategy is not
+profitable**, and no amount of engineering fixes that.
+
+---
+
+## 7. Code statistics
+
+| | Files | Lines |
+|---|---:|---:|
+| Python source | 87 | 20,702 |
+| Python tests | 31 | 11,230 |
+| Dashboard TS/TSX | 6 | 1,346 |
+| Migrations | 2 | — |
+| **Total** | **126** | **33,278** |
+
+- Test-to-source ratio: **0.54:1**
+- 1,026 Python tests + 26 dashboard tests
+- Coverage 82% statement+branch
+- 9 commits
+
+---
+
+## 8. Verified against the running system
+
+Not asserted from code — measured on 2026-08-03 against the live stack.
+
+**Paper session `dashboard-demo`** — `donchian_breakout`, BTC/USDT 1h, 10,000 USDT start:
+
+```
+bars 10,085 → signals 262 → orders 262 → fills 330 → rejections 0
+closed trades 165 (43 wins, 26.1%)
+final equity 8,933.80   return −10.66%   max drawdown 11.25%
+```
+
+**All 17 dashboard endpoints verified through the Vite proxy**, every one HTTP 200:
+readiness, health, portfolio, equity curve, trades, orders, sessions, risk status,
+risk events, market series, candles (BTC + ETH), attribution, warnings, strategies,
+notifications, Prometheus metrics (271 samples).
+
+**Rendering confirmed in-browser**: the attribution table reads
+`donchian_breakout 165 −1,066.20 26.1%`, which reconciles exactly with equity 8,933.80
+from 10,000.
+
+**Kill switch**: engages, latches, persists across restart, and writes an audit trail.
+
+---
+
+## 9. Next actions
+
+1. M18 hardening — load and failure-injection testing.
+2. Raise coverage on `workers/runner.py`, `live/runner.py`, `execution/engine.py`.
+3. Walk-forward validation across strategies and parameters — the current strategy loses
+   money and should not be a candidate for capital.
+4. Add a per-trade table and backtest-launch UI to the dashboard.
+5. Leave live trading disabled pending an explicit human decision.
