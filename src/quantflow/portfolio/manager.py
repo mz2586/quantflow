@@ -9,7 +9,7 @@ risk limit is measured against.
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -146,11 +146,20 @@ class PortfolioManager:
         for symbol, price in prices.items():
             self.update_mark_price(symbol, price)
 
-    def apply_fill(self, fill: Fill) -> tuple[Position, tuple[ClosedTrade, ...]]:
+    def apply_fill(
+        self, fill: Fill, *, strategy_id: str | None = None
+    ) -> tuple[Position, tuple[ClosedTrade, ...]]:
         """Apply a fill to cash and positions in one atomic step.
 
         Idempotent on ``fill_id``: exchanges re-deliver execution reports on reconnect, and
         double-counting one would corrupt both the position and the cash balance.
+
+        Args:
+            fill: The execution to apply.
+            strategy_id: Which strategy opened the position. Carried onto the position and
+                therefore onto every ClosedTrade it produces — without it, all performance
+                attribution collapses into a single "unattributed" bucket, which makes
+                per-strategy analysis impossible after the fact.
 
         Returns:
             The updated position and any round-trips the fill closed.
@@ -161,7 +170,13 @@ class PortfolioManager:
             existing = self._positions.get(fill.symbol, Position(symbol=fill.symbol))
             return existing, ()
 
-        position = self._positions.get(fill.symbol, Position(symbol=fill.symbol))
+        position = self._positions.get(fill.symbol)
+        if position is None:
+            position = Position(symbol=fill.symbol, strategy_id=strategy_id)
+        elif position.is_flat and strategy_id is not None:
+            # Re-opening a previously flat position: adopt the new owner rather than
+            # keeping whichever strategy happened to trade it last.
+            position = replace(position, strategy_id=strategy_id)
         updated, closed = position.apply_fill(fill)
 
         # Cash: a buy spends notional plus fee, a sell receives notional minus fee.
@@ -188,11 +203,13 @@ class PortfolioManager:
         )
         return updated, closed
 
-    def apply_fills(self, fills: Iterable[Fill]) -> tuple[ClosedTrade, ...]:
+    def apply_fills(
+        self, fills: Iterable[Fill], *, strategy_id: str | None = None
+    ) -> tuple[ClosedTrade, ...]:
         """Apply several fills in timestamp order."""
         closed: list[ClosedTrade] = []
         for fill in sorted(fills, key=lambda item: item.timestamp):
-            _, trades = self.apply_fill(fill)
+            _, trades = self.apply_fill(fill, strategy_id=strategy_id)
             closed.extend(trades)
         return tuple(closed)
 

@@ -119,6 +119,20 @@ def get_database(state: StateDep) -> Database:
 DatabaseDep = Annotated[Database, Depends(get_database)]
 
 
+def get_optional_database(state: StateDep) -> Database | None:
+    """The database, or ``None`` when none is configured.
+
+    For endpoints that can answer from an in-process engine and treat the database as a
+    fallback. Depending on `DatabaseDep` there would make persistence mandatory for a
+    request that never needed it, and the caller would get "database is not configured"
+    in place of the answer the process could have given.
+    """
+    return state.database
+
+
+OptionalDatabaseDep = Annotated[Database | None, Depends(get_optional_database)]
+
+
 def get_cache(state: StateDep) -> Cache:
     """The Redis cache."""
     return state.require_cache()

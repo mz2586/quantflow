@@ -77,6 +77,52 @@ class RiskEvent:
     context: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class TradingSessionSummary:
+    """A trading session, detached from the ORM.
+
+    Same reasoning as :class:`RiskEvent`: an ORM record read inside a session is expired
+    the moment that session rolls back, so any attribute touched afterwards raises
+    `DetachedInstanceError` — at runtime, in production, on a request that looked fine in
+    a test that happened to stay inside the session.
+    """
+
+    session_id: str
+    mode: str
+    status: RunStatus
+    strategy_id: str
+    symbols: tuple[str, ...]
+    timeframe: Timeframe
+    base_currency: str
+    starting_equity: Decimal
+    final_equity: Decimal | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    created_at: datetime | None = None
+    error: str | None = None
+    metrics: dict[str, float] = field(default_factory=dict)
+    strategy_params: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class BacktestRunSummary:
+    """A backtest run, detached from the ORM."""
+
+    run_id: str
+    strategy_id: str
+    symbols: tuple[str, ...]
+    timeframe: Timeframe
+    status: RunStatus
+    start: datetime
+    end: datetime
+    starting_equity: Decimal
+    final_equity: Decimal | None = None
+    sharpe_ratio: Decimal | None = None
+    max_drawdown_pct: Decimal | None = None
+    trade_count: int = 0
+    created_at: datetime | None = None
+
+
 #: Batch size for bulk candle upserts. asyncpg caps a single statement at 32767 bind
 #: parameters (a tighter limit than Postgres's own 65535). A candle binds 10 parameters,
 #: so 3000 rows (30k parameters) stays inside the limit with headroom.
@@ -660,18 +706,19 @@ class TradingSessionRepository(Repository[TradingSessionRecord]):
         if error is not None:
             record.error = error
 
-    async def get(self, session_id: str) -> TradingSessionRecord | None:
-        """Load a session record."""
-        return await self._session.get(TradingSessionRecord, session_id)
+    async def get(self, session_id: str) -> TradingSessionSummary | None:
+        """Load a session, safe to use after the session closes."""
+        record = await self._session.get(TradingSessionRecord, session_id)
+        return _to_session_summary(record) if record is not None else None
 
-    async def list_recent(self, *, limit: int = 50) -> list[TradingSessionRecord]:
-        """Recent sessions, newest first."""
+    async def list_recent(self, *, limit: int = 50) -> list[TradingSessionSummary]:
+        """Recent sessions, newest first, safe to use after the session closes."""
         statement = (
             select(TradingSessionRecord)
             .order_by(TradingSessionRecord.created_at.desc())
             .limit(limit)
         )
-        return list(await self._scalars(statement))
+        return [_to_session_summary(record) for record in await self._scalars(statement)]
 
 
 class EquityRepository(Repository[EquitySnapshotRecord]):
@@ -834,24 +881,63 @@ class BacktestRepository(Repository[BacktestRunRecord]):
         await self._session.flush()
         return merged
 
-    async def get(self, run_id: str) -> BacktestRunRecord | None:
-        """Load a backtest run."""
-        return await self._session.get(BacktestRunRecord, run_id)
+    async def get(self, run_id: str) -> BacktestRunSummary | None:
+        """Load a backtest run, safe to use after the session closes."""
+        record = await self._session.get(BacktestRunRecord, run_id)
+        return _to_backtest_summary(record) if record is not None else None
 
     async def list_recent(
         self, *, limit: int = 50, strategy_id: str | None = None
-    ) -> list[BacktestRunRecord]:
-        """Recent backtest runs, newest first."""
+    ) -> list[BacktestRunSummary]:
+        """Recent backtest runs, newest first, safe after the session closes."""
         statement = select(BacktestRunRecord)
         if strategy_id is not None:
             statement = statement.where(BacktestRunRecord.strategy_id == strategy_id)
         statement = statement.order_by(BacktestRunRecord.created_at.desc()).limit(limit)
-        return list(await self._scalars(statement))
+        return [_to_backtest_summary(record) for record in await self._scalars(statement)]
 
 
 # --------------------------------------------------------------------------- #
 # Record -> domain mapping
 # --------------------------------------------------------------------------- #
+def _to_session_summary(record: TradingSessionRecord) -> TradingSessionSummary:
+    return TradingSessionSummary(
+        session_id=record.id,
+        mode=record.mode,
+        status=record.status,
+        strategy_id=record.strategy_id,
+        symbols=tuple(record.symbols),
+        timeframe=record.timeframe,
+        base_currency=record.base_currency,
+        starting_equity=record.starting_equity,
+        final_equity=record.final_equity,
+        started_at=record.started_at,
+        finished_at=record.finished_at,
+        created_at=record.created_at,
+        error=record.error,
+        metrics=dict(record.metrics),
+        strategy_params=dict(record.strategy_params),
+    )
+
+
+def _to_backtest_summary(record: BacktestRunRecord) -> BacktestRunSummary:
+    return BacktestRunSummary(
+        run_id=record.id,
+        strategy_id=record.strategy_id,
+        symbols=tuple(record.symbols),
+        timeframe=record.timeframe,
+        status=record.status,
+        start=record.start,
+        end=record.end,
+        starting_equity=record.starting_equity,
+        final_equity=record.final_equity,
+        sharpe_ratio=record.sharpe_ratio,
+        max_drawdown_pct=record.max_drawdown_pct,
+        trade_count=record.trade_count,
+        created_at=record.created_at,
+    )
+
+
 def _to_risk_event(record: RiskEventRecord) -> RiskEvent:
     return RiskEvent(
         rule=record.rule,

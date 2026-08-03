@@ -22,12 +22,23 @@ from quantflow.persistence.repositories import CandleRepository, InstrumentRepos
 
 router = APIRouter(prefix="/market", tags=["market-data"])
 
+#: Symbols appear in URL paths as ``BTC-USDT`` or ``BTCUSDT``. The canonical ``BTC/USDT``
+#: form cannot be used there — see :func:`_parse_symbol`.
+SYMBOL_PATH_EXAMPLE = "BTC-USDT"
+
 #: Upper bound on a single candle request. Without a cap a client can ask for millions of
 #: rows and take the API down by accident.
 MAX_CANDLES = 5_000
 
 
 def _parse_symbol(raw: str) -> Symbol:
+    """Parse a symbol supplied as a URL path segment.
+
+    A slashed symbol (``BTC/USDT``) cannot travel in a path segment: percent-encoding it
+    does not help, because the server decodes ``%2F`` before routing and then sees an extra
+    segment. Clients must use the hyphenated (``BTC-USDT``) or concatenated (``BTCUSDT``)
+    form, both of which :meth:`Symbol.parse` accepts and normalises.
+    """
     parsed = Symbol.parse(raw)
     assert isinstance(parsed, Symbol)
     return parsed

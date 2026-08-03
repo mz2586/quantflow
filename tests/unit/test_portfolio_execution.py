@@ -566,3 +566,53 @@ class TestExecutionHelpers:
         assert stats.orders_submitted == 1
         assert stats.stale_signals == 1
         assert "signals_seen" in stats.to_dict()
+
+
+class TestStrategyAttribution:
+    """Positions must remember which strategy opened them.
+
+    Without it every ClosedTrade is `strategy_id=None`, all per-strategy analytics
+    collapse into one "unattributed" bucket, and there is no way to reconstruct which
+    strategy made or lost the money after the fact.
+    """
+
+    def test_a_new_position_records_its_strategy(
+        self, manager: PortfolioManager, btc: Symbol
+    ) -> None:
+        manager.apply_fill(fill(btc, OrderSide.BUY, "1", "50000"), strategy_id="donchian_breakout")
+        position = manager.position_for(btc)
+        assert position is not None
+        assert position.strategy_id == "donchian_breakout"
+
+    def test_closed_trades_inherit_the_attribution(
+        self, manager: PortfolioManager, btc: Symbol
+    ) -> None:
+        manager.apply_fill(
+            fill(btc, OrderSide.BUY, "1", "50000", fill_id="a"), strategy_id="ema_cross"
+        )
+        manager.apply_fill(
+            fill(btc, OrderSide.SELL, "1", "51000", fill_id="b", offset_seconds=60),
+            strategy_id="ema_cross",
+        )
+        assert manager.closed_trades[0].strategy_id == "ema_cross"
+
+    def test_reopening_adopts_the_new_owner(self, manager: PortfolioManager, btc: Symbol) -> None:
+        # Otherwise a symbol keeps whichever strategy happened to trade it first, forever.
+        manager.apply_fill(fill(btc, OrderSide.BUY, "1", "50000", fill_id="a"), strategy_id="first")
+        manager.apply_fill(
+            fill(btc, OrderSide.SELL, "1", "51000", fill_id="b", offset_seconds=60),
+            strategy_id="first",
+        )
+        manager.apply_fill(
+            fill(btc, OrderSide.BUY, "1", "52000", fill_id="c", offset_seconds=120),
+            strategy_id="second",
+        )
+        position = manager.position_for(btc)
+        assert position is not None
+        assert position.strategy_id == "second"
+
+    def test_attribution_is_optional(self, manager: PortfolioManager, btc: Symbol) -> None:
+        manager.apply_fill(fill(btc, OrderSide.BUY, "1", "50000"))
+        position = manager.position_for(btc)
+        assert position is not None
+        assert position.strategy_id is None

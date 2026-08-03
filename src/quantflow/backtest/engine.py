@@ -294,7 +294,7 @@ class BacktestEngine:
                     self._record_order(order)
                     if order.status.is_terminal and not order.fills:
                         continue  # a rejection carries a placeholder fill
-                    self._portfolio.apply_fill(fill)
+                    self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
                     self._attach_protection(order)
 
             # 3. Protective exits, evaluated against the bar's range rather than its close.
@@ -437,7 +437,7 @@ class BacktestEngine:
             fee_currency=symbol.quote,
             timestamp=candle.close_time,
         )
-        self._portfolio.apply_fill(fill)
+        self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
         logger.debug(
             "backtest.protective_exit",
             symbol=str(symbol),

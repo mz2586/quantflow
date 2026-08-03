@@ -183,9 +183,9 @@ async def list_runs(
         runs = await BacktestRepository(session).list_recent(limit=limit, strategy_id=strategy_id)
     return [
         {
-            "run_id": run.id,
+            "run_id": run.run_id,
             "strategy_id": run.strategy_id,
-            "symbols": run.symbols,
+            "symbols": list(run.symbols),
             "timeframe": run.timeframe.value,
             "status": run.status.value,
             "start": run.start.isoformat(),
@@ -194,7 +194,7 @@ async def list_runs(
             "sharpe_ratio": str(run.sharpe_ratio) if run.sharpe_ratio else None,
             "max_drawdown_pct": str(run.max_drawdown_pct) if run.max_drawdown_pct else None,
             "trade_count": run.trade_count,
-            "created_at": run.created_at.isoformat(),
+            "created_at": run.created_at.isoformat() if run.created_at else None,
         }
         for run in runs
     ]

@@ -225,9 +225,10 @@ class TestRiskEndpoints:
 
 class TestPortfolioEndpoint:
     async def test_no_session_gives_a_clear_message(self, client: httpx.AsyncClient) -> None:
-        # Better than a portfolio of zeros that reads as a flat account.
+        # Better than a portfolio of zeros that reads as a flat account. 404 rather than
+        # 500: nothing has traded yet, which is an absent resource, not a broken server.
         response = await client.get("/api/v1/portfolio")
-        assert response.status_code == 500
+        assert response.status_code == 404
         assert "no active trading session" in response.json()["error"]["message"]
 
     async def test_reports_live_portfolio_state(

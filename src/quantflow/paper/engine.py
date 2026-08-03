@@ -309,7 +309,7 @@ class PaperTradingEngine:
             self._orders[order.order_id] = order
             if order.status.is_terminal and not order.fills:
                 continue
-            self._portfolio.apply_fill(fill)
+            self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
             self._attach_protection(order)
             self._state.fills += 1
             await self._publish_fill(fill)
@@ -463,7 +463,7 @@ class PaperTradingEngine:
             fee_currency=symbol.quote,
             timestamp=candle.close_time,
         )
-        self._portfolio.apply_fill(fill)
+        self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
         self._state.fills += 1
         logger.info(
             "paper.protective_exit",

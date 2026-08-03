@@ -1,12 +1,20 @@
-"""Portfolio, orders, trades and equity-curve endpoints."""
+"""Portfolio, orders, trades and equity-curve endpoints.
+
+The portfolio is served from the **database** whenever the API process is not itself
+running the trading engine. That is the normal deployment: the API, the worker and the
+trading runner are separate processes, so an endpoint that only reads an in-process
+manager would return "no session" forever in production while trading proceeded happily
+next door.
+"""
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from quantflow.api.deps import DatabaseDep, StateDep
+from quantflow.api.deps import DatabaseDep, OptionalDatabaseDep, StateDep
 from quantflow.api.schemas import (
     EquityPointResponse,
     OrderResponse,
@@ -15,32 +23,135 @@ from quantflow.api.schemas import (
     SessionResponse,
     TradeResponse,
 )
-from quantflow.core.errors import ConfigurationError, NotFoundError
+from quantflow.core.clock import utc_now
+from quantflow.core.errors import NotFoundError
+from quantflow.core.logging import get_logger
 from quantflow.core.precision import ZERO, safe_divide
+from quantflow.domain.enums import PositionSide
 from quantflow.domain.instruments import Symbol
+from quantflow.persistence.database import Database
 from quantflow.persistence.repositories import (
     ClosedTradeRepository,
     EquityRepository,
     OrderRepository,
+    PositionRepository,
     TradingSessionRepository,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/portfolio", tags=["portfolio"])
 
 
-@router.get("", response_model=PortfolioResponse, summary="Current portfolio")
-async def get_portfolio(state: StateDep) -> PortfolioResponse:
-    """Current cash, positions, exposure and PnL.
+def _order_response(order: object) -> OrderResponse:
+    """Map a domain order onto the wire schema."""
+    from quantflow.domain.orders import Order
+
+    assert isinstance(order, Order)
+    return OrderResponse(
+        order_id=order.order_id,
+        client_order_id=order.client_order_id,
+        venue_order_id=order.venue_order_id,
+        symbol=order.symbol.slashed,
+        side=order.side,
+        order_type=order.order_type,
+        status=order.status,
+        quantity=order.quantity,
+        price=order.price,
+        filled_quantity=order.filled_quantity,
+        average_fill_price=order.average_fill_price,
+        fees_paid=order.fees_paid,
+        stop_loss_price=order.stop_loss_price,
+        strategy_id=order.strategy_id,
+        created_at=order.created_at,
+        updated_at=order.updated_at,
+        reject_reason=order.reject_reason,
+    )
+
+
+async def _portfolio_from_database(database: Database) -> PortfolioResponse:
+    """Reconstruct the portfolio from the most recent session's persisted state.
 
     Raises:
-        ConfigurationError: if no trading session is active, so the caller sees a clear
-            "nothing is running" rather than a portfolio of zeros that looks like a
-            flat account.
+        NotFoundError: if no session has ever run, which is genuinely different from a
+            session that has run and is flat.
+
+    """
+    async with database.read_session() as session:
+        sessions = await TradingSessionRepository(session).list_recent(limit=1)
+        if not sessions:
+            raise NotFoundError(
+                "no trading session has run yet; start a paper session to populate this"
+            )
+        record = sessions[0]
+        latest = await EquityRepository(session).latest(record.session_id)
+        positions = await PositionRepository(session).list_open(session_id=record.session_id)
+
+    starting = record.starting_equity
+    equity = latest.equity if latest is not None else starting
+    cash = latest.cash if latest is not None else starting
+
+    responses: list[PositionResponse] = []
+    gross_exposure = ZERO
+    unrealized = ZERO
+    for position in positions:
+        # The last mark is not persisted per position, so the entry price is used as the
+        # valuation reference. Labelled honestly rather than presented as a live mark.
+        mark = position.average_entry_price
+        gross_exposure += position.notional(mark)
+        responses.append(
+            PositionResponse(
+                symbol=position.symbol.slashed,
+                side=position.side,
+                quantity=position.quantity,
+                average_entry_price=position.average_entry_price,
+                mark_price=None,
+                unrealized_pnl=ZERO,
+                unrealized_pnl_pct=ZERO,
+                realized_pnl=position.realized_pnl,
+                stop_loss_price=position.stop_loss_price,
+                take_profit_price=position.take_profit_price,
+                opened_at=position.opened_at,
+                strategy_id=position.strategy_id,
+            )
+        )
+
+    return PortfolioResponse(
+        base_currency=record.base_currency,
+        equity=equity,
+        cash=cash,
+        starting_equity=starting,
+        total_return_pct=safe_divide(equity - starting, starting),
+        realized_pnl=latest.realized_pnl if latest else ZERO,
+        unrealized_pnl=unrealized,
+        fees_paid=ZERO,
+        gross_exposure=gross_exposure,
+        leverage=safe_divide(gross_exposure, equity),
+        drawdown_pct=latest.drawdown_pct if latest else ZERO,
+        daily_pnl=ZERO,
+        position_count=len(responses),
+        positions=tuple(responses),
+    )
+
+
+@router.get("", response_model=PortfolioResponse, summary="Current portfolio")
+async def get_portfolio(state: StateDep, database: OptionalDatabaseDep) -> PortfolioResponse:
+    """Current cash, positions, exposure and PnL.
+
+    Prefers the live in-process manager when the API is itself running an engine; falls
+    back to persisted session state otherwise, which is the normal multi-process case.
+
+    Raises:
+        NotFoundError: when there is neither a running engine nor a persisted session.
 
     """
     manager = state.portfolio
     if manager is None:
-        raise ConfigurationError("no active trading session; start a paper or live session first")
+        if database is None:
+            # Neither a live engine nor persistence: that is "nothing has traded",
+            # not a misconfiguration, and it should read that way to an operator.
+            raise NotFoundError("no active trading session")
+        return await _portfolio_from_database(database)
 
     snapshot = manager.snapshot()
     positions: list[PositionResponse] = []
@@ -97,28 +208,7 @@ async def list_orders(
             symbol=parsed if isinstance(parsed, Symbol) else None,
             session_id=session_id,
         )
-    return [
-        OrderResponse(
-            order_id=order.order_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=order.venue_order_id,
-            symbol=order.symbol.slashed,
-            side=order.side,
-            order_type=order.order_type,
-            status=order.status,
-            quantity=order.quantity,
-            price=order.price,
-            filled_quantity=order.filled_quantity,
-            average_fill_price=order.average_fill_price,
-            fees_paid=order.fees_paid,
-            stop_loss_price=order.stop_loss_price,
-            strategy_id=order.strategy_id,
-            created_at=order.created_at,
-            updated_at=order.updated_at,
-            reject_reason=order.reject_reason,
-        )
-        for order in orders
-    ]
+    return [_order_response(order) for order in orders]
 
 
 @router.get("/orders/open", response_model=list[OrderResponse], summary="Working orders")
@@ -128,28 +218,7 @@ async def list_open_orders(
     """Orders that can still receive fills."""
     async with database.read_session() as session:
         orders = await OrderRepository(session).list_open(session_id=session_id)
-    return [
-        OrderResponse(
-            order_id=order.order_id,
-            client_order_id=order.client_order_id,
-            venue_order_id=order.venue_order_id,
-            symbol=order.symbol.slashed,
-            side=order.side,
-            order_type=order.order_type,
-            status=order.status,
-            quantity=order.quantity,
-            price=order.price,
-            filled_quantity=order.filled_quantity,
-            average_fill_price=order.average_fill_price,
-            fees_paid=order.fees_paid,
-            stop_loss_price=order.stop_loss_price,
-            strategy_id=order.strategy_id,
-            created_at=order.created_at,
-            updated_at=order.updated_at,
-            reject_reason=order.reject_reason,
-        )
-        for order in orders
-    ]
+    return [_order_response(order) for order in orders]
 
 
 @router.get("/trades", response_model=list[TradeResponse], summary="Closed trades")
@@ -164,10 +233,6 @@ async def list_trades(
         if session_id:
             trades = await repository.list_for_session(session_id, limit=limit)
         else:
-            from datetime import timedelta
-
-            from quantflow.core.clock import utc_now
-
             now = utc_now()
             trades = await repository.list_between(now - timedelta(days=365), now, limit=limit)
     return [
@@ -217,6 +282,33 @@ async def get_equity_curve(
     ]
 
 
+@router.get("/equity", response_model=list[EquityPointResponse], summary="Latest equity curve")
+async def get_latest_equity_curve(
+    database: DatabaseDep,
+    limit: Annotated[int, Query(ge=1, le=100_000)] = 5_000,
+) -> list[EquityPointResponse]:
+    """The equity curve of the most recent session.
+
+    Saves the dashboard a round trip to discover the session id before it can draw a
+    chart, which would otherwise mean an empty panel on first paint.
+    """
+    async with database.read_session() as session:
+        sessions = await TradingSessionRepository(session).list_recent(limit=1)
+        if not sessions:
+            return []
+        curve = await EquityRepository(session).curve(sessions[0].session_id, limit=limit)
+    return [
+        EquityPointResponse(
+            timestamp=point.timestamp,
+            equity=point.equity,
+            cash=point.cash,
+            drawdown_pct=point.drawdown_pct,
+            position_count=point.position_count,
+        )
+        for point in curve
+    ]
+
+
 @router.get("/sessions", response_model=list[SessionResponse], summary="Recent sessions")
 async def list_sessions(
     database: DatabaseDep, limit: Annotated[int, Query(ge=1, le=200)] = 50
@@ -224,19 +316,26 @@ async def list_sessions(
     """Recent trading sessions, newest first."""
     async with database.read_session() as session:
         records = await TradingSessionRepository(session).list_recent(limit=limit)
-    return [
-        SessionResponse(
-            session_id=record.id,
-            mode=record.mode,
-            status=record.status,
-            strategy_id=record.strategy_id,
-            symbols=tuple(record.symbols),
-            timeframe=record.timeframe,
-            starting_equity=record.starting_equity,
-            final_equity=record.final_equity,
-            started_at=record.started_at,
-            finished_at=record.finished_at,
-            error=record.error,
-        )
-        for record in records
-    ]
+        # Built inside the session on purpose: these are ORM records, and the read
+        # session's rollback on exit expires them.
+        return [
+            SessionResponse(
+                session_id=record.session_id,
+                mode=record.mode,
+                status=record.status,
+                strategy_id=record.strategy_id,
+                symbols=tuple(record.symbols),
+                timeframe=record.timeframe,
+                starting_equity=record.starting_equity,
+                final_equity=record.final_equity,
+                started_at=record.started_at,
+                finished_at=record.finished_at,
+                error=record.error,
+            )
+            for record in records
+        ]
+
+
+def position_side_label(side: PositionSide) -> str:
+    """Human label for a position side."""
+    return side.value.upper()

@@ -258,7 +258,7 @@ class ExecutionEngine:
         """Fold an order's fills into the portfolio, skipping duplicates."""
         applied: list[Fill] = []
         for fill in order.fills:
-            self._portfolio.apply_fill(fill)
+            self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
             applied.append(fill)
         return tuple(applied)
 
