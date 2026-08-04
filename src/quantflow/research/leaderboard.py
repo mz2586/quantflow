@@ -62,6 +62,11 @@ class LeaderboardEntry:
     accepted: bool
     rejection_summary: str
     runs: tuple[StrategyRun, ...]
+    #: True when no run had a losing trade, which makes the profit factor undefined
+    #: rather than enormous. `compute_metrics` reports gross profit in that case so the
+    #: value serialises and sorts, but printing ~162,000 under a column headed "profit
+    #: factor" reads as a broken calculation. The flag lets the report say so instead.
+    profit_factor_undefined: bool = False
 
     @property
     def is_benchmark(self) -> bool:
@@ -133,6 +138,7 @@ def _entry_for(strategy_id: str, runs: Sequence[StrategyRun]) -> LeaderboardEntr
         accepted=accepted,
         rejection_summary=" | ".join(reasons),
         runs=tuple(runs),
+        profit_factor_undefined=all(run.metrics.loss_count == 0 for run in runs),
     )
 
 

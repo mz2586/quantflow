@@ -16,7 +16,7 @@ import json
 from collections.abc import Sequence
 from decimal import Decimal
 
-from quantflow.research.leaderboard import METRICS, RankedEntry, leaderboard
+from quantflow.research.leaderboard import METRICS, MetricSpec, RankedEntry, leaderboard
 from quantflow.research.runner import BENCHMARK_STRATEGY_ID, ResearchOutcome
 
 
@@ -26,6 +26,13 @@ def _fmt(value: Decimal, spec: str) -> str:
         return spec.format(value)
     except (ValueError, ArithmeticError):
         return "—"
+
+
+def _metric_cell(entry: RankedEntry, metric: MetricSpec) -> str:
+    """Render one metric, naming an undefined profit factor rather than printing it."""
+    if metric.key == "profit_factor" and entry.entry.profit_factor_undefined:
+        return "no losses"
+    return _fmt(metric.extract(entry.entry), metric.fmt)
 
 
 def _verdict(entry: RankedEntry) -> str:
@@ -131,7 +138,7 @@ def _md_leaderboard(board: Sequence[RankedEntry]) -> list[str]:
             str(entry.position),
             f"`{entry.entry.strategy_id}`",
             _verdict(entry),
-            *(_fmt(metric.extract(entry.entry), metric.fmt) for metric in METRICS),
+            *(_metric_cell(entry, metric) for metric in METRICS),
             "—" if entry.entry.excess_return is None else f"{entry.entry.excess_return:+.2%}",
             f"{entry.composite:.2f}",
         ]
@@ -172,9 +179,19 @@ def _md_rejections(board: Sequence[RankedEntry]) -> list[str]:
         )
         lines.append("")
         for entry in rejected:
+            # The benchmark is screened but is not a candidate for capital, so it is
+            # labelled rather than listed as a failed proposal. What it fails on is
+            # still worth reading: holding these assets meant sitting through drawdowns
+            # far past what the gate allows any strategy.
+            suffix = (
+                " *(benchmark — reported for context, not a candidate)*"
+                if entry.entry.is_benchmark
+                else ""
+            )
             lines.append(
                 f"### `{entry.entry.strategy_id}` — "
                 f"passed {entry.entry.symbols_accepted}/{entry.entry.symbols_tested} symbols"
+                f"{suffix}"
             )
             lines.append("")
             for run in entry.entry.runs:
@@ -200,9 +217,12 @@ def _md_detail(board: Sequence[RankedEntry]) -> list[str]:
     for entry in board:
         for run in entry.entry.runs:
             metrics = run.metrics
+            # Same "no losses" convention as the leaderboard: an undefined ratio must
+            # not be printed as a number here either.
+            factor = "no losses" if metrics.loss_count == 0 else f"{metrics.profit_factor:.2f}"
             lines.append(
                 f"| `{run.strategy_id}` | {run.symbol} | "
-                f"{metrics.total_return_pct:.2%} | {metrics.profit_factor:.2f} | "
+                f"{metrics.total_return_pct:.2%} | {factor} | "
                 f"{metrics.sharpe_ratio:.2f} | {metrics.max_drawdown_pct:.2%} | "
                 f"{metrics.win_rate:.2%} | {metrics.trade_count} | "
                 f"{metrics.total_fees:.2f} | "
@@ -240,6 +260,11 @@ def _md_footnotes() -> list[str]:
         "- These are **in-sample** results over a single historical period. Passing the gate "
         "makes a strategy a candidate for walk-forward validation, not a candidate for capital."
     )
+    lines.append(
+        "- Symbols can cover slightly different spans when live ingestion is running: the "
+        "bar counts above are per symbol for exactly that reason. To reproduce this run "
+        "exactly, pass the period end explicitly rather than letting it default to now."
+    )
     lines.append("")
     return lines
 
@@ -254,8 +279,7 @@ def build_html(outcome: ResearchOutcome) -> str:
         verdict = _verdict(entry)
         css = {"accepted": "ok", "rejected": "bad", "benchmark": "bench"}[verdict]
         cells = "".join(
-            f"<td class='num'>{html.escape(_fmt(metric.extract(entry.entry), metric.fmt))}</td>"
-            for metric in METRICS
+            f"<td class='num'>{html.escape(_metric_cell(entry, metric))}</td>" for metric in METRICS
         )
         excess = "—" if entry.entry.excess_return is None else f"{entry.entry.excess_return:+.2%}"
         rows.append(
@@ -273,6 +297,11 @@ def build_html(outcome: ResearchOutcome) -> str:
     for entry in board:
         if entry.entry.accepted:
             continue
+        label = (
+            f"{entry.entry.strategy_id} (benchmark - context, not a candidate)"
+            if entry.entry.is_benchmark
+            else entry.entry.strategy_id
+        )
         items = []
         for run in entry.entry.runs:
             for rejection in run.screen.rejections:
@@ -282,9 +311,7 @@ def build_html(outcome: ResearchOutcome) -> str:
                     f"{html.escape(rejection.detail)}</li>"
                 )
         if items:
-            rejection_blocks.append(
-                f"<h3>{html.escape(entry.entry.strategy_id)}</h3><ul>{''.join(items)}</ul>"
-            )
+            rejection_blocks.append(f"<h3>{html.escape(label)}</h3><ul>{''.join(items)}</ul>")
 
     threshold_rows = "".join(
         f"<tr><td>{html.escape(name)}</td><td class='num'>{html.escape(requirement)}</td></tr>"
@@ -400,7 +427,9 @@ def build_json(outcome: ResearchOutcome) -> str:
                 "composite": round(entry.composite, 4),
                 "ranks": entry.ranks,
                 "net_return": str(entry.entry.net_return),
-                "profit_factor": str(entry.entry.profit_factor),
+                "profit_factor": (
+                    None if entry.entry.profit_factor_undefined else str(entry.entry.profit_factor)
+                ),
                 "sharpe_ratio": str(entry.entry.sharpe_ratio),
                 "max_drawdown": str(entry.entry.max_drawdown),
                 "win_rate": str(entry.entry.win_rate),

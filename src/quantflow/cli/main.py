@@ -610,7 +610,7 @@ def _render_leaderboard(board: Sequence[RankedEntry]) -> Table:
             item.strategy_id,
             verdict,
             f"{item.net_return:.2%}",
-            f"{item.profit_factor:.2f}",
+            "no losses" if item.profit_factor_undefined else f"{item.profit_factor:.2f}",
             f"{item.sharpe_ratio:.2f}",
             f"{item.max_drawdown:.2%}",
             f"{item.win_rate:.2%}",

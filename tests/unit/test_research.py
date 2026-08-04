@@ -353,6 +353,35 @@ class TestLeaderboard:
         )
         assert board[0].entry.strategy_id == "balanced"
 
+    def test_a_flawless_record_marks_profit_factor_undefined(self) -> None:
+        # With no losing trades the ratio is undefined, not enormous. compute_metrics
+        # reports gross profit so the value sorts, but printing ~162,000 under a column
+        # headed "profit factor" reads as a broken calculation - which is exactly how
+        # buy-and-hold rendered before this flag existed.
+        from quantflow.research.leaderboard import aggregate
+
+        flawless = metrics(trades=4, win_rate="1.0", profit_factor="162203.47")
+        run = StrategyRun(
+            strategy_id="buy_and_hold",
+            symbol=Symbol(base="BTC", quote="USDT"),
+            metrics=flawless,
+            screen=screen(flawless),
+            params={},
+            bars=1000,
+            signals=1,
+            orders=1,
+            rejected_signals=0,
+            duration_seconds=0.0,
+        )
+        entry_built = aggregate(outcome_with((run,)))[0]
+        assert entry_built.profit_factor_undefined
+
+    def test_a_record_with_losses_reports_a_real_profit_factor(self) -> None:
+        from quantflow.research.leaderboard import aggregate
+
+        entry_built = aggregate(outcome_with((run_for("ema_cross", accepted=True),)))[0]
+        assert not entry_built.profit_factor_undefined
+
     def test_ranking_an_empty_board_is_not_an_error(self) -> None:
         assert rank([]) == ()
 
@@ -411,6 +440,27 @@ class TestReport:
         assert "<style>" in page
         assert "http://" not in page
         assert "https://" not in page
+
+    def test_an_undefined_profit_factor_is_named_not_printed(self) -> None:
+        from quantflow.research.leaderboard import aggregate, rank
+
+        flawless = metrics(trades=4, win_rate="1.0", profit_factor="162203.47")
+        run = StrategyRun(
+            strategy_id="buy_and_hold",
+            symbol=Symbol(base="BTC", quote="USDT"),
+            metrics=flawless,
+            screen=screen(flawless),
+            params={},
+            bars=1000,
+            signals=1,
+            orders=1,
+            rejected_signals=0,
+            duration_seconds=0.0,
+        )
+        outcome = outcome_with((run,))
+        assert "no losses" in build_markdown(outcome)
+        assert "162203" not in build_markdown(outcome)
+        assert rank(aggregate(outcome))[0].entry.profit_factor_undefined
 
     def test_json_round_trips(self) -> None:
         import json
