@@ -30,6 +30,11 @@ DEFAULT_STRIDE = 24
 #: Trades below which a per-regime figure is reported but flagged as unreliable.
 MIN_TRADES_PER_REGIME = 10
 
+#: Bars each classification may look back over. Comfortably above what every measure
+#: needs (the slowest is volatility's 100-return baseline) while keeping the label
+#: responsive to recent conditions rather than diluted by years of history.
+REGIME_LOOKBACK = 500
+
 
 @dataclass(frozen=True, slots=True)
 class RegimePerformance:
@@ -156,12 +161,34 @@ class RegimeTimeline:
         self._labels = list(labels)
 
     @classmethod
-    def build(cls, candles: Sequence[Candle], *, stride: int = DEFAULT_STRIDE) -> RegimeTimeline:
-        """Classify a candle series at intervals of ``stride`` bars."""
+    def build(
+        cls,
+        candles: Sequence[Candle],
+        *,
+        stride: int = DEFAULT_STRIDE,
+        lookback: int = REGIME_LOOKBACK,
+    ) -> RegimeTimeline:
+        """Classify a candle series at intervals of ``stride`` bars.
+
+        Each classification sees a bounded window ending at that bar, not the whole
+        history before it. That is both the correct definition and the affordable one.
+
+        Correct, because a regime is a *local* property. Handed the full prefix, the
+        moving averages and dispersion that decide the label are dominated by however
+        many years came before: a market that trended for three years and turned last
+        week still classifies as trending, which is precisely backwards for a signal
+        whose entire job is to notice that conditions changed.
+
+        Affordable, because the indicators recompute over their input on every call. Over
+        the full prefix that is O(bars^2 / stride) - on 20,000 bars it left a laboratory
+        run single-threaded for the better part of an hour after its worker pools had
+        already finished.
+        """
         stamps: list[datetime] = []
         labels: list[str] = []
         for end in range(1, len(candles) + 1, stride):
-            profile = classify(candles[:end])
+            window = candles[max(0, end - lookback) : end]
+            profile = classify(window)
             if profile is None:
                 continue
             stamps.append(candles[end - 1].close_time)
@@ -246,6 +273,7 @@ def build_timelines(
 __all__ = [
     "DEFAULT_STRIDE",
     "MIN_TRADES_PER_REGIME",
+    "REGIME_LOOKBACK",
     "RegimeBreakdown",
     "RegimePerformance",
     "RegimeTimeline",

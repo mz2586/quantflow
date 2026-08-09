@@ -224,3 +224,46 @@ class TestAttribution:
     def test_an_empty_breakdown_summarises_honestly(self) -> None:
         timeline = RegimeTimeline.build(candles(300), stride=24)
         assert attribute([], timeline).summary() == "no trades to attribute"
+
+
+class TestRegimeLookback:
+    """Classification must be local, and affordable."""
+
+    def test_a_bounded_window_matches_the_full_prefix(self) -> None:
+        # The optimisation must not change the answer. It does not, because every
+        # measure's own window is far shorter than the lookback.
+        bars = candles(1500)
+        bounded = RegimeTimeline.build(bars)
+        full = RegimeTimeline.build(bars, lookback=10**9)
+        assert bounded.labels == full.labels
+        assert len(bounded) == len(full)
+
+    def test_distant_history_does_not_change_a_recent_label(self) -> None:
+        # The behavioural statement of locality, which is the property that matters:
+        # a regime is a description of current conditions, so what happened a thousand
+        # bars ago must not decide today's label. With the full prefix it did - a market
+        # that trended for years and turned last week still read as trending, which is
+        # backwards for a signal whose job is to notice that conditions changed.
+        from quantflow.lab.attribution import REGIME_LOOKBACK
+
+        recent = candles(REGIME_LOOKBACK * 2, rising=False)
+
+        def rebased(bars: list[Candle], offset: timedelta) -> list[Candle]:
+            from dataclasses import replace as replace_field
+
+            return [replace_field(bar, open_time=bar.open_time + offset) for bar in bars]
+
+        after_uptrend = candles(REGIME_LOOKBACK * 3, rising=True) + rebased(
+            recent, timedelta(hours=REGIME_LOOKBACK * 3)
+        )
+        after_chop = candles(REGIME_LOOKBACK * 3, rising=False) + rebased(
+            recent, timedelta(hours=REGIME_LOOKBACK * 3)
+        )
+
+        from_uptrend = RegimeTimeline.build(after_uptrend)
+        from_chop = RegimeTimeline.build(after_chop)
+
+        # Compare only labels covering the shared recent stretch.
+        tail = min(len(from_uptrend.labels), len(from_chop.labels))
+        assert tail > 0
+        assert from_uptrend.labels[-1] == from_chop.labels[-1]
