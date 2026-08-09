@@ -76,7 +76,13 @@ def permissive_risk(**overrides: object) -> RiskSettings:
         "max_concurrent_positions": 5,
         "max_orders_per_minute": 600,
         "max_daily_loss_pct": Decimal("0.5"),
+        # The capital-preservation rules are relaxed here for the same reason as the
+        # rest: an end-to-end persistence test must measure persistence, not the caps.
+        # Their own behaviour is covered in test_risk_capital_preservation.py.
+        "max_weekly_loss_pct": Decimal("0.55"),
         "max_drawdown_pct": Decimal("0.6"),
+        "consecutive_loss_limit": 100,
+        "max_correlated_positions": 50,
     }
     kwargs.update(overrides)
     return RiskSettings(**kwargs)  # type: ignore[arg-type]

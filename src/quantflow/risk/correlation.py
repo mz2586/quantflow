@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from itertools import pairwise
 
@@ -28,6 +29,34 @@ from quantflow.domain.instruments import Symbol
 #: zero — treating an unmeasurable correlation as absence of correlation is the exact
 #: failure this module exists to prevent.
 MIN_OBSERVATIONS = 30
+
+
+def aligned_returns(
+    series: Mapping[Symbol, Sequence[tuple[datetime, Decimal]]],
+) -> dict[Symbol, tuple[Decimal, ...]]:
+    """Returns for every symbol, restricted to timestamps they all share.
+
+    Correlating by *position* is silently wrong whenever two series differ in length or
+    coverage — and they routinely do, because live ingestion updates some symbols before
+    others. Aligning on the intersection of timestamps costs one set operation and is the
+    difference between a real correlation and a comparison of two different weeks.
+    """
+    if not series:
+        return {}
+
+    common: set[datetime] | None = None
+    for points in series.values():
+        stamps = {stamp for stamp, _ in points}
+        common = stamps if common is None else (common & stamps)
+    if not common:
+        return dict.fromkeys(series, ())
+
+    ordered = sorted(common)
+    out: dict[Symbol, tuple[Decimal, ...]] = {}
+    for symbol, points in series.items():
+        lookup = dict(points)
+        out[symbol] = returns_from_prices([lookup[stamp] for stamp in ordered])
+    return out
 
 
 def returns_from_prices(prices: Sequence[Decimal]) -> tuple[Decimal, ...]:
@@ -133,6 +162,7 @@ def _key(left: Symbol, right: Symbol) -> tuple[str, str]:
 __all__ = [
     "MIN_OBSERVATIONS",
     "CorrelationMatrix",
+    "aligned_returns",
     "pearson",
     "returns_from_prices",
 ]
