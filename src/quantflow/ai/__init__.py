@@ -26,18 +26,30 @@ from quantflow.ai.regime import (
     extract_features,
     regime_history,
 )
+from quantflow.ai.research_agent import (
+    Finding,
+    FindingKind,
+    ResearchAgent,
+    ResearchReport,
+    Severity,
+)
 from quantflow.ai.strategy import AIAugmentedStrategy, wrap
 
 __all__ = [
     "AIAdvice",
     "AIAugmentedStrategy",
     "AIDecisionEngine",
+    "Finding",
+    "FindingKind",
     "GaussianMixtureRegimeDetector",
     "RegimeAdvisor",
     "RegimeDetector",
     "RegimeFeatures",
     "RegimeObservation",
+    "ResearchAgent",
+    "ResearchReport",
     "RuleBasedRegimeDetector",
+    "Severity",
     "assert_risk_reducing",
     "build_detector",
     "build_engine",
