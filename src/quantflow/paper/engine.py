@@ -34,6 +34,7 @@ from quantflow.domain.enums import MarketRegime, PositionSide, RunStatus, Timefr
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle, CandleSeries
 from quantflow.domain.orders import Fill, Order
+from quantflow.domain.positions import ClosedTrade
 from quantflow.domain.signals import Signal
 from quantflow.exchange.base import MarketDataGateway
 from quantflow.exchange.simulator import (
@@ -309,7 +310,8 @@ class PaperTradingEngine:
             self._orders[order.order_id] = order
             if order.status.is_terminal and not order.fills:
                 continue
-            self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
+            _, closed = self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
+            self._record_trade_results(closed)
             self._attach_protection(order)
             self._state.fills += 1
             await self._publish_fill(fill)
@@ -409,6 +411,15 @@ class PaperTradingEngine:
         )
         await self._persist_order(order)
 
+    def _record_trade_results(self, trades: Sequence[ClosedTrade]) -> None:
+        """Feed closed trades to the risk engine's loss-streak tracker.
+
+        The cooldown rule is only as good as what it is told: without this the streak
+        counter never advances and the rule silently never fires.
+        """
+        for trade in trades:
+            self._risk.record_trade_result(trade.net_pnl, closed_at=trade.exit_time)
+
     def _attach_protection(self, order: Order) -> None:
         """Apply protective levels once the order's fill has created the position."""
         levels = self._pending_protection.get(order.order_id)
@@ -463,7 +474,8 @@ class PaperTradingEngine:
             fee_currency=symbol.quote,
             timestamp=candle.close_time,
         )
-        self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
+        _, closed = self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
+        self._record_trade_results(closed)
         self._state.fills += 1
         logger.info(
             "paper.protective_exit",

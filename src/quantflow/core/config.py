@@ -258,6 +258,9 @@ class RiskSettings(BaseModel):
     )
     max_concurrent_positions: int = Field(default=5, ge=1, le=100)
     max_daily_loss_pct: Fraction = Decimal("0.03")
+    #: Rolling seven-day loss ceiling. A daily limit alone permits five consecutive days
+    #: at 2.9% each — inside the daily rule every time, and a 14% hole in a week.
+    max_weekly_loss_pct: Fraction = Decimal("0.08")
     max_drawdown_pct: Fraction = Decimal("0.15")
     default_stop_loss_pct: Fraction = Decimal("0.02")
     max_stop_loss_pct: Fraction = Decimal("0.20")
@@ -267,6 +270,17 @@ class RiskSettings(BaseModel):
     min_order_notional: PositiveDecimal = Decimal("10")
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)
     max_slippage_pct: Fraction = Decimal("0.01")
+    #: Absolute return correlation at or above which two positions count as one bet.
+    correlation_threshold: Fraction = Decimal("0.80")
+    #: How many mutually correlated positions may be held at once. Crypto is not a
+    #: diversified universe; five alt positions are usually one BTC position in costume.
+    max_correlated_positions: int = Field(default=2, ge=1, le=50)
+    #: Consecutive losing trades that trigger a cooldown.
+    consecutive_loss_limit: int = Field(default=4, ge=1, le=100)
+    #: Minutes of no new entries after the limit is hit. A losing streak is usually the
+    #: market telling you the regime changed; continuing to fire into it is how a bad day
+    #: becomes a bad month.
+    loss_cooldown_minutes: int = Field(default=240, ge=1, le=10_080)
 
     @model_validator(mode="after")
     def _validate_coherence(self) -> Self:
@@ -274,8 +288,10 @@ class RiskSettings(BaseModel):
             raise ValueError("max_position_pct cannot exceed max_total_exposure_pct")
         if self.default_stop_loss_pct > self.max_stop_loss_pct:
             raise ValueError("default_stop_loss_pct cannot exceed max_stop_loss_pct")
-        if self.max_daily_loss_pct > self.max_drawdown_pct:
-            raise ValueError("max_daily_loss_pct cannot exceed max_drawdown_pct")
+        if self.max_daily_loss_pct > self.max_weekly_loss_pct:
+            raise ValueError("max_daily_loss_pct cannot exceed max_weekly_loss_pct")
+        if self.max_weekly_loss_pct > self.max_drawdown_pct:
+            raise ValueError("max_weekly_loss_pct cannot exceed max_drawdown_pct")
         if self.min_order_notional >= self.max_order_notional:
             raise ValueError("min_order_notional must be below max_order_notional")
         return self

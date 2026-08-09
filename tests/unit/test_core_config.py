@@ -183,8 +183,18 @@ class TestRiskCoherence:
             RiskSettings(default_stop_loss_pct=Decimal("0.3"), max_stop_loss_pct=Decimal("0.1"))
 
     def test_daily_loss_cannot_exceed_max_drawdown(self) -> None:
+        # The limits form a chain: daily <= weekly <= drawdown. Raising the weekly cap
+        # alongside the daily one isolates the drawdown check being asserted here.
         with pytest.raises(PydanticValidationError, match="max_drawdown_pct"):
-            RiskSettings(max_daily_loss_pct=Decimal("0.2"), max_drawdown_pct=Decimal("0.1"))
+            RiskSettings(
+                max_daily_loss_pct=Decimal("0.2"),
+                max_weekly_loss_pct=Decimal("0.2"),
+                max_drawdown_pct=Decimal("0.1"),
+            )
+
+    def test_daily_loss_cannot_exceed_weekly_loss(self) -> None:
+        with pytest.raises(PydanticValidationError, match="max_weekly_loss_pct"):
+            RiskSettings(max_daily_loss_pct=Decimal("0.2"), max_weekly_loss_pct=Decimal("0.1"))
 
     def test_notional_bounds_must_be_ordered(self) -> None:
         with pytest.raises(PydanticValidationError, match="min_order_notional"):

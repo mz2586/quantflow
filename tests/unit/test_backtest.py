@@ -75,7 +75,13 @@ def permissive_risk(**overrides: object) -> RiskSettings:
         "max_concurrent_positions": 10,
         "max_orders_per_minute": 600,
         "max_daily_loss_pct": Decimal("0.99"),
+        # The capital-preservation rules are disabled here for the same reason as the
+        # rest: a test of the engine must measure the engine, not the caps. Their own
+        # behaviour is covered in test_risk_capital_preservation.py.
+        "max_weekly_loss_pct": Decimal("0.99"),
         "max_drawdown_pct": Decimal("0.99"),
+        "consecutive_loss_limit": 100,
+        "max_correlated_positions": 50,
         "max_stop_loss_pct": Decimal("0.9"),
     }
     kwargs.update(overrides)

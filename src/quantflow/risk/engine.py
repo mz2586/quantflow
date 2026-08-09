@@ -12,7 +12,7 @@ refusal. It never returns a partially-checked order.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -22,11 +22,12 @@ from quantflow.core.errors import RiskViolationError, ValidationError
 from quantflow.core.logging import get_logger
 from quantflow.core.precision import ONE, ZERO
 from quantflow.domain.enums import OrderSide, OrderType, SignalDirection
-from quantflow.domain.instruments import Instrument
+from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.orders import OrderRequest
 from quantflow.domain.portfolio import PortfolioSnapshot
 from quantflow.domain.signals import Signal
 from quantflow.persistence.database import Database
+from quantflow.risk.correlation import CorrelationMatrix
 from quantflow.risk.killswitch import KillSwitch
 from quantflow.risk.rules import RiskContext, RiskRule, RiskVerdict, build_default_rules
 from quantflow.risk.sizing import PositionSizer, SizingRequest, SizingResult, build_sizer
@@ -95,15 +96,20 @@ class RiskEngine:
 
     __slots__ = (
         "_clock",
+        "_consecutive_losses",
+        "_correlations",
         "_database",
         "_halted_until",
         "_kill_switch",
+        "_last_loss_at",
         "_notifier",
         "_order_timestamps",
         "_rules",
         "_session_id",
         "_settings",
         "_sizer",
+        "_week_start_equity",
+        "_week_started_at",
     )
 
     def __init__(
@@ -130,6 +136,15 @@ class RiskEngine:
         self._order_timestamps: list[datetime] = []
         #: UTC day for which trading is halted, if any.
         self._halted_until: datetime | None = None
+        #: Equity at the start of the rolling seven-day window, and when it was taken.
+        self._week_start_equity: Decimal | None = None
+        self._week_started_at: datetime | None = None
+        #: Losing trades closed back-to-back, and when the last one closed.
+        self._consecutive_losses = 0
+        self._last_loss_at: datetime | None = None
+        #: Return correlations between traded symbols. Supplied from outside because the
+        #: engine has no market data of its own and must never acquire any.
+        self._correlations = CorrelationMatrix(values={})
 
     # ------------------------------------------------------------------ #
     # State
@@ -226,6 +241,10 @@ class RiskEngine:
             orders_last_minute=self.orders_in_last_minute(now),
             kill_switch_engaged=self._kill_switch.engaged,
             trading_halted=self.is_halted,
+            week_start_equity=self._weekly_baseline(portfolio.equity, now),
+            consecutive_losses=self._consecutive_losses,
+            last_loss_at=self._last_loss_at,
+            correlated_open_symbols=self._correlated_open(request.symbol, portfolio),
         )
 
         verdicts = tuple(rule.evaluate(context) for rule in self._rules)
@@ -390,6 +409,56 @@ class RiskEngine:
             instrument=instrument,
             reference_price=reference_price,
         )
+
+    def set_correlations(self, matrix: CorrelationMatrix) -> None:
+        """Supply the current return-correlation estimate.
+
+        Pushed in rather than computed here: the risk engine owns decisions, not market
+        data, and giving it a data feed would make it impossible to test a rule without
+        also standing up a data source.
+        """
+        self._correlations = matrix
+
+    def record_trade_result(self, net_pnl: Decimal, *, closed_at: datetime) -> None:
+        """Record a closed trade so the loss-streak cooldown can track it.
+
+        A break-even trade counts as a loss: after fees it *is* one, and treating it as a
+        reset would let a strategy grind through the streak limit indefinitely.
+        """
+        if net_pnl > ZERO:
+            self._consecutive_losses = 0
+            return
+        self._consecutive_losses += 1
+        self._last_loss_at = closed_at
+
+    def _weekly_baseline(self, equity: Decimal, now: datetime) -> Decimal | None:
+        """Equity at the start of the current seven-day window.
+
+        Rolls forward rather than resetting on a calendar boundary: a drawdown that
+        straddles Sunday midnight is exactly as damaging as one that does not, and a
+        calendar reset would forgive it for no reason.
+        """
+        if self._week_start_equity is None or self._week_started_at is None:
+            self._week_start_equity = equity
+            self._week_started_at = now
+            return self._week_start_equity
+
+        if now - self._week_started_at >= timedelta(days=7):
+            self._week_start_equity = equity
+            self._week_started_at = now
+        return self._week_start_equity
+
+    def _correlated_open(self, candidate: Symbol, portfolio: PortfolioSnapshot) -> tuple[str, ...]:
+        """Open positions that move with the candidate beyond the threshold."""
+        open_symbols = [
+            position.symbol for position in portfolio.open_positions if position.symbol != candidate
+        ]
+        if not open_symbols:
+            return ()
+        hits = self._correlations.correlated_with(
+            candidate, open_symbols, threshold=self._settings.correlation_threshold
+        )
+        return tuple(str(symbol) for symbol in hits)
 
     def _default_stop(self, side: OrderSide, price: Decimal) -> Decimal:
         """Apply the configured default stop when a strategy supplies none.

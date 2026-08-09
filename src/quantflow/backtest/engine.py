@@ -294,7 +294,8 @@ class BacktestEngine:
                     self._record_order(order)
                     if order.status.is_terminal and not order.fills:
                         continue  # a rejection carries a placeholder fill
-                    self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
+                    _, closed = self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
+                    self._record_trade_results(closed)
                     self._attach_protection(order)
 
             # 3. Protective exits, evaluated against the bar's range rather than its close.
@@ -368,6 +369,15 @@ class BacktestEngine:
                 request.take_profit_price,
             )
 
+    def _record_trade_results(self, trades: Sequence[ClosedTrade]) -> None:
+        """Feed closed trades to the risk engine's loss-streak tracker.
+
+        The cooldown rule is only as good as what it is told: without this the streak
+        counter never advances and the rule silently never fires.
+        """
+        for trade in trades:
+            self._risk.record_trade_result(trade.net_pnl, closed_at=trade.exit_time)
+
     def _attach_protection(self, order: Order) -> None:
         """Apply an order's protective levels to the position it just opened.
 
@@ -437,7 +447,8 @@ class BacktestEngine:
             fee_currency=symbol.quote,
             timestamp=candle.close_time,
         )
-        self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
+        _, closed = self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
+        self._record_trade_results(closed)
         logger.debug(
             "backtest.protective_exit",
             symbol=str(symbol),

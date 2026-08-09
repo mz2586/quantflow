@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -87,6 +87,15 @@ class RiskContext:
     realized_pnl_today: Decimal = ZERO
     kill_switch_engaged: bool = False
     trading_halted: bool = False
+    #: Equity at the start of the rolling seven-day window, or None when unknown.
+    week_start_equity: Decimal | None = None
+    #: Losing trades closed back-to-back with no winner between them.
+    consecutive_losses: int = 0
+    #: When the most recent losing trade closed, for the cooldown clock.
+    last_loss_at: datetime | None = None
+    #: Open positions that move with the candidate beyond the correlation threshold.
+    #: Supplied by the engine, which owns the correlation estimate.
+    correlated_open_symbols: tuple[str, ...] = ()
 
     @property
     def notional(self) -> Decimal:
@@ -500,16 +509,120 @@ class SufficientCashRule(RiskRule):
 
 #: Evaluation order. Cheap, absolute blocks come first so an obviously-doomed order does
 #: not incur the cost of the exposure calculations.
+class MaxWeeklyLossRule(RiskRule):
+    """Halts new entries once the rolling seven-day loss limit is reached.
+
+    A daily limit alone is not enough: five consecutive days at 2.9% each pass the 3%
+    daily rule every single time and still leave a 14% hole in the account. The weekly
+    ceiling is what stops a slow bleed that never trips a daily check.
+    """
+
+    name = "max_weekly_loss"
+
+    def check(self, context: RiskContext) -> RiskVerdict:
+        """Deny entries once the week's loss exceeds the limit."""
+        baseline = context.week_start_equity
+        if baseline is None or baseline <= ZERO:
+            return RiskVerdict.allow(self.name, "no baseline equity for the week yet")
+
+        weekly_pnl = context.portfolio.equity - baseline
+        if weekly_pnl >= ZERO:
+            return RiskVerdict.allow(self.name)
+
+        loss_pct = safe_divide(-weekly_pnl, baseline)
+        limit = context.settings.max_weekly_loss_pct
+        if loss_pct >= limit:
+            return RiskVerdict.deny(
+                self.name,
+                f"seven-day loss {loss_pct:.2%} has reached the {limit:.2%} limit; "
+                "new entries are halted",
+                observed=loss_pct,
+                limit=limit,
+                severity=Severity.CRITICAL,
+                halts_trading=True,
+            )
+        return RiskVerdict.allow(self.name)
+
+
+class CorrelationLimitRule(RiskRule):
+    """Caps how many mutually correlated positions may be held at once.
+
+    Position-count limits assume positions are independent bets. In crypto they are
+    usually not: a basket of alts is one BTC beta expressed five ways, so a "diversified"
+    five-position book can carry five times the exposure that was actually sized for.
+    """
+
+    name = "correlation_limit"
+
+    def check(self, context: RiskContext) -> RiskVerdict:
+        """Deny an entry that would exceed the correlated-position cap."""
+        correlated = context.correlated_open_symbols
+        limit = context.settings.max_correlated_positions
+        if len(correlated) < limit:
+            return RiskVerdict.allow(self.name)
+
+        return RiskVerdict.deny(
+            self.name,
+            f"already holding {len(correlated)} position(s) correlated above "
+            f"{context.settings.correlation_threshold:.0%} with "
+            f"{context.request.symbol} ({', '.join(correlated)}); "
+            f"the cap is {limit}",
+            observed=Decimal(len(correlated)),
+            limit=Decimal(limit),
+            severity=Severity.WARNING,
+            symbol=str(context.request.symbol),
+        )
+
+
+class ConsecutiveLossCooldownRule(RiskRule):
+    """Pauses new entries after a run of losing trades.
+
+    A losing streak is usually the market saying the regime the strategy was built for is
+    no longer the regime being traded. Continuing to fire into it is how a bad day becomes
+    a bad month. The pause expires on its own — this is a brake, not a latch, and it must
+    not require an operator to come and clear it.
+    """
+
+    name = "consecutive_loss_cooldown"
+
+    def check(self, context: RiskContext) -> RiskVerdict:
+        """Deny entries while a post-streak cooldown is still running."""
+        limit = context.settings.consecutive_loss_limit
+        if context.consecutive_losses < limit or context.last_loss_at is None:
+            return RiskVerdict.allow(self.name)
+
+        elapsed = context.now - context.last_loss_at
+        cooldown = timedelta(minutes=context.settings.loss_cooldown_minutes)
+        if elapsed >= cooldown:
+            return RiskVerdict.allow(self.name, "cooldown has expired")
+
+        remaining = cooldown - elapsed
+        minutes = Decimal(str(round(remaining.total_seconds() / 60, 1)))
+        return RiskVerdict.deny(
+            self.name,
+            f"{context.consecutive_losses} consecutive losses hit the limit of {limit}; "
+            f"new entries pause for another {minutes} minute(s)",
+            observed=Decimal(context.consecutive_losses),
+            limit=Decimal(limit),
+            severity=Severity.WARNING,
+        )
+
+
+#: The standard rule set, ordered cheapest-and-hardest first: a latched kill switch or a
+#: breached loss limit should short-circuit before anything computes a notional.
 DEFAULT_RULES: tuple[type[RiskRule], ...] = (
     KillSwitchRule,
     TradingHaltedRule,
     MaxDrawdownRule,
+    MaxWeeklyLossRule,
     MaxDailyLossRule,
+    ConsecutiveLossCooldownRule,
     OrderRateRule,
     StopLossRequiredRule,
     InstrumentRule,
     OrderNotionalRule,
     MaxConcurrentPositionsRule,
+    CorrelationLimitRule,
     MaxPositionSizeRule,
     MaxTotalExposureRule,
     MaxLeverageRule,

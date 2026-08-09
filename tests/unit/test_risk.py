@@ -70,6 +70,8 @@ def permissive_settings(**overrides: object) -> RiskSettings:
         "max_position_pct": Decimal("1"),
         "max_total_exposure_pct": Decimal("1"),
         "max_order_notional": Decimal("1000000"),
+        "consecutive_loss_limit": 100,
+        "max_correlated_positions": 50,
     }
     kwargs.update(overrides)
     return settings(**kwargs)
