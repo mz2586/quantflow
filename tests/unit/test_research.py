@@ -496,3 +496,42 @@ class TestStrategyLibrary:
         registry = load_builtin_strategies()
         for name in registry.names():
             assert registry.create(name, {}).warmup_bars >= 1
+
+
+class TestWorkerSizing:
+    """Pool size must account for memory, not just cores."""
+
+    def test_an_explicit_request_is_honoured(self) -> None:
+        from quantflow.research.runner import workers_for
+
+        assert workers_for(1_000_000, requested=2) == 2
+
+    def test_a_request_of_zero_still_yields_one_worker(self) -> None:
+        from quantflow.research.runner import workers_for
+
+        assert workers_for(1000, requested=0) == 1
+
+    def test_a_huge_dataset_reduces_the_pool(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The failure this guards against: sizing by CPU alone, every worker receiving
+        # its own copy of the dataset under spawn, and the pool never starting. That
+        # presents as a hang, not an error - it stalled a run for five hours with 112 MB
+        # free and zero worker children.
+        from quantflow.research import runner
+
+        monkeypatch.setattr(runner, "available_memory_bytes", lambda: 100 * 1024 * 1024)
+        assert runner.workers_for(10_000_000) == 1
+
+    def test_a_small_dataset_uses_the_cpu_ceiling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from quantflow.research import runner
+
+        monkeypatch.setattr(runner, "available_memory_bytes", lambda: 64 * 1024**3)
+        assert runner.workers_for(100) == runner.default_worker_count()
+
+    def test_unknown_memory_falls_back_to_the_cpu_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Guessing low would serialise every sweep on platforms we cannot measure.
+        from quantflow.research import runner
+
+        monkeypatch.setattr(runner, "available_memory_bytes", lambda: None)
+        assert runner.workers_for(1_000_000) == runner.default_worker_count()

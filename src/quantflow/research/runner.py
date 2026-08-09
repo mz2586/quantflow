@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from quantflow.backtest.engine import BacktestConfig, BacktestEngine
@@ -73,14 +76,105 @@ def history_window_for(warmup_bars: int) -> int:
     return max(warmup_bars * HISTORY_WARMUP_MULTIPLE, MIN_HISTORY_BARS)
 
 
-def default_worker_count() -> int:
-    """Processes to run backtests in.
+#: Rough resident cost of one Candle once unpickled into a worker. Measured empirically
+#: on CPython 3.12: a frozen slots dataclass holding a Symbol, a Timeframe, a datetime,
+#: six Decimals and an int. Deliberately generous - underestimating this is what makes a
+#: sweep deadlock rather than merely run slowly.
+BYTES_PER_CANDLE = 1_200
 
-    Leaves two cores free so the machine stays usable during a sweep that can run for
-    tens of minutes. Backtests are pure, CPU-bound and independent, which makes them
-    close to the ideal case for process-level parallelism — and they cannot share a
-    thread pool usefully, because the work is Decimal arithmetic under the GIL.
+#: Fraction of free memory a sweep may claim. The rest belongs to everything else on the
+#: machine, including the parent process holding its own copy of the same data.
+MEMORY_BUDGET_SHARE = 0.5
+
+
+def available_memory_bytes() -> int | None:
+    """Physically free memory, or ``None`` when it cannot be determined.
+
+    Only genuinely free and inactive pages count. Compressed and swapped pages are not
+    available in any useful sense: allocating into them is what turns a slow sweep into a
+    thrashing one.
     """
+    # Read through a variable rather than `sys.platform` directly: mypy narrows the
+    # literal to the platform it is running on and then reports every other branch as
+    # unreachable, which would leave the Linux path unchecked.
+    platform = str(sys.platform)
+    readers: dict[str, Callable[[], int | None]] = {
+        "darwin": _macos_free_bytes,
+        "linux": _linux_free_bytes,
+    }
+    reader = readers.get(platform) or (_linux_free_bytes if platform.startswith("linux") else None)
+    if reader is None:
+        return None
+    try:
+        return reader()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def _macos_free_bytes() -> int | None:
+    """Free plus inactive bytes from vm_stat."""
+    output = subprocess.run(
+        ["/usr/bin/vm_stat"], capture_output=True, text=True, check=True, timeout=10
+    ).stdout
+    page_size = 4096
+    free = inactive = 0
+    for line in output.splitlines():
+        if "page size of" in line:
+            page_size = int(line.split("page size of")[1].split("bytes")[0].strip())
+        elif line.startswith("Pages free:"):
+            free = int(line.split(":")[1].strip().rstrip("."))
+        elif line.startswith("Pages inactive:"):
+            inactive = int(line.split(":")[1].strip().rstrip("."))
+    return (free + inactive) * page_size
+
+
+def _linux_free_bytes() -> int | None:
+    """MemAvailable from /proc/meminfo."""
+    with Path("/proc/meminfo").open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    return None
+
+
+def workers_for(total_candles: int, *, requested: int | None = None) -> int:
+    """How many worker processes this dataset can afford.
+
+    Under the *spawn* start method every worker receives its own unpickled copy of the
+    whole dataset. Sizing the pool by CPU count alone ignores that entirely, and on a
+    memory-constrained machine the workers simply never start: the parent then waits on
+    futures that will never complete, which presents as a hang rather than as an error.
+
+    That is not hypothetical - it is what stalled a laboratory run for five hours with
+    112 MB free and 7.8 GB of swap in use, spinning with zero children and no output.
+    """
+    ceiling = max(1, (os.cpu_count() or 2) - 2)
+    if requested is not None:
+        return max(1, requested)
+
+    free = available_memory_bytes()
+    if free is None or total_candles <= 0:
+        return ceiling
+
+    per_worker = total_candles * BYTES_PER_CANDLE
+    if per_worker <= 0:
+        return ceiling
+
+    affordable = int(free * MEMORY_BUDGET_SHARE) // per_worker
+    chosen = max(1, min(ceiling, affordable))
+    if chosen < ceiling:
+        logger.warning(
+            "research.workers_reduced_for_memory",
+            chosen=chosen,
+            cpu_ceiling=ceiling,
+            free_mb=free // (1024 * 1024),
+            per_worker_mb=per_worker // (1024 * 1024),
+        )
+    return chosen
+
+
+def default_worker_count() -> int:
+    """Worker count from CPU alone, ignoring memory. Prefer `workers_for`."""
     return max(1, (os.cpu_count() or 2) - 2)
 
 
@@ -333,7 +427,8 @@ class ResearchRunner:
             if strategy_id != BENCHMARK_STRATEGY_ID
             for symbol in self._config.symbols
         ]
-        workers = self._config.workers or default_worker_count()
+        total_candles = sum(len(candles) for candles in data.values())
+        workers = workers_for(total_candles, requested=self._config.workers)
         loop = asyncio.get_running_loop()
         logger.info("research.sweep_started", jobs=len(jobs), workers=workers)
         with ProcessPoolExecutor(
@@ -457,6 +552,7 @@ def failed_run_as_rejection(failure: FailedRun) -> Rejection:
 
 __all__ = [
     "BENCHMARK_STRATEGY_ID",
+    "BYTES_PER_CANDLE",
     "HISTORY_WARMUP_MULTIPLE",
     "MIN_HISTORY_BARS",
     "FailedRun",
@@ -464,6 +560,8 @@ __all__ = [
     "ResearchOutcome",
     "ResearchRunner",
     "StrategyRun",
+    "available_memory_bytes",
     "failed_run_as_rejection",
     "history_window_for",
+    "workers_for",
 ]
