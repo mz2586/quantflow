@@ -34,6 +34,7 @@ from quantflow.core.precision import ZERO
 from quantflow.domain.enums import Timeframe
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle
+from quantflow.domain.positions import ClosedTrade
 from quantflow.research.benchmark import buy_and_hold_metrics
 from quantflow.research.costs import CostModel, realistic
 from quantflow.research.thresholds import (
@@ -130,6 +131,7 @@ class _WorkerResponse:
     orders: int
     rejected_signals: int
     error: str | None = None
+    trades: tuple[ClosedTrade, ...] = ()
 
 
 def _run_in_worker(request: _WorkerRequest) -> _WorkerResponse:
@@ -180,6 +182,7 @@ def _run_in_worker(request: _WorkerRequest) -> _WorkerResponse:
         signals=len(result.signals),
         orders=len(result.orders),
         rejected_signals=len(result.rejected_signals),
+        trades=tuple(result.closed_trades),
     )
 
 
@@ -198,6 +201,10 @@ class StrategyRun:
     rejected_signals: int
     duration_seconds: float
     benchmark_return: Decimal | None = None
+    #: The round-trips this run produced. Needed to attribute performance to the regime
+    #: each trade was opened in; without them the laboratory would have to re-run the
+    #: whole backtest just to see the trades it already computed.
+    trades: tuple[ClosedTrade, ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -439,6 +446,7 @@ class ResearchRunner:
             rejected_signals=response.rejected_signals,
             duration_seconds=0.0,
             benchmark_return=None if is_benchmark else benchmark_return,
+            trades=response.trades,
         )
 
 
