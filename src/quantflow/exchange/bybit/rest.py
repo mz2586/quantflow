@@ -19,7 +19,7 @@ from typing import Any
 import ccxt.async_support as ccxt
 
 from quantflow.core.clock import Clock, SystemClock, to_epoch_ms
-from quantflow.core.config import ExchangeSettings
+from quantflow.core.config import ExchangeSettings, MarketType
 from quantflow.core.errors import (
     ExchangeError,
     InvalidSymbolError,
@@ -471,6 +471,32 @@ class BybitGateway:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    async def raw_account_info(self) -> dict[str, Any]:
+        """Bybit V5 account configuration: unified status and margin mode.
+
+        V5 returns *different balance structures* for UNIFIED and CLASSIC accounts, so a
+        balance figure cannot be trusted until the account type is known. There is no
+        CCXT-unified call for this, so the V5 endpoint is invoked directly — one of the
+        few places a venue-specific route is unavoidable.
+        """
+        self._require_trading()
+        raw = await self._call("account_info", self._client.privateGetV5AccountInfo)
+        result = (raw or {}).get("result")
+        return result if isinstance(result, dict) else {}
+
+    async def fetch_positions(self) -> list[dict[str, Any]]:
+        """Open derivative positions.
+
+        Spot accounts have no positions endpoint on V5; callers get an empty list rather
+        than an error, because "no positions" is the correct answer for a spot account
+        and raising here would make a spot verification look like a failure.
+        """
+        self._require_trading()
+        if self._settings.market_type is not MarketType.FUTURE:
+            return []
+        rows = await self._call("fetch_positions", self._client.fetch_positions)
+        return [row for row in (rows or []) if isinstance(row, dict)]
+
     def _require_trading(self) -> None:
         if not self.supports_trading:
             raise ExchangeError(
