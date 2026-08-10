@@ -186,6 +186,71 @@ export interface PerformanceReview {
   warnings: string[];
 }
 
+export interface LiveBalance {
+  asset: string;
+  free: Money;
+  locked: Money;
+  total: Money;
+}
+
+export interface LivePosition {
+  symbol: string;
+  side: string;
+  quantity: Money;
+  entry_price: Money;
+  mark_price: Money;
+  unrealized_pnl: Money;
+  leverage: Money;
+}
+
+export interface LiveOrder {
+  order_id: string;
+  venue_order_id: string | null;
+  symbol: string;
+  side: string;
+  type: string;
+  status: string;
+  quantity: Money;
+  filled: Money;
+  price: Money | null;
+  created_at: string;
+}
+
+/** Live exchange account, read straight from the venue. Never stored state. */
+export interface LiveAccount {
+  venue: string;
+  network: string;
+  authenticated: boolean;
+  total_balance: Money;
+  available_balance: Money;
+  balances: LiveBalance[];
+  positions: LivePosition[];
+  position_count: number;
+  unrealized_pnl: Money;
+  open_orders: LiveOrder[];
+  open_order_count: number;
+}
+
+export interface LiveFill {
+  fill_id: string;
+  order_id: string;
+  side: string;
+  price: Money;
+  quantity: Money;
+  fee: Money;
+  fee_currency: string;
+  role: string;
+  timestamp: string;
+}
+
+export interface LiveFills {
+  symbol: string;
+  count: number;
+  realized_pnl: Money;
+  total_fees: Money;
+  fills: LiveFill[];
+}
+
 export interface Session {
   session_id: string;
   mode: string;
@@ -299,6 +364,13 @@ export const api = {
     ),
 
   /** Performance review. Scoped to one session when given, for the reason above. */
+  /** Live venue account. Fails rather than falling back to stored paper state. */
+  account: () => request<LiveAccount>(`${BASE}/account`),
+  accountFills: (symbol: string, limit = 50) =>
+    request<LiveFills>(
+      `${BASE}/account/fills?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
+    ),
+
   review: (days = 90, sessionId?: string | null) =>
     request<PerformanceReview>(
       `${BASE}/analytics/review?days=${days}` +

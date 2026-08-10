@@ -29,6 +29,8 @@ import {
   type ReadinessResponse,
   type RiskEvent,
   type RiskStatus,
+  type LiveAccount,
+  type LiveFills,
   type SeriesSummary,
   type Session,
   type StrategyDescription,
@@ -185,6 +187,9 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [review, setReview] = useState<PerformanceReview | null>(null);
   const [session, setSession] = useState<Session | null>(null);
+  const [account, setAccount] = useState<LiveAccount | null>(null);
+  const [accountError, setAccountError] = useState<string | null>(null);
+  const [fills, setFills] = useState<LiveFills | null>(null);
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
@@ -217,6 +222,20 @@ export default function App() {
       settle(api.strategies(), setStrategies),
       settle(api.series(), setSeries),
       settle(api.review(365, sessionId), setReview),
+      settle(api.accountFills("BTC/USDT", 25), setFills),
+      (async () => {
+        try {
+          setAccount(await api.account());
+          setAccountError(null);
+        } catch (error) {
+          // Never fall back to stored paper state: a live balance that is silently a
+          // backtest number is worse than an error.
+          setAccount(null);
+          setAccountError(
+            error instanceof ApiError ? error.message : "live account unavailable",
+          );
+        }
+      })(),
       (async () => {
         try {
           setPortfolio(await api.portfolio());
@@ -320,6 +339,115 @@ export default function App() {
       />
 
       <main className="mx-auto max-w-7xl space-y-4 px-4 py-5">
+        <Panel
+          title={
+            account
+              ? `Live ${account.venue.toUpperCase()} account (${account.network})`
+              : "Live exchange account"
+          }
+        >
+          {accountError ? (
+            <Empty message={`Not connected: ${accountError}`} />
+          ) : !account ? (
+            <Empty message="Loading live account…" />
+          ) : (
+            <>
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
+                <Stat label="Total balance" value={money(account.total_balance)} />
+                <Stat label="Available" value={money(account.available_balance)} />
+                <Stat
+                  label="Unrealised PnL"
+                  value={signed(account.unrealized_pnl)}
+                  valueClass={tone(account.unrealized_pnl)}
+                />
+                <Stat
+                  label="Realised PnL"
+                  value={fills ? signed(fills.realized_pnl) : "—"}
+                  valueClass={fills ? tone(fills.realized_pnl) : ""}
+                  {...(fills ? { hint: `fees ${money(fills.total_fees)}` } : {})}
+                />
+                <Stat label="Open orders" value={String(account.open_order_count)} />
+              </div>
+
+              <div className="mt-4 grid gap-4 lg:grid-cols-2">
+                <div>
+                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                    Positions ({account.position_count})
+                  </div>
+                  {account.positions.length === 0 ? (
+                    <p className="text-sm text-zinc-500">No open positions.</p>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <tbody className="font-mono tabular-nums">
+                        {account.positions.map((position) => (
+                          <tr key={position.symbol} className="border-t border-zinc-800">
+                            <td className="py-1.5 font-sans">{position.symbol}</td>
+                            <td className="py-1.5">{position.side}</td>
+                            <td className="py-1.5 text-right">{quantity(position.quantity)}</td>
+                            <td className="py-1.5 text-right">{money(position.entry_price)}</td>
+                            <td
+                              className={`py-1.5 text-right ${tone(position.unrealized_pnl)}`}
+                            >
+                              {signed(position.unrealized_pnl)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+
+                <div>
+                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                    Recent fills{fills ? ` (${fills.symbol}, ${fills.count})` : ""}
+                  </div>
+                  {!fills || fills.fills.length === 0 ? (
+                    <p className="text-sm text-zinc-500">No fills on the venue.</p>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <tbody className="font-mono tabular-nums">
+                        {fills.fills.slice(0, 6).map((fill) => (
+                          <tr key={fill.fill_id} className="border-t border-zinc-800">
+                            <td className="py-1.5 font-sans">{time(fill.timestamp)}</td>
+                            <td className="py-1.5">{fill.side}</td>
+                            <td className="py-1.5 text-right">{quantity(fill.quantity)}</td>
+                            <td className="py-1.5 text-right">{money(fill.price)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+
+              {account.open_orders.length > 0 ? (
+                <div className="mt-4">
+                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
+                    Working orders
+                  </div>
+                  <table className="w-full text-sm">
+                    <tbody className="font-mono tabular-nums">
+                      {account.open_orders.map((order) => (
+                        <tr key={order.order_id} className="border-t border-zinc-800">
+                          <td className="py-1.5 font-sans">{order.symbol}</td>
+                          <td className="py-1.5">
+                            {order.side} {order.type}
+                          </td>
+                          <td className="py-1.5 text-right">{quantity(order.quantity)}</td>
+                          <td className="py-1.5 text-right">
+                            {order.price ? money(order.price) : "market"}
+                          </td>
+                          <td className="py-1.5 text-right">{order.status}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+            </>
+          )}
+        </Panel>
+
         {banner ? (
           <div className="rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm">
             {banner}

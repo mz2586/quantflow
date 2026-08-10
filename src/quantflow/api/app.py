@@ -19,16 +19,49 @@ from fastapi.middleware.cors import CORSMiddleware
 from quantflow import __version__
 from quantflow.api import middleware
 from quantflow.api.deps import AppState
-from quantflow.api.routers import analytics, backtest, marketdata, portfolio, risk, system
+from quantflow.api.routers import (
+    account,
+    analytics,
+    backtest,
+    marketdata,
+    portfolio,
+    risk,
+    system,
+)
 from quantflow.cache.redis import Cache, EventBus
 from quantflow.core.config import Settings, get_settings
 from quantflow.core.logging import configure_logging, get_logger
+from quantflow.exchange.base import ExchangeGateway
 from quantflow.notifications.dispatcher import build_dispatcher
 from quantflow.persistence.database import Database
 from quantflow.risk.engine import RiskEngine
 from quantflow.strategy.registry import load_builtin_strategies
 
 logger = get_logger(__name__)
+
+
+async def _connect_exchange(settings: Settings) -> ExchangeGateway | None:
+    """Open an authenticated exchange gateway, or return None.
+
+    Only attempted when credentials exist. A failure here degrades the account endpoints
+    rather than refusing to boot - but it never falls back to stored paper state, because
+    a dashboard silently showing yesterday's backtest as a live balance is worse than one
+    showing an error.
+    """
+    if not settings.exchange.has_credentials:
+        logger.info("startup.exchange_skipped", reason="no API credentials configured")
+        return None
+    try:
+        from quantflow.exchange.bybit import BybitGateway
+
+        gateway = BybitGateway(settings.exchange)
+        await gateway.connect()
+        logger.info("startup.exchange_connected", venue=gateway.name, testnet=gateway.is_testnet)
+    except Exception as exc:
+        logger.warning("startup.exchange_failed", error=str(exc))
+        return None
+    return gateway
+
 
 # FastAPI serialises response models straight to JSON bytes via Pydantic, so a custom
 # ORJSON response class is both unnecessary and (as of this version) deprecated.
@@ -73,6 +106,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         logger.warning("startup.redis_failed", error=str(exc))
         state.cache = None
+
+    state.gateway = await _connect_exchange(settings)
 
     dispatcher = build_dispatcher(settings.notifications)
     state.extras["dispatcher"] = dispatcher
@@ -150,6 +185,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(risk.router, prefix=prefix)
     app.include_router(backtest.router, prefix=prefix)
     app.include_router(analytics.router, prefix=prefix)
+    app.include_router(account.router, prefix=prefix)
 
     _install_websocket(app, prefix)
     return app
