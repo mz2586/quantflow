@@ -382,6 +382,7 @@ def trade_paper(
     symbol: Annotated[str, typer.Option()] = "BTC/USDT",
     timeframe: Annotated[str, typer.Option()] = "1h",
     equity: Annotated[float, typer.Option()] = 10000.0,
+    session_id: Annotated[str, typer.Option(help="Persisted session name")] = "paper-live",
 ) -> None:
     """Start a paper-trading session against live market data."""
     settings = _settings()
@@ -411,6 +412,10 @@ def trade_paper(
                     timeframe=parsed_timeframe,
                     starting_equity=Decimal(str(equity)),
                     risk=settings.risk,
+                    # Persisted so the dashboard reads this session rather than whatever
+                    # historical run happens to be newest in the database.
+                    persist=True,
+                    session_id=session_id,
                 ),
                 instruments={parsed_symbol: instrument},
                 database=database,

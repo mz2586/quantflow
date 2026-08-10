@@ -667,7 +667,36 @@ class TradingSessionRepository(Repository[TradingSessionRecord]):
         strategy_params: dict[str, Any] | None = None,
         risk_config: dict[str, Any] | None = None,
     ) -> TradingSessionRecord:
-        """Open a new session record."""
+        """Open a session record, reusing the id if it already exists.
+
+        A restart must not crash. A paper session that reconnects after a dropped
+        websocket, an operator restart or a container bounce comes back with the same
+        session id, and a plain INSERT turns every one of those into a unique-key
+        violation at startup — the platform dies precisely when it is trying to recover.
+
+        The existing row is reset to RUNNING and re-stamped rather than duplicated, so the
+        id stays stable for the dashboard while the run genuinely starts over.
+        """
+        existing = await self._session.get(TradingSessionRecord, session_id)
+        if existing is not None:
+            existing.status = RunStatus.RUNNING
+            existing.mode = mode
+            existing.strategy_id = strategy_id
+            existing.strategy_params = {
+                key: str(value) for key, value in (strategy_params or {}).items()
+            }
+            existing.symbols = [symbol.slashed for symbol in symbols]
+            existing.timeframe = timeframe
+            existing.base_currency = base_currency
+            existing.starting_equity = starting_equity
+            existing.started_at = utc_now()
+            existing.finished_at = None
+            existing.final_equity = None
+            existing.error = None
+            existing.risk_config = {key: str(value) for key, value in (risk_config or {}).items()}
+            await self._session.flush()
+            return existing
+
         record = TradingSessionRecord(
             id=session_id,
             mode=mode,
@@ -758,11 +787,18 @@ class EquityRepository(Repository[EquitySnapshotRecord]):
         await self._session.execute(statement)
 
     async def curve(self, session_id: str, *, limit: int = 100_000) -> list[EquityPoint]:
-        """The session's equity curve, oldest first."""
+        """The session's equity curve, oldest first, truncated to the most recent ``limit``.
+
+        The limit takes the *newest* points, not the oldest. Ordering ascending and then
+        limiting silently freezes a live chart: once a running session exceeds the limit,
+        every later point falls outside the window and the curve stops advancing while
+        still looking healthy. Selecting newest-first and reversing keeps a long session's
+        chart tracking the present.
+        """
         statement = (
             select(EquitySnapshotRecord)
             .where(EquitySnapshotRecord.session_id == session_id)
-            .order_by(EquitySnapshotRecord.timestamp)
+            .order_by(EquitySnapshotRecord.timestamp.desc())
             .limit(limit)
         )
         return [
@@ -775,7 +811,7 @@ class EquityRepository(Repository[EquitySnapshotRecord]):
                 realized_pnl=record.realized_pnl,
                 unrealized_pnl=record.unrealized_pnl,
             )
-            for record in await self._scalars(statement)
+            for record in reversed(list(await self._scalars(statement)))
         ]
 
     async def latest(self, session_id: str) -> EquityPoint | None:

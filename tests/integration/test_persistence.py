@@ -689,3 +689,93 @@ class TestBacktestRepository:
         assert stored.sharpe_ratio == Decimal("1.85")
         assert len(await repo.list_recent(strategy_id="ema_cross")) == 1
         assert await repo.list_recent(strategy_id="other") == []
+
+
+class TestSessionRestartSafety:
+    """A paper session must survive a restart under the same id."""
+
+    async def test_reopening_the_same_session_id_does_not_raise(
+        self, session: AsyncSession
+    ) -> None:
+        # The failure this guards: a dropped websocket, an operator restart or a container
+        # bounce all bring the session back with the same id, and a plain INSERT turned
+        # every one of those into a unique-key violation at startup — the platform dying
+        # exactly when it was trying to recover.
+        repo = TradingSessionRepository(session)
+        params = {
+            "session_id": "restart-me",
+            "mode": "paper",
+            "strategy_id": "donchian_breakout",
+            "symbols": [BTC],
+            "timeframe": Timeframe.M5,
+            "starting_equity": Decimal("10000"),
+        }
+        first = await repo.create(**params)  # type: ignore[arg-type]
+        await session.commit()
+        assert first.id == "restart-me"
+
+        second = await repo.create(**params)  # type: ignore[arg-type]
+        await session.commit()
+        assert second.id == "restart-me"
+        assert second.status is RunStatus.RUNNING
+
+    async def test_restart_clears_the_previous_terminal_state(self, session: AsyncSession) -> None:
+        # A finished session that restarts must not keep reporting its old final equity,
+        # or the dashboard shows a completed run while a live one is underway.
+        repo = TradingSessionRepository(session)
+        params = {
+            "session_id": "restart-after-finish",
+            "mode": "paper",
+            "strategy_id": "ema_cross",
+            "symbols": [BTC],
+            "timeframe": Timeframe.M5,
+            "starting_equity": Decimal("10000"),
+        }
+        await repo.create(**params)  # type: ignore[arg-type]
+        await repo.finish(
+            "restart-after-finish", status=RunStatus.COMPLETED, final_equity=Decimal("9000")
+        )
+        await session.commit()
+
+        reopened = await repo.create(**params)  # type: ignore[arg-type]
+        await session.commit()
+        assert reopened.status is RunStatus.RUNNING
+        assert reopened.final_equity is None
+        assert reopened.finished_at is None
+
+
+class TestEquityCurveWindow:
+    """A live chart must track the present, not freeze at the session start."""
+
+    async def test_the_limit_returns_the_newest_points(self, session: AsyncSession) -> None:
+        # Ordering ascending and then limiting silently freezes a running chart: once the
+        # session exceeds the limit every later point falls outside the window and the
+        # curve stops advancing while still looking healthy.
+        sessions = TradingSessionRepository(session)
+        await sessions.create(
+            session_id="curve-window",
+            mode="paper",
+            strategy_id="ema_cross",
+            symbols=[BTC],
+            timeframe=Timeframe.M5,
+            starting_equity=Decimal("10000"),
+        )
+        equity = EquityRepository(session)
+        base = datetime(2026, 6, 1, tzinfo=UTC)
+        for i in range(20):
+            await equity.add(
+                "curve-window",
+                EquityPoint(
+                    timestamp=base + timedelta(minutes=5 * i),
+                    equity=Decimal("10000") + Decimal(i),
+                    cash=Decimal("10000"),
+                    position_count=0,
+                ),
+            )
+        await session.commit()
+
+        window = await equity.curve("curve-window", limit=5)
+        assert len(window) == 5
+        # Newest five, still oldest-first within the window.
+        assert window[-1].equity == Decimal("10019")
+        assert window[0].equity == Decimal("10015")
