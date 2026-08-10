@@ -129,6 +129,15 @@ class ExecutionEngine:
         return self._mode
 
     @property
+    def portfolio(self) -> PortfolioManager:
+        """The portfolio this engine folds fills into.
+
+        Read-only accessor so callers that need account state - the AI service builds its
+        prompt from it - do not reach into a private attribute.
+        """
+        return self._portfolio
+
+    @property
     def open_orders(self) -> tuple[Order, ...]:
         """Locally tracked orders that can still receive fills."""
         return tuple(order for order in self._orders.values() if order.is_open)

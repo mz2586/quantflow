@@ -365,6 +365,43 @@ class StorageSettings(BaseModel):
             path.mkdir(parents=True, exist_ok=True)
 
 
+class LLMSettings(BaseModel):
+    """Configuration for the AI trading service's language-model client.
+
+    Provider-agnostic on purpose: the service depends on a protocol, not a vendor, so a
+    model can be swapped without touching the decision loop.
+    """
+
+    model_config = {"frozen": True}
+
+    #: Which client to build. "null" returns a deterministic HOLD and needs no
+    #: credentials - it is the default so that nothing accidentally makes paid API calls,
+    #: and so the service is testable with no network at all.
+    provider: Literal["null", "anthropic", "openai"] = "null"
+    model: str = "claude-sonnet-5"
+    api_key: OptionalSecret = None
+    base_url: str | None = None
+    #: Hard ceiling on response size. A model that rambles cannot be parsed anyway.
+    max_tokens: int = Field(default=1024, ge=64, le=8192)
+    #: Zero by default. A trading decision that changes between identical inputs cannot
+    #: be reasoned about, reproduced, or audited after a loss.
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    #: Seconds between decision cycles.
+    interval_seconds: float = Field(default=300.0, ge=5.0)
+    #: Candles handed to the model per symbol. Enough for context, few enough that the
+    #: prompt stays inside a sane budget.
+    candles_in_prompt: int = Field(default=100, ge=20, le=500)
+    #: Confidence below which the service holds regardless of the action returned.
+    min_confidence: Decimal = Field(default=Decimal("0.65"), ge=0, le=1)
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> Self:
+        if self.provider != "null" and self.api_key is None:
+            raise ValueError(f"provider {self.provider!r} requires QF_LLM__API_KEY")
+        return self
+
+
 class Settings(BaseSettings):
     """Root settings object. Construct via :func:`get_settings`."""
 
@@ -403,6 +440,7 @@ class Settings(BaseSettings):
     trading: TradingSettings = Field(default_factory=TradingSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     notifications: NotificationSettings = Field(default_factory=NotificationSettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
     ai: AISettings = Field(default_factory=AISettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
 
