@@ -1,6 +1,6 @@
 """Client-side rate limiting and retry policy.
 
-Binance publishes weighted rate limits and answers a breach with HTTP 429, then 418 (an IP
+Bybit V5 publishes per-endpoint request limits and answers a breach with HTTP 403 (an IP
 ban) if you keep going. Throttling on our side is therefore not politeness — it is the
 difference between a working system and a banned IP mid-position.
 """
@@ -166,7 +166,7 @@ async def retry_async[T](
 class RateLimiter:
     """Named token buckets, so heavyweight endpoints can be throttled independently.
 
-    Binance weights endpoints differently (an order book at depth 5000 costs 250x a
+    Venues weight endpoints differently (a deep order book costs far more than a
     ticker), so a single global bucket would either throttle cheap calls needlessly or fail
     to protect against expensive ones.
     """

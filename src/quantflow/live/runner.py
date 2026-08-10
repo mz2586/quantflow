@@ -42,8 +42,8 @@ from quantflow.core.logging import get_logger, log_context
 from quantflow.domain.enums import RunStatus, Timeframe
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle
-from quantflow.exchange.binance.rest import BinanceGateway
-from quantflow.exchange.binance.ws import BinanceStream
+from quantflow.exchange.bybit.rest import BybitGateway
+from quantflow.exchange.bybit.ws import BybitStream
 from quantflow.notifications.dispatcher import NotificationDispatcher, build_dispatcher
 from quantflow.paper.engine import PaperConfig, PaperSessionState, PaperTradingEngine
 from quantflow.persistence.database import Database
@@ -198,8 +198,8 @@ class TradingRunner:
         self._database: Database | None = None
         self._cache: Cache | None = None
         self._dispatcher: NotificationDispatcher | None = None
-        self._gateway: BinanceGateway | None = None
-        self._stream: BinanceStream | None = None
+        self._gateway: BybitGateway | None = None
+        self._stream: BybitStream | None = None
         self._engine: PaperTradingEngine | None = None
         self._stopping = asyncio.Event()
 
@@ -278,7 +278,7 @@ class TradingRunner:
                 cache = None
         self._cache = cache
 
-        self._gateway = BinanceGateway(settings.exchange, clock=self._clock)
+        self._gateway = BybitGateway(settings.exchange, clock=self._clock)
         await self._gateway.connect()
 
         instruments: dict[Symbol, Instrument] = {}
@@ -321,7 +321,7 @@ class TradingRunner:
         self._engine._risk = risk
 
         await self._engine.prepare(self._gateway)
-        self._stream = BinanceStream(settings.exchange, clock=self._clock)
+        self._stream = BybitStream(settings.exchange, clock=self._clock)
 
     async def _feed(self) -> AsyncIterator[Candle]:
         """Yield closed bars until a stop is requested."""

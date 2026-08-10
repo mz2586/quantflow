@@ -1,7 +1,7 @@
 """Domain enumerations.
 
 These are exchange-agnostic. Venue-specific spellings are translated in
-``quantflow.exchange.binance.mapping``.
+``quantflow.exchange.bybit.mapping``.
 """
 
 from __future__ import annotations

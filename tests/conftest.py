@@ -56,7 +56,7 @@ def eth() -> Symbol:
 
 @pytest.fixture
 def btc_instrument(btc: Symbol) -> Instrument:
-    """A BTC/USDT instrument with realistic Binance spot rules."""
+    """A BTC/USDT instrument with realistic Bybit spot rules."""
     return Instrument(
         symbol=btc,
         price_tick=Decimal("0.01"),

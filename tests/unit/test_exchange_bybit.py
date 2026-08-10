@@ -1,4 +1,4 @@
-"""CCXT/Binance translation: symbols, instruments, orders, fills and errors."""
+"""CCXT/Bybit translation: symbols, instruments, orders, fills and errors."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ from quantflow.domain.enums import (
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.orders import OrderRequest
 from quantflow.exchange.base import estimate_fee, normalize_order
-from quantflow.exchange.binance.mapping import (
+from quantflow.exchange.bybit.mapping import (
     from_ccxt_symbol,
     parse_fill,
     parse_instrument,
@@ -41,11 +41,12 @@ from quantflow.exchange.binance.mapping import (
     to_ccxt_symbol,
     translate_exception,
 )
-from quantflow.exchange.binance.ws import (
+from quantflow.exchange.bybit.ws import (
     CandleGapDetector,
-    _parse_book_ticker,
     _parse_kline,
+    _parse_ticker,
     _parse_trade,
+    bybit_interval,
     stream_url,
 )
 from tests.conftest import REFERENCE_TIME
@@ -370,56 +371,117 @@ def test_estimate_fee(btc_instrument: Instrument) -> None:
 
 
 class TestStreamUrls:
-    def test_selects_by_market_type_and_network(self) -> None:
+    def test_selects_by_category_and_network(self) -> None:
         from quantflow.core.config import ExchangeSettings
 
-        assert "testnet" in stream_url(ExchangeSettings(testnet=True))
-        assert stream_url(ExchangeSettings(testnet=False)).startswith("wss://stream.binance.com")
-        assert "fstream" in stream_url(
-            ExchangeSettings(testnet=False, market_type=MarketType.FUTURE)
+        # V5 opens one socket per category, so the category is part of the URL.
+        assert stream_url(ExchangeSettings(testnet=False)) == (
+            "wss://stream.bybit.com/v5/public/spot"
+        )
+        assert stream_url(ExchangeSettings(testnet=True)) == (
+            "wss://stream-testnet.bybit.com/v5/public/spot"
+        )
+        assert (
+            stream_url(ExchangeSettings(testnet=False, market_type=MarketType.FUTURE))
+            == "wss://stream.bybit.com/v5/public/linear"
         )
 
 
+class TestIntervalMapping:
+    """Bybit counts minutes as bare numbers and switches to letters at daily."""
+
+    def test_hours_are_expressed_in_minutes(self) -> None:
+        assert bybit_interval(Timeframe.H1) == "60"
+        assert bybit_interval(Timeframe.H4) == "240"
+
+    def test_minutes_pass_through_as_numbers(self) -> None:
+        assert bybit_interval(Timeframe.M15) == "15"
+
+    def test_daily_and_weekly_are_letters(self) -> None:
+        assert bybit_interval(Timeframe.D1) == "D"
+        assert bybit_interval(Timeframe.W1) == "W"
+
+    def test_an_unsupported_interval_is_refused(self) -> None:
+        # Substituting a neighbouring interval would feed a strategy bars it never asked
+        # for, which is worse than failing.
+        from quantflow.core.errors import MarketDataError
+
+        with pytest.raises(MarketDataError, match="no kline interval"):
+            bybit_interval(Timeframe.D3)
+
+
 class TestStreamPayloadParsing:
+    """V5 payloads share no field names with Binance's."""
+
     def test_kline(self, btc: Symbol) -> None:
         candle = _parse_kline(
             btc,
             Timeframe.H1,
             {
-                "t": 1767225600000,
-                "o": "50000.00",
-                "h": "50500.00",
-                "l": "49800.00",
-                "c": "50200.00",
-                "v": "123.456",
-                "q": "6200000.00",
-                "n": 4321,
-                "x": True,
+                "start": 1767225600000,
+                "end": 1767229199999,
+                "interval": "60",
+                "open": "50000.00",
+                "high": "50500.00",
+                "low": "49800.00",
+                "close": "50200.00",
+                "volume": "123.456",
+                "turnover": "6200000.00",
+                "confirm": True,
             },
         )
         assert candle.open_time == datetime(2026, 1, 1, tzinfo=UTC)
         assert candle.close == Decimal("50200.00")
-        assert candle.trades == 4321
+        # Bybit names quote volume "turnover"; reading "volume" for both would report
+        # base volume as quote volume and skew every liquidity measure.
+        assert candle.quote_volume == Decimal("6200000.00")
+        # V5 klines carry no trade count.
+        assert candle.trades == 0
 
-    def test_book_ticker(self, btc: Symbol) -> None:
-        ticker = _parse_book_ticker(
-            btc, {"b": "49999.00", "a": "50001.00", "E": 1767225600000}, REFERENCE_TIME
+    def test_kline_without_a_start_is_rejected(self, btc: Symbol) -> None:
+        from quantflow.core.errors import MarketDataError
+
+        with pytest.raises(MarketDataError, match="no start time"):
+            _parse_kline(btc, Timeframe.H1, {"open": "1", "close": "1"})
+
+    def test_ticker(self, btc: Symbol) -> None:
+        ticker = _parse_ticker(
+            btc,
+            {
+                "bid1Price": "49999.00",
+                "ask1Price": "50001.00",
+                "bid1Size": "2",
+                "ask1Size": "3",
+                "lastPrice": "50000.50",
+            },
+            {"ts": 1767225600000},
+            REFERENCE_TIME,
         )
         assert ticker.bid == Decimal("49999.00")
         assert ticker.mid == Decimal("50000.00")
+        assert ticker.last == Decimal("50000.50")
 
-    def test_book_ticker_without_prices_is_rejected(self, btc: Symbol) -> None:
+    def test_a_ticker_without_prices_is_rejected(self, btc: Symbol) -> None:
+        # Linear tickers are delta frames that may omit a side entirely, so a missing
+        # quote must be an error rather than a silent zero.
         from quantflow.core.errors import MarketDataError
 
         with pytest.raises(MarketDataError, match="usable prices"):
-            _parse_book_ticker(btc, {"b": "0", "a": "0"}, REFERENCE_TIME)
+            _parse_ticker(btc, {"bid1Price": "0", "ask1Price": "0"}, {}, REFERENCE_TIME)
 
-    def test_trade_side_follows_the_aggressor(self, btc: Symbol) -> None:
-        # Binance's `m` flag means the buyer was the maker, i.e. the aggressor sold.
-        sell = _parse_trade(btc, {"t": 1, "T": 1767225600000, "p": "1", "q": "1", "m": True})
-        buy = _parse_trade(btc, {"t": 2, "T": 1767225600000, "p": "1", "q": "1", "m": False})
+    def test_trade_side_is_the_aggressor_directly(self, btc: Symbol) -> None:
+        # Bybit reports the aggressor's side in `S`, the OPPOSITE convention to Binance's
+        # maker flag. Carrying the Binance logic across would invert every trade.
+        sell = _parse_trade(btc, {"i": "1", "T": 1767225600000, "p": "1", "v": "1", "S": "Sell"})
+        buy = _parse_trade(btc, {"i": "2", "T": 1767225600000, "p": "1", "v": "1", "S": "Buy"})
         assert sell.side is OrderSide.SELL
         assert buy.side is OrderSide.BUY
+
+    def test_a_trade_without_a_timestamp_is_rejected(self, btc: Symbol) -> None:
+        from quantflow.core.errors import MarketDataError
+
+        with pytest.raises(MarketDataError, match="no timestamp"):
+            _parse_trade(btc, {"i": "1", "p": "1", "v": "1", "S": "Buy"})
 
 
 class TestCandleGapDetector:

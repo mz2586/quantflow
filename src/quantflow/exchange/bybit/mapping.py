@@ -1,7 +1,19 @@
-"""Translation between CCXT/Binance wire formats and the QuantFlow domain.
+"""Translation between CCXT/Bybit V5 wire formats and the QuantFlow domain.
 
 Kept in one module so venue quirks are contained: everywhere else in the codebase, an
-order status is an :class:`OrderStatus`, never the string ``"NEW"``.
+order status is an :class:`OrderStatus`, never the string ``"New"``.
+
+Bybit V5 differs from other venues in ways that matter here:
+
+* Its market segments are **spot**, **linear** and **inverse**, not "future". CCXT wants
+  ``linear`` for USDT-margined perpetuals, and passing ``future`` silently selects the
+  wrong category.
+* Its status vocabulary is CamelCase (``PartiallyFilled``) and includes conditional-order
+  states (``Untriggered``, ``Triggered``, ``Deactivated``) that no other venue reports.
+  Both the raw forms and CCXT's lowercase normalisations are accepted, because which one
+  arrives depends on whether the value came through CCXT's unified parser or straight off
+  the wire in a websocket frame.
+* ``PostOnly`` is a time-in-force value rather than an order flag.
 """
 
 from __future__ import annotations
@@ -48,6 +60,9 @@ ORDER_TYPE_TO_CCXT: dict[OrderType, str] = {
 CCXT_TO_ORDER_TYPE: dict[str, OrderType] = {
     "market": OrderType.MARKET,
     "limit": OrderType.LIMIT,
+    # Bybit V5 returns CamelCase order types on the raw wire.
+    "Market": OrderType.MARKET,
+    "Limit": OrderType.LIMIT,
     "stop": OrderType.STOP_LIMIT,
     "stop_market": OrderType.STOP_MARKET,
     "stop_loss": OrderType.STOP_MARKET,
@@ -59,8 +74,10 @@ CCXT_TO_ORDER_TYPE: dict[str, OrderType] = {
     "limit_maker": OrderType.LIMIT,
 }
 
-#: Binance's own status vocabulary, plus the lowercase forms CCXT normalises to.
+#: Bybit V5's status vocabulary plus the lowercase forms CCXT normalises to. Both are
+#: needed: CCXT's unified parser lowercases, while a raw websocket frame does not.
 CCXT_TO_ORDER_STATUS: dict[str, OrderStatus] = {
+    # CCXT unified
     "new": OrderStatus.NEW,
     "open": OrderStatus.NEW,
     "partially_filled": OrderStatus.PARTIALLY_FILLED,
@@ -72,14 +89,29 @@ CCXT_TO_ORDER_STATUS: dict[str, OrderStatus] = {
     "pending_cancel": OrderStatus.PENDING_CANCEL,
     "rejected": OrderStatus.REJECTED,
     "expired": OrderStatus.EXPIRED,
-    "expired_in_match": OrderStatus.EXPIRED,
+    # Bybit V5 raw
+    "New": OrderStatus.NEW,
+    "PartiallyFilled": OrderStatus.PARTIALLY_FILLED,
+    "Filled": OrderStatus.FILLED,
+    "Cancelled": OrderStatus.CANCELLED,
+    "Rejected": OrderStatus.REJECTED,
+    # A conditional order that has not triggered is working, not filled.
+    "Untriggered": OrderStatus.NEW,
+    "Triggered": OrderStatus.NEW,
+    # Deactivated is Bybit's word for a conditional order cancelled before triggering.
+    "Deactivated": OrderStatus.CANCELLED,
+    # Partially filled then cancelled: the remainder is gone, so the order is terminal.
+    "PartiallyFilledCanceled": OrderStatus.CANCELLED,
 }
 
+#: Bybit V5 accepts GTC, IOC, FOK and PostOnly. It has no GTD, so a good-till-date order
+#: is sent as GTC rather than silently rejected by the venue - the expiry is enforced on
+#: our side, which is where the clock we trust lives anyway.
 TIME_IN_FORCE_TO_CCXT: dict[TimeInForce, str] = {
     TimeInForce.GTC: "GTC",
     TimeInForce.IOC: "IOC",
     TimeInForce.FOK: "FOK",
-    TimeInForce.GTD: "GTD",
+    TimeInForce.GTD: "GTC",
 }
 
 CCXT_TO_TIME_IN_FORCE: dict[str, TimeInForce] = {
@@ -87,18 +119,31 @@ CCXT_TO_TIME_IN_FORCE: dict[str, TimeInForce] = {
     "IOC": TimeInForce.IOC,
     "FOK": TimeInForce.FOK,
     "GTD": TimeInForce.GTD,
+    "PostOnly": TimeInForce.GTC,
     "PO": TimeInForce.GTC,
 }
 
 
 def to_ccxt_symbol(symbol: Symbol, market_type: MarketType = MarketType.SPOT) -> str:
-    """Render a symbol the way CCXT expects it.
+    """Render a symbol the way CCXT expects it for Bybit.
 
-    CCXT uses ``BTC/USDT`` for spot and ``BTC/USDT:USDT`` for linear perpetuals.
+    ``BTC/USDT`` for spot, ``BTC/USDT:USDT`` for a USDT-margined linear perpetual. The
+    settlement suffix is what tells CCXT to route to Bybit's ``linear`` category; without
+    it a futures order would be placed against the spot book.
     """
     if market_type is MarketType.FUTURE:
         return f"{symbol.slashed}:{symbol.quote}"
     return symbol.slashed
+
+
+def bybit_category(market_type: MarketType) -> str:
+    """Bybit V5's category name for a market segment.
+
+    V5 organises everything by category and rejects a request whose category does not
+    match the symbol. CCXT's ``defaultType`` must therefore be ``linear``, never
+    ``future`` - Bybit has no such category and the request fails at the venue.
+    """
+    return "linear" if market_type is MarketType.FUTURE else "spot"
 
 
 def from_ccxt_symbol(raw: str) -> Symbol:

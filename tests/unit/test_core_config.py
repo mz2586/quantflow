@@ -120,7 +120,7 @@ class TestBlankSecrets:
 
 
 class TestMarketDataRouting:
-    """Binance's testnet carries almost no history and synthetic prices.
+    """Bybit's testnet carries thin history and synthetic prices.
 
     Backtesting or warming up against it produces results that mean nothing, so public
     data is read from production by default even when trading on testnet.

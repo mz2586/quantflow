@@ -1,9 +1,13 @@
-"""Binance REST gateway, implemented over CCXT.
+"""Bybit V5 REST gateway, implemented over CCXT.
 
-CCXT rather than a hand-rolled client: it already tracks Binance's endpoint changes,
-signing rules and market metadata. Everything venue-specific that CCXT does *not*
-normalise — error semantics, precision handling, symbol forms — is handled here and in
-``mapping``, so nothing above this module ever sees a CCXT type.
+CCXT rather than a hand-rolled V5 client: its Bybit implementation already targets the V5
+endpoints, tracks their signing rules and keeps up with the category routing that V5
+requires. Everything venue-specific that CCXT does *not* normalise — error semantics,
+precision handling, symbol forms, category selection — is handled here and in ``mapping``,
+so nothing above this module ever sees a CCXT type.
+
+The gateway satisfies the same `ExchangeGateway` protocol as every other venue, which is
+why swapping Binance for Bybit touched no strategy, risk, execution or backtest code.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from typing import Any
 import ccxt.async_support as ccxt
 
 from quantflow.core.clock import Clock, SystemClock, to_epoch_ms
-from quantflow.core.config import ExchangeSettings, MarketType
+from quantflow.core.config import ExchangeSettings
 from quantflow.core.errors import (
     ExchangeError,
     InvalidSymbolError,
@@ -30,9 +34,10 @@ from quantflow.domain.market import Candle, OrderBook, OrderBookLevel, Ticker, T
 from quantflow.domain.orders import Fill, Order, OrderRequest
 from quantflow.domain.portfolio import Balance
 from quantflow.exchange.base import MAX_CANDLES_PER_REQUEST, InstrumentCache, normalize_order
-from quantflow.exchange.binance.mapping import (
+from quantflow.exchange.bybit.mapping import (
     ORDER_TYPE_TO_CCXT,
     TIME_IN_FORCE_TO_CCXT,
+    bybit_category,
     from_ccxt_symbol,
     parse_fill,
     parse_instrument,
@@ -44,8 +49,13 @@ from quantflow.exchange.ratelimit import RateLimiter, retry_async
 
 logger = get_logger(__name__)
 
-#: Binance request weights, used to size the token-bucket cost of each call. Sourced from
-#: the published API limits; deep order books are dramatically more expensive than tickers.
+#: Relative request costs used to size the token-bucket spend of each call.
+#:
+#: Bybit V5 rate-limits by requests-per-second per endpoint group rather than by Binance's
+#: weight system, so these are not venue-published weights - they are a local ordering
+#: that keeps expensive calls from crowding out cheap ones. Kept because the limiter needs
+#: *some* relative cost, and a flat 1.0 everywhere would let a burst of order-book reads
+#: starve order placement.
 ENDPOINT_WEIGHTS: dict[str, float] = {
     "load_markets": 10.0,
     "fetch_candles": 2.0,
@@ -61,17 +71,17 @@ ENDPOINT_WEIGHTS: dict[str, float] = {
     "server_time": 1.0,
 }
 
-#: Maximum tolerated difference between our clock and Binance's. Binance rejects a signed
-#: request whose timestamp is outside its recv window, so drift beyond this is a hard fault
-#: rather than something to retry through.
+#: Maximum tolerated difference between our clock and Bybit's. V5 rejects a signed request
+#: whose timestamp falls outside ``recvWindow`` (error 10002), so drift beyond this is a
+#: hard fault rather than something to retry through.
 MAX_CLOCK_DRIFT_SECONDS = 5.0
 
 #: An order-book level is [price, quantity].
 ORDER_BOOK_LEVEL_WIDTH = 2
 
 
-class BinanceGateway:
-    """Binance spot / USDⓈ-M futures gateway.
+class BybitGateway:
+    """Bybit V5 spot / linear-perpetual gateway.
 
     Implements :class:`~quantflow.exchange.base.ExchangeGateway`.
     """
@@ -95,7 +105,7 @@ class BinanceGateway:
             settings.rate_limit_per_second, settings.rate_limit_burst, clock=self._clock
         )
         self._client = self._build_client(settings)
-        # Binance's testnet has almost no history and synthetic prices, so public data is
+        # Bybit's testnet carries thin history and synthetic prices, so public data is
         # read from production unless explicitly disabled. This client carries no
         # credentials — public endpoints do not need them.
         self._data_client = (
@@ -110,8 +120,8 @@ class BinanceGateway:
         self._local_by_venue_id: dict[str, str] = {}
 
     @staticmethod
-    def _build_client(settings: ExchangeSettings) -> ccxt.binance:
-        client = ccxt.binance(
+    def _build_client(settings: ExchangeSettings) -> ccxt.bybit:
+        client = ccxt.bybit(
             {
                 "apiKey": settings.api_key.get_secret_value() if settings.api_key else None,
                 "secret": settings.api_secret.get_secret_value() if settings.api_secret else None,
@@ -120,9 +130,10 @@ class BinanceGateway:
                 # token bucket; belt and braces is cheap here and an IP ban is not.
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": (
-                        "future" if settings.market_type is MarketType.FUTURE else "spot"
-                    ),
+                    # Bybit V5 has no "future" category. USDT-margined perpetuals are
+                    # "linear"; sending "future" makes CCXT build a request the venue
+                    # rejects outright.
+                    "defaultType": bybit_category(settings.market_type),
                     "recvWindow": settings.recv_window_ms,
                     "adjustForTimeDifference": True,
                 },
@@ -138,7 +149,7 @@ class BinanceGateway:
     @property
     def name(self) -> str:
         """Venue identifier."""
-        return "binance"
+        return "bybit"
 
     @property
     def is_testnet(self) -> bool:
@@ -185,7 +196,8 @@ class BinanceGateway:
     async def _assert_clock_sync(self) -> None:
         """Fail fast on clock drift.
 
-        A signed Binance request whose timestamp falls outside ``recvWindow`` is rejected.
+        A signed Bybit V5 request whose timestamp falls outside ``recvWindow`` is rejected
+        with error 10002.
         Detecting that at startup beats discovering it when an exit order is rejected.
         """
         if not self.supports_trading:
@@ -492,7 +504,7 @@ def _safe_decimal(value: Any) -> Decimal:
 def _parse_ticker(symbol: Symbol, raw: dict[str, Any], now: datetime) -> Ticker:
     """Build a :class:`Ticker`, falling back to ``last`` when a side is missing.
 
-    Some Binance pairs briefly report a null bid or ask; using ``last`` keeps the mark
+    Some Bybit pairs briefly report a null bid or ask; using ``last`` keeps the mark
     price usable instead of failing an otherwise healthy trading loop.
     """
     from quantflow.core.clock import from_epoch_ms

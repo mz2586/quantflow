@@ -21,14 +21,14 @@ from typing import Final
 from quantflow.core.errors import ValidationError
 from quantflow.exchange.simulator import FeeModel, FixedSlippage, SlippageModel, VolumeShareSlippage
 
-#: Binance spot taker fee at the base VIP tier, paid on both legs of a round trip.
-#: No BNB discount and no fee-tier improvement is assumed — both are privileges that can
-#: be withdrawn, and a strategy that needs them is not robust.
-BINANCE_SPOT_TAKER: Final = Decimal("0.001")
+#: Bybit V5 spot taker fee at the base VIP tier, paid on both legs of a round trip.
+#: No token discount and no fee-tier improvement is assumed — both are privileges that
+#: can be withdrawn, and a strategy that needs them is not robust.
+BYBIT_SPOT_TAKER: Final = Decimal("0.001")
 
-#: Binance spot maker fee at the base tier. Present for completeness; every strategy in
+#: Bybit V5 spot maker fee at the base tier. Present for completeness; every strategy in
 #: the library trades market orders, so the taker rate is what actually applies.
-BINANCE_SPOT_MAKER: Final = Decimal("0.001")
+BYBIT_SPOT_MAKER: Final = Decimal("0.001")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,12 +50,12 @@ class CostModel:
         reduced to a constant. Useful as a sanity anchor: a strategy whose average trade
         return is below this number cannot be profitable, whatever the backtest says.
         """
-        taker = self.fees.taker_rate if self.fees.taker_rate is not None else BINANCE_SPOT_TAKER
+        taker = self.fees.taker_rate if self.fees.taker_rate is not None else BYBIT_SPOT_TAKER
         return taker * 2
 
 
 def realistic() -> CostModel:
-    """The default research cost model: Binance base-tier taker fees plus volume slippage.
+    """The default research cost model: Bybit base-tier taker fees plus volume slippage.
 
     Slippage scales with the share of a bar's volume the order consumes, so a strategy is
     penalised for wanting size the market could not actually supply. A flat basis-point
@@ -64,12 +64,12 @@ def realistic() -> CostModel:
     """
     return CostModel(
         name="realistic",
-        description="Binance spot base tier, market orders, volume-scaled slippage",
-        fees=FeeModel(maker_rate=BINANCE_SPOT_MAKER, taker_rate=BINANCE_SPOT_TAKER),
+        description="Bybit V5 spot base tier, market orders, volume-scaled slippage",
+        fees=FeeModel(maker_rate=BYBIT_SPOT_MAKER, taker_rate=BYBIT_SPOT_TAKER),
         slippage=VolumeShareSlippage(),
         summary=(
-            f"taker {BINANCE_SPOT_TAKER:.3%} / maker {BINANCE_SPOT_MAKER:.3%} per fill "
-            f"({BINANCE_SPOT_TAKER * 2:.2%} per round trip), volume-scaled slippage, "
+            f"taker {BYBIT_SPOT_TAKER:.3%} / maker {BYBIT_SPOT_MAKER:.3%} per fill "
+            f"({BYBIT_SPOT_TAKER * 2:.2%} per round trip), volume-scaled slippage, "
             "market orders filled at the next bar's open"
         ),
     )
@@ -82,7 +82,7 @@ def pessimistic() -> CostModel:
     this is not living on the edge of its cost assumptions; one that collapses was never
     really profitable, it was profitable *at one specific cost estimate*.
     """
-    doubled = BINANCE_SPOT_TAKER * 2
+    doubled = BYBIT_SPOT_TAKER * 2
     return CostModel(
         name="pessimistic",
         description="Double fees plus a fixed 10 bp slippage floor",

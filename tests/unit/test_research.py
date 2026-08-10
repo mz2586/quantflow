@@ -148,7 +148,7 @@ class TestThresholds:
 class TestCosts:
     """Cost presets must be explicit and pessimistic."""
 
-    def test_realistic_charges_binance_base_tier_on_both_legs(self) -> None:
+    def test_realistic_charges_bybit_base_tier_on_both_legs(self) -> None:
         assert realistic().round_trip_cost_pct() == Decimal("0.002")
 
     def test_pessimistic_is_strictly_worse_than_realistic(self) -> None:

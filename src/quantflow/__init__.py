@@ -1,4 +1,4 @@
-"""QuantFlow — AI-powered algorithmic trading platform for Binance."""
+"""QuantFlow — AI-powered algorithmic trading platform for Bybit."""
 
 from __future__ import annotations
 

@@ -280,7 +280,7 @@ class TestSimulatedBroker:
         assert len(broker.open_orders) == 0
 
     def test_submit_enforces_venue_rules(self, btc: Symbol, btc_instrument: Instrument) -> None:
-        # Skipping this would let a backtest fill orders Binance would have rejected.
+        # Skipping this would let a backtest fill orders the venue would have rejected.
         broker = self._broker(btc_instrument)
         with pytest.raises(ValidationError, match=r"min_notional|below minimum"):
             broker.submit(

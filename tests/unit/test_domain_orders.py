@@ -58,7 +58,7 @@ def make_fill(
 
 
 class TestClientOrderId:
-    def test_fits_binance_limit(self) -> None:
+    def test_fits_venue_limit(self) -> None:
         assert len(new_client_order_id()) <= 36
 
     def test_is_unique(self) -> None:

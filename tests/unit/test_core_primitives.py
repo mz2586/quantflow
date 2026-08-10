@@ -245,8 +245,8 @@ class TestLogging:
         self, settings: Settings, capsys: pytest.CaptureFixture[str]
     ) -> None:
         configure_logging(settings)
-        get_logger("test.plain").info("connecting", host="binance.com")
-        assert "binance.com" in capsys.readouterr().err
+        get_logger("test.plain").info("connecting", host="bybit.com")
+        assert "bybit.com" in capsys.readouterr().err
 
     def test_non_string_keys_do_not_crash_the_logger(
         self, settings: Settings, capsys: pytest.CaptureFixture[str]

@@ -43,9 +43,9 @@ class Worker:
 
     async def start(self) -> None:
         """Run until stopped."""
-        from quantflow.exchange.binance.rest import BinanceGateway
+        from quantflow.exchange.bybit.rest import BybitGateway
 
-        self._gateway = BinanceGateway(self.settings.exchange)
+        self._gateway = BybitGateway(self.settings.exchange)
         try:
             await self._gateway.connect()
         except Exception as exc:

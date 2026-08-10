@@ -1,4 +1,4 @@
-"""Exchange integration: the gateway protocol, Binance connector and simulated venue."""
+"""Exchange integration: the gateway protocol, Bybit V5 connector and simulated venue."""
 
 from __future__ import annotations
 

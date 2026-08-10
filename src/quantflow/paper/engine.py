@@ -632,7 +632,7 @@ class PaperTradingEngine:
 async def candle_feed(
     stream: Any, symbols: Sequence[Symbol], timeframe: Timeframe
 ) -> AsyncIterator[Candle]:
-    """Adapt a :class:`~quantflow.exchange.binance.ws.BinanceStream` into a bar feed.
+    """Adapt a :class:`~quantflow.exchange.bybit.ws.BybitStream` into a bar feed.
 
     ``closed_only=True`` is not optional: a forming bar's close is still moving, and a
     strategy acting on it is trading information the backtest never had.

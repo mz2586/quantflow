@@ -176,18 +176,18 @@ class RedisSettings(BaseModel):
 
 
 class ExchangeSettings(BaseModel):
-    """Binance (or other CCXT venue) connection settings."""
+    """Bybit V5 (or other CCXT venue) connection settings."""
 
     model_config = {"frozen": True}
 
-    name: str = "binance"
+    name: str = "bybit"
     api_key: OptionalSecret = None
     api_secret: OptionalSecret = None
     testnet: bool = True
-    #: Read public market data from production even when trading on testnet. Binance's
-    #: testnet carries almost no history and its prices are synthetic, so backtesting or
-    #: warming up a strategy on it produces results that mean nothing. Public endpoints
-    #: need no credentials, so this costs nothing and is on by default.
+    #: Read public market data from production even when trading on testnet. Bybit's
+    #: testnet carries thin history and synthetic prices, so backtesting or warming up a
+    #: strategy on it produces results that mean nothing. Public endpoints need no
+    #: credentials, so this costs nothing and is on by default.
     market_data_from_production: bool = True
     market_type: MarketType = MarketType.SPOT
     rate_limit_per_second: float = Field(default=10.0, gt=0, le=100)

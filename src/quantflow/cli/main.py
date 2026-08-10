@@ -144,7 +144,7 @@ def download_data(
     end_at = _parse_date(end) if end else None
 
     async def run() -> None:
-        from quantflow.exchange.binance.rest import BinanceGateway
+        from quantflow.exchange.bybit.rest import BybitGateway
         from quantflow.marketdata.downloader import HistoricalDownloader, estimate_requests
         from quantflow.persistence.database import Database
 
@@ -154,7 +154,7 @@ def download_data(
             f"from {start_at.date()} (~{expected} requests)"
         )
 
-        gateway = BinanceGateway(settings.exchange)
+        gateway = BybitGateway(settings.exchange)
         database = Database.from_settings(settings)
         try:
             await gateway.connect()
@@ -389,8 +389,8 @@ def trade_paper(
     parsed_timeframe = Timeframe.parse(timeframe)
 
     async def run() -> None:
-        from quantflow.exchange.binance.rest import BinanceGateway
-        from quantflow.exchange.binance.ws import BinanceStream
+        from quantflow.exchange.bybit.rest import BybitGateway
+        from quantflow.exchange.bybit.ws import BybitStream
         from quantflow.paper.engine import PaperConfig, PaperTradingEngine, candle_feed
         from quantflow.persistence.database import Database
         from quantflow.strategy.registry import load_builtin_strategies
@@ -398,7 +398,7 @@ def trade_paper(
         registry = load_builtin_strategies()
         engine_strategy = registry.create(strategy)
 
-        gateway = BinanceGateway(settings.exchange)
+        gateway = BybitGateway(settings.exchange)
         database = Database.from_settings(settings)
         try:
             await gateway.connect()
@@ -421,7 +421,7 @@ def trade_paper(
                 f"{parsed_timeframe.value}. Press Ctrl-C to stop."
             )
 
-            stream = BinanceStream(settings.exchange)
+            stream = BybitStream(settings.exchange)
             feed = candle_feed(stream, [parsed_symbol], parsed_timeframe)
             await engine.run(feed)
         except KeyboardInterrupt:

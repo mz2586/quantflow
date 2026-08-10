@@ -1,8 +1,9 @@
 """The exchange boundary.
 
 Everything above this line — strategies, risk, execution, backtesting — depends only on
-:class:`ExchangeGateway`. That is what lets the *same* engine code run against Binance, the
-paper broker and the backtest simulator without a single conditional on trading mode.
+:class:`ExchangeGateway`. That is what lets the *same* engine code run against Bybit, the
+paper broker and the backtest simulator without a single conditional on trading mode — and
+it is why replacing Binance with Bybit V5 changed no strategy, risk or execution code.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from quantflow.domain.market import Candle, OrderBook, Ticker, Trade
 from quantflow.domain.orders import Fill, Order, OrderRequest
 from quantflow.domain.portfolio import Balance
 
-#: Binance returns at most 1000 klines per request; the downloader paginates on this.
+#: Bybit V5 returns at most 1000 klines per request; the downloader paginates on this.
 MAX_CANDLES_PER_REQUEST = 1000
 
 
@@ -132,7 +133,7 @@ class ExchangeGateway(MarketDataGateway, TradingGateway, Protocol):
 
     @property
     def name(self) -> str:
-        """Venue identifier, e.g. ``binance``."""
+        """Venue identifier, e.g. ``bybit``."""
         ...
 
     @property
