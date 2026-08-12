@@ -379,14 +379,18 @@ def list_strategies() -> None:
 @trade_app.command("paper")
 def trade_paper(
     strategy: Annotated[str, typer.Option()] = "ema_cross",
-    symbol: Annotated[str, typer.Option()] = "BTC/USDT",
+    symbol: Annotated[str, typer.Option(help="One pair, or several comma-separated")] = "BTC/USDT",
     timeframe: Annotated[str, typer.Option()] = "1h",
     equity: Annotated[float, typer.Option()] = 10000.0,
     session_id: Annotated[str, typer.Option(help="Persisted session name")] = "paper-live",
 ) -> None:
     """Start a paper-trading session against live market data."""
     settings = _settings()
-    parsed_symbol = _parse_symbol(symbol)
+    # Several symbols share one account, so portfolio-level exposure, concurrent-position
+    # and correlation limits apply across the whole book rather than per symbol.
+    parsed_symbols = tuple(
+        _parse_symbol(item.strip()) for item in symbol.split(",") if item.strip()
+    )
     parsed_timeframe = Timeframe.parse(timeframe)
 
     async def run() -> None:
@@ -403,12 +407,12 @@ def trade_paper(
         database = Database.from_settings(settings)
         try:
             await gateway.connect()
-            instrument = await gateway.get_instrument(parsed_symbol)
+            instruments = {sym: await gateway.get_instrument(sym) for sym in parsed_symbols}
 
             engine = PaperTradingEngine(
                 engine_strategy,
                 PaperConfig(
-                    symbols=(parsed_symbol,),
+                    symbols=parsed_symbols,
                     timeframe=parsed_timeframe,
                     starting_equity=Decimal(str(equity)),
                     risk=settings.risk,
@@ -417,17 +421,18 @@ def trade_paper(
                     persist=True,
                     session_id=session_id,
                 ),
-                instruments={parsed_symbol: instrument},
+                instruments=instruments,
                 database=database,
             )
             await engine.prepare(gateway)
             console.print(
-                f"[green]Paper trading[/] {strategy} on {parsed_symbol} "
+                f"[green]Paper trading[/] {strategy} on "
+                f"{len(parsed_symbols)} symbol(s) "
                 f"{parsed_timeframe.value}. Press Ctrl-C to stop."
             )
 
             stream = BybitStream(settings.exchange)
-            feed = candle_feed(stream, [parsed_symbol], parsed_timeframe)
+            feed = candle_feed(stream, list(parsed_symbols), parsed_timeframe)
             await engine.run(feed)
         except KeyboardInterrupt:
             console.print("\n[yellow]stopping[/]")

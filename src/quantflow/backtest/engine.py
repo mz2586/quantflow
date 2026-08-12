@@ -25,7 +25,7 @@ from decimal import Decimal
 from typing import Any
 
 from quantflow.core.clock import FrozenClock
-from quantflow.core.config import RiskSettings, TradingMode
+from quantflow.core.config import MarketType, RiskSettings, TradingMode
 from quantflow.core.errors import BacktestError, InsufficientDataError
 from quantflow.core.logging import get_logger, log_context
 from quantflow.core.precision import ZERO
@@ -50,6 +50,7 @@ from quantflow.exchange.simulator import (
     SlippageModel,
     VolumeShareSlippage,
 )
+from quantflow.portfolio.funding import FundingSchedule
 from quantflow.portfolio.manager import PortfolioManager
 from quantflow.risk.engine import RiskEngine, assert_protected
 from quantflow.strategy.base import Strategy, StrategyContext
@@ -80,6 +81,14 @@ class BacktestConfig:
     """Override the strategy's own warm-up. Rarely needed."""
     max_history_bars: int = MAX_HISTORY_BARS
     reject_oversized_orders: bool = True
+    #: Same accounting as paper and live, so a backtest cannot describe a spot account while
+    #: the strategy trades perps.
+    market_type: MarketType = MarketType.SPOT
+    #: Pinned to 1x so the backtest cannot quietly assume leverage the live account does not
+    #: use. Live reconciles to the venue's value; a backtest has no venue to ask.
+    leverage: Decimal = Decimal("1")
+    #: Historical funding rates per symbol, keyed by settlement time.
+    funding: dict[Symbol, FundingSchedule] = field(default_factory=dict)
     risk_free_rate: float = 0.0
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -157,6 +166,8 @@ class BacktestEngine:
         # the result is historical rather than wall-clock.
         self._clock = FrozenClock()
         self._portfolio = PortfolioManager(
+            market_type=config.market_type,
+            leverage=config.leverage,
             base_currency=config.base_currency,
             starting_equity=config.starting_equity,
             clock=self._clock,
@@ -179,6 +190,15 @@ class BacktestEngine:
     def portfolio(self) -> PortfolioManager:
         """The portfolio being simulated."""
         return self._portfolio
+
+    def _funding_rate_for(self, symbol: Symbol, settled_at: datetime) -> Decimal | None:
+        """The historical rate that applied at a settlement, or ``None`` if unknown.
+
+        Unknown means no charge. A backtest that guessed a rate would be inventing a cost,
+        which is exactly as dishonest as ignoring a real one.
+        """
+        schedule = self._config.funding.get(symbol)
+        return schedule.rate_at(settled_at) if schedule is not None else None
 
     async def run(self, data: dict[Symbol, Sequence[Candle]]) -> BacktestResult:
         """Replay the supplied bars.
@@ -305,6 +325,9 @@ class BacktestEngine:
             # 4. Mark and sample.
             for symbol, candle in current.items():
                 self._portfolio.update_mark_price(symbol, candle.close)
+            # Funding settles before the equity sample so the curve reflects it.
+            if self._config.market_type is MarketType.FUTURE and self._config.funding:
+                self._portfolio.settle_funding(moment, rate_for=self._funding_rate_for)
             self._portfolio.record_equity(moment)
             processed += 1
 
@@ -376,7 +399,9 @@ class BacktestEngine:
         counter never advances and the rule silently never fires.
         """
         for trade in trades:
-            self._risk.record_trade_result(trade.net_pnl, closed_at=trade.exit_time)
+            self._risk.record_trade_result(
+                trade.net_pnl, closed_at=trade.exit_time, symbol=trade.symbol
+            )
 
     def _attach_protection(self, order: Order) -> None:
         """Apply an order's protective levels to the position it just opened.

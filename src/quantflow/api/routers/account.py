@@ -153,7 +153,7 @@ async def get_fills(
                 "quantity": str(fill.quantity),
                 "fee": str(fill.fee),
                 "fee_currency": fill.fee_currency,
-                "role": fill.liquidity_role.value,
+                "role": fill.role.value,
                 "timestamp": fill.timestamp.isoformat(),
             }
             for fill in fills

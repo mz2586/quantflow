@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -26,15 +26,15 @@ from typing import Any
 
 from quantflow.cache.redis import EventBus
 from quantflow.core.clock import Clock, SystemClock
-from quantflow.core.config import RiskSettings, TradingMode
+from quantflow.core.config import MarketType, RiskSettings, TradingMode
 from quantflow.core.errors import MarketDataError, ValidationError
 from quantflow.core.logging import get_logger, log_context
 from quantflow.core.precision import ZERO
-from quantflow.domain.enums import MarketRegime, PositionSide, RunStatus, Timeframe
+from quantflow.domain.enums import MarketRegime, OrderSide, PositionSide, RunStatus, Timeframe
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle, CandleSeries
 from quantflow.domain.orders import Fill, Order
-from quantflow.domain.positions import ClosedTrade
+from quantflow.domain.positions import ClosedTrade, Position
 from quantflow.domain.signals import Signal
 from quantflow.exchange.base import MarketDataGateway
 from quantflow.exchange.simulator import (
@@ -43,13 +43,23 @@ from quantflow.exchange.simulator import (
     SlippageModel,
     VolumeShareSlippage,
 )
+from quantflow.execution.router import OrderRouter, SimulatedOrderRouter
+from quantflow.intelligence.snapshot import portfolio_correlations
 from quantflow.persistence.database import Database
 from quantflow.portfolio.manager import PortfolioManager
 from quantflow.risk.engine import RiskEngine, assert_protected
+from quantflow.risk.monitor import LossMonitor
 from quantflow.strategy.base import Strategy, StrategyContext
 from quantflow.strategy.indicators import atr
 
 logger = get_logger(__name__)
+
+#: Bars a symbol needs before it contributes to the correlation estimate. Below this the
+#: estimate is noise, and a spurious correlation would block legitimate trades.
+MIN_CORRELATION_BARS = 60
+
+#: A correlation needs two series. Below this there is nothing to compare.
+MIN_SYMBOLS_FOR_CORRELATION = 2
 
 #: How many closed bars to preload per symbol before trading starts. A strategy that has
 #: not warmed up produces nothing, so seeding history is what makes the engine useful from
@@ -75,6 +85,14 @@ class PaperConfig:
     slippage: SlippageModel = field(default_factory=VolumeShareSlippage)
     fees: FeeModel = field(default_factory=FeeModel)
     history_bars: int = DEFAULT_HISTORY_BARS
+    #: Drives the portfolio's accounting. Paper must use the SAME margin math as live, or
+    #: paper results describe an account that does not exist on the venue.
+    market_type: MarketType = MarketType.SPOT
+    leverage: Decimal = Decimal("1")
+    #: Funding rate lookup, ``(symbol, settled_at) -> rate or None``. Left unset, no funding
+    #: is charged - correct for spot, and honest for a perp session with no rate source
+    #: rather than inventing one.
+    funding_rate_for: Callable[[Symbol, datetime], Decimal | None] | None = None
     persist: bool = True
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
@@ -121,8 +139,10 @@ class PaperTradingEngine:
         "_database",
         "_history",
         "_instruments",
+        "_loss_monitor",
         "_orders",
         "_pending_protection",
+        "_persisted_trades",
         "_portfolio",
         "_risk",
         "_state",
@@ -139,6 +159,7 @@ class PaperTradingEngine:
         database: Database | None = None,
         event_bus: EventBus | None = None,
         clock: Clock | None = None,
+        router: OrderRouter | None = None,
     ) -> None:
         self._strategy = strategy
         self._config = config
@@ -150,6 +171,8 @@ class PaperTradingEngine:
             base_currency=config.base_currency,
             starting_equity=config.starting_equity,
             clock=self._clock,
+            market_type=config.market_type,
+            leverage=config.leverage,
         )
         self._risk = RiskEngine(
             config.risk,
@@ -157,14 +180,24 @@ class PaperTradingEngine:
             database=self._database,
             session_id=config.session_id,
         )
-        self._broker = SimulatedBroker(
-            instruments=instruments, slippage=config.slippage, fees=config.fees
+        # Injectable so a LIVE session can route to the venue instead. Defaulting to the
+        # simulator keeps backtest and paper unchanged; the point of the seam is that a live
+        # session can no longer silently end up here.
+        self._broker: OrderRouter = router or SimulatedOrderRouter(
+            SimulatedBroker(instruments=instruments, slippage=config.slippage, fees=config.fees)
         )
         self._history: dict[Symbol, list[Candle]] = {symbol: [] for symbol in config.symbols}
         self._orders: dict[str, Order] = {}
         self._pending_protection: dict[str, tuple[Decimal | None, Decimal | None]] = {}
         self._state = PaperSessionState(session_id=config.session_id)
         self._stopping = False
+        #: Closed trades already written to the database. Trades are flushed as they close
+        #: so a *running* session's dashboard reflects them; without this counter the
+        #: end-of-session flush would write every trade a second time.
+        self._persisted_trades = 0
+        # Runs on every equity sample. Without it the loss limits were only consulted when a
+        # new order was proposed, so an open loser with no fresh signal had no backstop.
+        self._loss_monitor = LossMonitor(self._risk, config.risk, flatten=self._flatten_for_breach)
 
     # ------------------------------------------------------------------ #
     # State
@@ -183,6 +216,15 @@ class PaperTradingEngine:
     def risk(self) -> RiskEngine:
         """The risk engine guarding this session."""
         return self._risk
+
+    @property
+    def router(self) -> OrderRouter:
+        """Where approved orders are sent.
+
+        Exposed so the live runner can verify a LIVE session is not routing to a simulator
+        before it declares itself armed.
+        """
+        return self._broker
 
     @property
     def mode(self) -> TradingMode:
@@ -215,6 +257,55 @@ class PaperTradingEngine:
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
+    def _refresh_correlations(self) -> None:
+        """Hand the risk engine a fresh correlation estimate.
+
+        Without this the correlation rule is inert: it sees an empty matrix, finds nothing
+        correlated with anything, and silently permits a book of ten positions that are
+        really one bet ten times over. On a single symbol that never mattered; across a
+        basket of crypto pairs correlated 0.7-0.9 it is the whole point of the rule.
+
+        Aligned on shared timestamps inside `portfolio_correlations`, so symbols with
+        different history lengths are compared over the same window rather than by
+        position.
+        """
+        usable = {
+            symbol: bars
+            for symbol, bars in self._history.items()
+            if len(bars) > MIN_CORRELATION_BARS
+        }
+        if len(usable) < MIN_SYMBOLS_FOR_CORRELATION:
+            return
+        self._risk.set_correlations(portfolio_correlations(usable))
+
+    async def _align_venue_leverage(self, gateway: MarketDataGateway) -> None:
+        """Set each symbol's venue leverage to the value this engine assumes.
+
+        The accounting reserves ``config.leverage`` per position. If the venue disagrees it
+        reserves a different amount, and free margin, exposure and every equity-derived
+        limit are then measured against a reservation that does not exist. Setting it here
+        makes the venue match the assumption instead of the bot hoping they coincide.
+
+        Best-effort: a gateway with no ``set_leverage`` (the simulator, or spot) is simply
+        skipped, and a refusal is logged rather than raised - the reconciler reads the
+        venue's actual value regardless, so a failure here degrades to "reconcile to truth".
+        """
+        if self._config.market_type is not MarketType.FUTURE:
+            return
+        setter = getattr(gateway, "set_leverage", None)
+        if not callable(setter):
+            return
+        for symbol in self._config.symbols:
+            try:
+                await setter(symbol, self._config.leverage)
+            except Exception as exc:  # pragma: no cover - defensive, never blocks startup
+                logger.warning(
+                    "paper.set_leverage_failed",
+                    symbol=str(symbol),
+                    leverage=str(self._config.leverage),
+                    error=str(exc)[:160],
+                )
+
     async def prepare(self, gateway: MarketDataGateway) -> None:
         """Load history and restore any prior state.
 
@@ -223,6 +314,7 @@ class PaperTradingEngine:
         """
         await self._risk.start()
         await self._restore()
+        await self._align_venue_leverage(gateway)
 
         for symbol in self._config.symbols:
             if symbol not in self._instruments:
@@ -242,6 +334,7 @@ class PaperTradingEngine:
                 from_time=closed[0].open_time.isoformat(),
             )
 
+        self._refresh_correlations()
         self._strategy.on_start(self._config.symbols)
 
         if self._database is not None:
@@ -309,12 +402,23 @@ class PaperTradingEngine:
         for order, fill in self._broker.process_candle(candle):
             self._orders[order.order_id] = order
             if order.status.is_terminal and not order.fills:
+                # Rejected without a fill - most often because the order was larger than
+                # the bar's liquidity. It still has to be written through: the row was
+                # saved as NEW at submission, so skipping it leaves the database claiming
+                # a live order that the engine has already given up on.
+                await self._persist_order(order)
                 continue
-            _, closed = self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
+            position, closed = self._portfolio.apply_fill(fill, strategy_id=order.strategy_id)
             self._record_trade_results(closed)
             self._attach_protection(order)
             self._state.fills += 1
             await self._publish_fill(fill)
+            # The order row was written at submission with status NEW and no fill. Re-saving
+            # it here is what makes the persisted order agree with reality; without it a
+            # filled order reads as unfilled for the life of the session.
+            await self._persist_order(order)
+            await self._persist_position(position)
+            await self._persist_trades(closed)
 
         # 2. Protective exits, checked against the bar's range.
         await self._check_protective_exits(symbol, candle)
@@ -335,8 +439,15 @@ class PaperTradingEngine:
             del history[: len(history) - MAX_HISTORY_BARS]
 
         self._state.bars_seen += 1
+        # Funding settles before the equity sample so the recorded curve includes it - a
+        # cost charged after the sample would be invisible on the chart it belongs to.
+        if self._config.funding_rate_for is not None:
+            self._portfolio.settle_funding(
+                candle.close_time, rate_for=self._config.funding_rate_for
+            )
         point = self._portfolio.record_equity(candle.close_time)
         await self._persist_equity(point)
+        await self._loss_monitor.check(self._portfolio.snapshot(candle.close_time))
 
         # 4. Decide, for execution on the next bar.
         if len(history) < self._strategy.warmup_bars:
@@ -366,6 +477,16 @@ class PaperTradingEngine:
 
         signal = self._strategy.evaluate(context)
         if not signal.is_actionable:
+            # A held bar used to vanish here without trace, which made "the engine is not
+            # trading" indistinguishable from "the engine is broken" - the strategy's own
+            # reason for standing aside was discarded at the one point it mattered.
+            logger.info(
+                "paper.signal_hold",
+                symbol=str(symbol),
+                strategy=self._strategy.strategy_id,
+                reason=signal.reason,
+                bar=candle.close_time.isoformat(),
+            )
             return
         self._state.signals += 1
         await self._publish_signal(signal)
@@ -391,7 +512,9 @@ class PaperTradingEngine:
 
         request = decision.request
         assert_protected(request, self._config.risk)
-        order = self._broker.submit(request, now=self._clock.now(), reference_price=candle.close)
+        order = await self._broker.submit(
+            request, now=self._clock.now(), reference_price=candle.close
+        )
         self._orders[order.order_id] = order
         self._risk.record_order()
         self._state.orders += 1
@@ -418,7 +541,12 @@ class PaperTradingEngine:
         counter never advances and the rule silently never fires.
         """
         for trade in trades:
-            self._risk.record_trade_result(trade.net_pnl, closed_at=trade.exit_time)
+            self._risk.record_trade_result(
+                trade.net_pnl, closed_at=trade.exit_time, symbol=trade.symbol
+            )
+            # A composite strategy scores its members partly on their realised record; a
+            # plain strategy ignores this.
+            self._strategy.on_trade_closed(trade)
 
     def _attach_protection(self, order: Order) -> None:
         """Apply protective levels once the order's fill has created the position."""
@@ -431,6 +559,36 @@ class PaperTradingEngine:
         self._portfolio.set_protection(order.symbol, stop_loss_price=stop, take_profit_price=target)
         if order.is_terminal:
             del self._pending_protection[order.order_id]
+
+    def _protective_exit_price(
+        self,
+        level: Decimal,
+        *,
+        candle: Candle,
+        side: OrderSide,
+        quantity: Decimal,
+        is_stop: bool,
+    ) -> Decimal:
+        """Fill price for a protective exit, with gap and slippage applied.
+
+        These used to fill at the exact stop or target, which quietly assumes the venue
+        always gives you your level. It does not: a bar that gaps straight through a stop
+        fills at the open, and the difference is pure loss the backtest never charged.
+
+        A stop fills at the *worse* of its level and the bar open - the same rule the
+        simulator already applies to explicit STOP orders. A target is not gapped in the
+        trader's favour: assuming a better-than-asked fill is the optimism this exists to
+        remove, so it fills at the level and then pays slippage like anything else.
+        """
+        if is_stop:
+            # Closing a long sells: a gap down opens below the stop and that is where it
+            # fills. Closing a short buys: a gap up fills higher.
+            worst = min(level, candle.open) if side is OrderSide.SELL else max(level, candle.open)
+        else:
+            worst = level
+        return self._config.slippage.apply(
+            reference_price=worst, side=side, quantity=quantity, candle=candle
+        )
 
     async def _check_protective_exits(self, symbol: Symbol, candle: Candle) -> None:
         """Close a position whose stop or target was reached inside this bar.
@@ -448,8 +606,8 @@ class PaperTradingEngine:
         if not stop_hit and not target_hit:
             return
 
-        exit_price = position.stop_loss_price if stop_hit else position.take_profit_price
-        if exit_price is None:  # pragma: no cover — guarded above
+        level = position.stop_loss_price if stop_hit else position.take_profit_price
+        if level is None:  # pragma: no cover — guarded above
             return
 
         instrument = self._instruments[symbol]
@@ -460,6 +618,10 @@ class PaperTradingEngine:
             return
 
         from quantflow.domain.enums import LiquidityRole
+
+        exit_price = self._protective_exit_price(
+            level, candle=candle, side=closing_side, quantity=quantity, is_stop=stop_hit
+        )
 
         fill = Fill(
             fill_id=f"protective-{symbol.concatenated}-{candle.open_time.isoformat()}",
@@ -474,7 +636,7 @@ class PaperTradingEngine:
             fee_currency=symbol.quote,
             timestamp=candle.close_time,
         )
-        _, closed = self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
+        exited, closed = self._portfolio.apply_fill(fill, strategy_id=position.strategy_id)
         self._record_trade_results(closed)
         self._state.fills += 1
         logger.info(
@@ -484,6 +646,12 @@ class PaperTradingEngine:
             price=str(exit_price),
         )
         await self._publish_fill(fill)
+        await self._persist_position(exited)
+        await self._persist_trades(closed)
+
+    async def _flatten_for_breach(self, reason: str) -> list[Fill]:
+        """Close everything after a loss-limit breach."""
+        return await self.flatten_all(reason=reason)
 
     async def flatten_all(self, *, reason: str = "flatten") -> list[Fill]:
         """Close every open position at the last known mark price."""
@@ -532,23 +700,62 @@ class PaperTradingEngine:
             return
         try:
             async with self._database.read_session() as session:
-                from quantflow.persistence.repositories import PositionRepository
+                from quantflow.persistence.repositories import (
+                    ClosedTradeRepository,
+                    EquityRepository,
+                    PositionRepository,
+                )
 
                 positions = await PositionRepository(session).list_open(
                     session_id=self._config.session_id
+                )
+                curve = await EquityRepository(session).curve(self._config.session_id)
+                closed = await ClosedTradeRepository(session).list_for_session(
+                    self._config.session_id
                 )
         except Exception as exc:
             logger.debug("paper.restore_skipped", reason=str(exc))
             return
 
-        if not positions:
+        # A flat session still has state worth restoring: cash that has drifted from the
+        # opening balance, realized PnL and fees. Returning early on "no positions" left
+        # all three at their constructor defaults.
+        if not positions and not curve:
             return
-        self._portfolio.restore(
-            cash=self._config.starting_equity,
-            positions=positions,
-            peak_equity=self._config.starting_equity,
+
+        last = curve[-1] if curve else None
+        # Cash, not starting equity. Restoring the opening balance *and* the positions that
+        # balance was spent on counts the same money twice: equity comes back inflated by
+        # the deployed notional, and nothing downstream disagrees, so it goes unnoticed.
+        cash = last.cash if last is not None else self._config.starting_equity
+        realized = last.realized_pnl if last is not None else ZERO
+        # Fees are not carried on the equity curve, so rebuild them: what each completed
+        # round-trip was charged, plus the entry fees still sitting in open positions.
+        fees = sum((trade.fees for trade in closed), ZERO) + sum(
+            (position.fees_paid for position in positions), ZERO
         )
-        logger.info("paper.state_restored", positions=len(positions))
+        # Peak drives the drawdown rule. Seeded from the opening balance it would forget
+        # every high the session reached and under-report drawdown after a restart.
+        peak = max((point.equity for point in curve), default=cash)
+
+        self._portfolio.restore(
+            cash=cash,
+            positions=positions,
+            peak_equity=peak,
+            realized_pnl=realized,
+            fees_paid=fees,
+        )
+        # Hand the restored positions to the strategy so a composite one can re-adopt the
+        # member that opened each. Without it a restart leaves every open trade ownerless.
+        self._strategy.on_restore(positions)
+        logger.info(
+            "paper.state_restored",
+            positions=len(positions),
+            cash=str(cash),
+            realized_pnl=str(realized),
+            fees_paid=str(fees),
+            peak_equity=str(peak),
+        )
 
     async def _persist_order(self, order: Order) -> None:
         if self._database is None:
@@ -558,6 +765,38 @@ class PaperTradingEngine:
                 await uow.orders.save(order, session_id=self._config.session_id)
         except Exception as exc:
             logger.exception("paper.persist_order_failed", error=str(exc))
+
+    async def _persist_position(self, position: Position) -> None:
+        """Write a position through, open or just-closed.
+
+        Nothing else in this engine writes the positions table, so without this an open
+        position exists only in memory: the dashboard shows none, and ``_restore`` has
+        nothing to restore after a restart. ``save`` stamps ``closed_at`` when the position
+        is flat, so the same call serves both opening and closing.
+        """
+        if self._database is None:
+            return
+        # `_attach_protection` may have set stop/target after the fill was applied, so
+        # prefer the portfolio's current view and fall back to the post-fill object, which
+        # is all that remains once the position has gone flat.
+        current = self._portfolio.position_for(position.symbol) or position
+        try:
+            async with self._database.unit_of_work() as uow:
+                await uow.positions.save(current, session_id=self._config.session_id)
+        except Exception as exc:
+            logger.exception("paper.persist_position_failed", error=str(exc))
+
+    async def _persist_trades(self, trades: Sequence[ClosedTrade]) -> None:
+        """Flush closed trades as they close rather than at session end."""
+        if self._database is None or not trades:
+            return
+        try:
+            async with self._database.unit_of_work() as uow:
+                await uow.trades.add_many(trades, session_id=self._config.session_id)
+        except Exception as exc:
+            logger.exception("paper.persist_trades_failed", error=str(exc))
+            return
+        self._persisted_trades += len(trades)
 
     async def _persist_equity(self, point: Any) -> None:
         if self._database is None:
@@ -606,8 +845,12 @@ class PaperTradingEngine:
             return
         try:
             async with self._database.unit_of_work() as uow:
+                # Only the tail: everything before this was already flushed as it closed,
+                # and add_many mints a fresh id per call, so re-sending them would
+                # duplicate every trade of the session.
                 await uow.trades.add_many(
-                    self._portfolio.closed_trades, session_id=self._config.session_id
+                    self._portfolio.closed_trades[self._persisted_trades :],
+                    session_id=self._config.session_id,
                 )
                 await uow.sessions.finish(
                     self._config.session_id,

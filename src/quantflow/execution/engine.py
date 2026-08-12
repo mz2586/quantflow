@@ -232,6 +232,36 @@ class ExecutionEngine:
                 quantity=str(request.quantity),
                 error=str(exc),
             )
+            # A raised submit does NOT mean nothing happened. The rate limiter retries
+            # timeouts, and a request that timed out may still have executed on the venue.
+            # Declaring failure without asking leaves a real, unprotected position that the
+            # system does not know it holds - the worst state available.
+            adopted = await self._reconcile_after_failed_submit(request)
+            if adopted is not None:
+                logger.critical(
+                    "execution.orphan_adopted",
+                    order_id=adopted.order_id,
+                    symbol=str(adopted.symbol),
+                    status=adopted.status.value,
+                    error=str(exc),
+                )
+                self._orders[adopted.order_id] = adopted
+                self._risk.record_order()
+                fills = self._apply_fills(adopted)
+                if request.stop_loss_price is not None:
+                    self._portfolio.set_protection(
+                        request.symbol,
+                        stop_loss_price=request.stop_loss_price,
+                        take_profit_price=request.take_profit_price,
+                    )
+                return ExecutionResult(
+                    signal,
+                    submitted=True,
+                    order=adopted,
+                    fills=fills,
+                    decision=decision,
+                    reason="submit raised but the order was found on the venue and adopted",
+                )
             return ExecutionResult(
                 signal,
                 submitted=False,
@@ -262,6 +292,45 @@ class ExecutionEngine:
             fills=len(fills),
         )
         return ExecutionResult(signal, submitted=True, order=order, fills=fills, decision=decision)
+
+    async def _reconcile_after_failed_submit(self, request: OrderRequest) -> Order | None:
+        """Look for an order the venue may have accepted despite the submit raising.
+
+        Matched on ``client_order_id``, which is ours and travels with the request, so an
+        order that reached Bybit is identifiable even when the response never reached us.
+        Open orders first, then recent fills - an order can be filled and closed by the time
+        we ask, in which case it will not appear in the open list at all.
+
+        Returns ``None`` when nothing matches, which is the genuine "it never landed" case.
+        """
+        wanted = request.client_order_id
+        if not wanted:
+            return None
+
+        try:
+            for order in await self._gateway.fetch_open_orders(request.symbol):
+                if order.client_order_id == wanted:
+                    return order
+        except ExchangeError as exc:
+            logger.exception(
+                "execution.reconcile_open_orders_failed",
+                symbol=str(request.symbol),
+                error=str(exc),
+            )
+
+        try:
+            fetch_order = getattr(self._gateway, "fetch_order_by_client_id", None)
+            if callable(fetch_order):
+                found: Order | None = await fetch_order(wanted, request.symbol)
+                if found is not None:
+                    return found
+        except ExchangeError as exc:
+            logger.exception(
+                "execution.reconcile_by_client_id_failed",
+                symbol=str(request.symbol),
+                error=str(exc),
+            )
+        return None
 
     def _apply_fills(self, order: Order) -> tuple[Fill, ...]:
         """Fold an order's fills into the portfolio, skipping duplicates."""

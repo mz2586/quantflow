@@ -12,15 +12,16 @@ why swapping Binance for Bybit touched no strategy, risk, execution or backtest 
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
 import ccxt.async_support as ccxt
 
 from quantflow.core.clock import Clock, SystemClock, to_epoch_ms
-from quantflow.core.config import ExchangeSettings, MarketType
+from quantflow.core.config import EXCHANGE_HOSTS, ExchangeEnv, ExchangeSettings, MarketType
 from quantflow.core.errors import (
+    ConfigurationError,
     ExchangeError,
     InvalidSymbolError,
     NotFoundError,
@@ -48,6 +49,11 @@ from quantflow.exchange.bybit.mapping import (
 from quantflow.exchange.ratelimit import RateLimiter, retry_async
 
 logger = get_logger(__name__)
+
+#: Which price Bybit compares a protective trigger against. LastPrice is the conservative
+#: choice: mark price can diverge from traded price during a squeeze and trigger a stop the
+#: market never actually printed.
+STOP_TRIGGER_BY = "LastPrice"
 
 #: Relative request costs used to size the token-bucket spend of each call.
 #:
@@ -94,7 +100,9 @@ class BybitGateway:
         "_instruments",
         "_limiter",
         "_local_by_venue_id",
+        "_quantity_by_order_id",
         "_settings",
+        "_venue_ids_by_symbol",
     )
 
     def __init__(self, settings: ExchangeSettings, *, clock: Clock | None = None) -> None:
@@ -110,7 +118,16 @@ class BybitGateway:
         # credentials — public endpoints do not need them.
         self._data_client = (
             self._build_client(
-                settings.model_copy(update={"testnet": False, "api_key": None, "api_secret": None})
+                settings.model_copy(
+                    update={
+                        "env": ExchangeEnv.MAINNET,
+                        "testnet": False,
+                        "api_key": None,
+                        "api_secret": None,
+                        "demo_api_key": None,
+                        "demo_api_secret": None,
+                    }
+                )
             )
             if settings.use_production_market_data
             else self._client
@@ -118,13 +135,24 @@ class BybitGateway:
         self._connected = False
         #: Maps a venue order id back to our own order id, so a fetched order reconciles.
         self._local_by_venue_id: dict[str, str] = {}
+        #: Quantity we submitted, per order id. Bybit's cancel and fetch acknowledgements
+        #: omit the amount, so this is the only source for it when parsing them back.
+        self._quantity_by_order_id: dict[str, Decimal] = {}
+        #: Venue order ids this gateway has submitted, per symbol - including the conditional
+        #: stops Bybit creates alongside an entry. Cleanup and reconciliation need to target
+        #: those by venue id; without the registry they are orders we can see but not name.
+        self._venue_ids_by_symbol: dict[Symbol, list[str]] = {}
 
     @staticmethod
     def _build_client(settings: ExchangeSettings) -> ccxt.bybit:
+        # Credentials come from the resolved environment, so a demo key can never be sent
+        # to production and a mainnet key can never be sent to demo.
+        key = settings.active_api_key
+        secret = settings.active_api_secret
         client = ccxt.bybit(
             {
-                "apiKey": settings.api_key.get_secret_value() if settings.api_key else None,
-                "secret": settings.api_secret.get_secret_value() if settings.api_secret else None,
+                "apiKey": key.get_secret_value() if key else None,
+                "secret": secret.get_secret_value() if secret else None,
                 "timeout": int(settings.request_timeout_seconds * 1000),
                 # CCXT's own throttle stays on as a second line of defence behind our
                 # token bucket; belt and braces is cheap here and an IP ban is not.
@@ -139,8 +167,30 @@ class BybitGateway:
                 },
             }
         )
-        if settings.testnet:
+        env = settings.resolved_env
+        if env is ExchangeEnv.TESTNET:
             client.set_sandbox_mode(True)
+        elif env is ExchangeEnv.DEMO:
+            # Demo trading is its own host with its own keys - not the sandbox. CCXT models
+            # it as a distinct mode; where that is unavailable the host is set directly so
+            # the behaviour does not silently fall back to production.
+            enable_demo = getattr(client, "enable_demo_trading", None)
+            if callable(enable_demo):
+                enable_demo(True)
+            else:  # pragma: no cover - depends on the installed ccxt version
+                client.urls["api"] = dict.fromkeys(
+                    client.urls["api"], EXCHANGE_HOSTS[ExchangeEnv.DEMO]
+                )
+
+        # Belt and braces: whatever ccxt did above, a non-mainnet configuration must not be
+        # left pointing at production.
+        if not env.is_mainnet:
+            resolved = str(client.urls.get("api", ""))
+            if "api.bybit.com" in resolved and "api-demo" not in resolved:
+                raise ConfigurationError(
+                    f"exchange env is {env.value} but the client resolved to production "
+                    f"({resolved}); refusing to build a gateway that would trade real money"
+                )
         return client
 
     # ------------------------------------------------------------------ #
@@ -337,6 +387,17 @@ class BybitGateway:
             reference = ticker.price_for(normalised.side)
         instrument.validate_order(normalised.quantity, reference)
 
+        # An entry with no stop must never reach the venue. The in-memory portfolio used to
+        # be the only thing that believed a position was protected; the venue knew nothing,
+        # so a fill sat naked through any disconnect, restart or crash.
+        if not normalised.reduce_only and normalised.stop_loss_price is None:
+            raise ValidationError(
+                f"refusing to submit an unprotected entry for {normalised.symbol}: "
+                "no stop_loss_price. A protective stop must be attached atomically with "
+                "the entry, not applied afterwards.",
+                symbol=str(normalised.symbol),
+            )
+
         params: dict[str, Any] = {
             "clientOrderId": normalised.client_order_id,
             "newOrderRespType": "RESULT",
@@ -347,6 +408,15 @@ class BybitGateway:
             params["stopPrice"] = float(normalised.trigger_price)
         if normalised.reduce_only:
             params["reduceOnly"] = True
+
+        # Sent as strings: Bybit accepts them, and a Decimal formatted as str keeps the exact
+        # price the risk engine computed instead of whatever the nearest float happens to be.
+        if normalised.stop_loss_price is not None:
+            params["stopLoss"] = str(normalised.stop_loss_price)
+            params["slTriggerBy"] = STOP_TRIGGER_BY
+        if normalised.take_profit_price is not None:
+            params["takeProfit"] = str(normalised.take_profit_price)
+            params["tpTriggerBy"] = STOP_TRIGGER_BY
 
         raw = await self._call(
             "submit_order",
@@ -360,15 +430,36 @@ class BybitGateway:
         )
 
         order = Order.from_request(normalised, now=self._clock.now())
+
+        # An ack carrying an order id means the venue ACCEPTED the order. Bybit V5 returns
+        # only orderId/orderLinkId there - no amount, no price, no fees - so parsing it as
+        # though it were a complete order used to raise on the positive-quantity invariant.
+        # Raising on a well-formed ack reports failure for an order that is live on the
+        # exchange: an orphan, unprotected, invisible to the local book. Acceptance is
+        # decided by the id; the numbers are then fetched from the authoritative source.
+        if not self._ack_has_order_id(raw):
+            raise ExchangeError(
+                f"venue acknowledged the order for {normalised.symbol} without an order id; "
+                "cannot confirm it was accepted",
+                symbol=str(normalised.symbol),
+            )
+
         acknowledged = parse_order(
             raw,
             local_order_id=order.order_id,
             strategy_id=normalised.strategy_id,
             stop_loss_price=normalised.stop_loss_price,
             take_profit_price=normalised.take_profit_price,
+            fallback_quantity=normalised.quantity,
         )
+        self._quantity_by_order_id[order.order_id] = normalised.quantity
         if acknowledged.venue_order_id:
             self._local_by_venue_id[acknowledged.venue_order_id] = order.order_id
+            self._venue_ids_by_symbol.setdefault(normalised.symbol, []).append(
+                acknowledged.venue_order_id
+            )
+
+        acknowledged = await self._enrich_from_venue(acknowledged, normalised)
 
         logger.info(
             "exchange.order_submitted",
@@ -381,16 +472,205 @@ class BybitGateway:
             price=str(normalised.price) if normalised.price else None,
             status=acknowledged.status.value,
         )
+
+        if not normalised.reduce_only and normalised.stop_loss_price is not None:
+            await self._require_stop_on_venue(normalised, acknowledged, raw)
         return acknowledged
 
-    async def cancel_order(self, order_id: str, symbol: Symbol) -> Order:
-        """Cancel a working order."""
+    def submitted_venue_ids(self, symbol: Symbol | None = None) -> list[str]:
+        """Venue order ids submitted through this gateway."""
+        if symbol is not None:
+            return list(self._venue_ids_by_symbol.get(symbol, []))
+        return [i for ids in self._venue_ids_by_symbol.values() for i in ids]
+
+    def track_venue_order(self, symbol: Symbol, venue_order_id: str, quantity: Decimal) -> None:
+        """Register an order discovered on the venue so cancel/cleanup can target it.
+
+        Conditional stops are created by the exchange alongside an entry, so they never pass
+        through ``submit_order`` and have no local record. Registering them on discovery is
+        what lets cleanup cancel them by venue id with a usable quantity.
+        """
+        self._venue_ids_by_symbol.setdefault(symbol, []).append(venue_order_id)
+        self._quantity_by_order_id[venue_order_id] = quantity
+
+    @staticmethod
+    def _ack_has_order_id(raw: Any) -> bool:
+        """Whether the acknowledgement identifies an accepted order.
+
+        The presence of an id is the acceptance signal. Amount, price and fees are absent
+        from a V5 create_order ack and say nothing about whether it landed.
+        """
+        if not isinstance(raw, dict):
+            return False
+        if raw.get("id"):
+            return True
+        info = raw.get("info")
+        if isinstance(info, dict):
+            result = info.get("result")
+            if isinstance(result, dict) and (result.get("orderId") or result.get("orderLinkId")):
+                return True
+            if info.get("orderId") or info.get("orderLinkId"):
+                return True
+        return bool(raw.get("clientOrderId"))
+
+    async def _enrich_from_venue(self, acknowledged: Order, request: OrderRequest) -> Order:
+        """Replace ack placeholders with the venue's authoritative view.
+
+        Best-effort by design: the order is already accepted, so a failure to read it back
+        must not turn a live order into a reported failure. The ack-derived record stands in
+        until the next reconciliation pass if this cannot complete.
+        """
+        venue_id = acknowledged.venue_order_id
+        if not venue_id:
+            return acknowledged
+        try:
+            authoritative = await self.fetch_order(acknowledged.order_id, request.symbol)
+        except Exception as exc:
+            # Deliberately broad. The order is ALREADY ACCEPTED by the venue; letting any
+            # failure here propagate would report failure for a live order - precisely the
+            # orphan this method exists to prevent. Enrichment is best-effort by contract.
+            logger.warning(
+                "exchange.order_enrich_failed",
+                order_id=acknowledged.order_id,
+                venue_order_id=venue_id,
+                error=str(exc)[:160],
+            )
+            return acknowledged
+        logger.info(
+            "exchange.order_enriched",
+            order_id=authoritative.order_id,
+            status=authoritative.status.value,
+            filled=str(authoritative.filled_quantity),
+            average=str(authoritative.average_fill_price),
+        )
+        return authoritative
+
+    async def _require_stop_on_venue(self, request: OrderRequest, order: Order, raw: Any) -> None:
+        """Confirm the venue is holding a stop, and close the entry if it is not.
+
+        "Protected" has to mean the exchange says so. An accepted entry whose ``stopLoss``
+        silently failed to attach leaves a real position with no server-side protection,
+        and the local record would keep claiming it was covered. If confirmation fails the
+        entry is closed reduce-only immediately: an unprotected position is a worse outcome
+        than a flat one, and no amount of local bookkeeping substitutes for the venue.
+
+        Raises:
+            ExchangeError: if no stop can be confirmed, after attempting to close.
+
+        """
+        if self._stop_confirmed_in_response(raw):
+            return
+        try:
+            positions = await self.fetch_positions()
+        except ExchangeError as exc:
+            logger.exception(
+                "exchange.stop_confirmation_unavailable",
+                symbol=str(request.symbol),
+                error=str(exc),
+            )
+            positions = []
+
+        target = self._ccxt_symbol(request.symbol)
+        for position in positions:
+            if str(position.get("symbol", "")).replace("/", "").replace(":USDT", "") not in (
+                target.replace("/", "").replace(":USDT", ""),
+            ):
+                continue
+            info = position.get("info", {}) if isinstance(position, dict) else {}
+            stop = info.get("stopLoss") or position.get("stopLossPrice")
+            if stop not in (None, "", "0", 0):
+                logger.info(
+                    "exchange.stop_confirmed",
+                    symbol=str(request.symbol),
+                    stop_loss=str(stop),
+                )
+                return
+
+        logger.critical(
+            "exchange.stop_attach_failed",
+            symbol=str(request.symbol),
+            order_id=order.order_id,
+            requested_stop=str(request.stop_loss_price),
+        )
+        await self._emergency_flatten(request)
+        raise ExchangeError(
+            f"stop failed to attach on the venue for {request.symbol}; the entry was closed "
+            "reduce-only. Refusing to hold an unprotected position.",
+            symbol=str(request.symbol),
+        )
+
+    @staticmethod
+    def _stop_confirmed_in_response(raw: Any) -> bool:
+        """Whether the venue's own response evidences a live stop.
+
+        Reads the raw payload deliberately. The parsed local order carries the stop we
+        *asked* for - `parse_order` is handed `normalised.stop_loss_price` - so trusting it
+        would confirm protection from our own request and reproduce the exact defect this
+        method exists to catch.
+        """
+        if not isinstance(raw, dict):
+            return False
+        info = raw.get("info")
+        stop = info.get("stopLoss") if isinstance(info, dict) else None
+        if stop in (None, "", "0", 0):
+            return False
+        try:
+            return Decimal(str(stop)) > ZERO
+        except (ArithmeticError, ValueError):
+            return False
+
+    async def _emergency_flatten(self, request: OrderRequest) -> None:
+        """Close an entry that could not be protected, reduce-only.
+
+        Best-effort and never raises: the caller is already raising, and masking that with a
+        secondary failure would hide why the position was being closed.
+        """
+        from quantflow.domain.enums import OrderType
+
+        closing = OrderSide.SELL if request.side is OrderSide.BUY else OrderSide.BUY
+        try:
+            await self._call(
+                "submit_order",
+                self._client.create_order,
+                self._ccxt_symbol(request.symbol),
+                ORDER_TYPE_TO_CCXT[OrderType.MARKET],
+                closing.value,
+                float(request.quantity),
+                None,
+                {"reduceOnly": True, "newOrderRespType": "RESULT"},
+            )
+            logger.critical(
+                "exchange.unprotected_entry_closed",
+                symbol=str(request.symbol),
+                quantity=str(request.quantity),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception(
+                "exchange.emergency_close_failed",
+                symbol=str(request.symbol),
+                error=str(exc),
+            )
+
+    async def cancel_order(
+        self, order_id: str, symbol: Symbol, *, quantity: Decimal | None = None
+    ) -> Order:
+        """Cancel a working order.
+
+        ``quantity`` covers orders this process did not submit - a conditional stop the
+        venue created alongside an entry, for instance. Bybit's cancel acknowledgement omits
+        the amount, and without a fallback the parsed Order fails its positive-quantity
+        invariant on an order that was cancelled perfectly well.
+        """
         self._require_trading()
         venue_id = self._venue_id_for(order_id)
         raw = await self._call(
             "cancel_order", self._client.cancel_order, venue_id, self._ccxt_symbol(symbol)
         )
-        cancelled = parse_order(raw, local_order_id=order_id)
+        cancelled = parse_order(
+            raw,
+            local_order_id=order_id,
+            fallback_quantity=quantity or self._quantity_by_order_id.get(order_id),
+        )
         logger.info(
             "exchange.order_cancelled",
             order_id=order_id,
@@ -483,6 +763,76 @@ class BybitGateway:
         raw = await self._call("account_info", self._client.privateGetV5AccountInfo)
         result = (raw or {}).get("result")
         return result if isinstance(result, dict) else {}
+
+    async def fetch_funding_history(
+        self, symbol: Symbol, *, since: datetime | None = None, limit: int = 200
+    ) -> list[tuple[datetime, Decimal]]:
+        """Historical 8h funding rates, oldest first.
+
+        Read from the public data client: funding history is public, and a backtest should
+        not need credentials to price a cost the venue publishes. Rates come back as
+        ``Decimal`` via ``str`` so a float literal never reaches money arithmetic.
+        """
+        rows = await self._call(
+            "fetch_candles",
+            self._data_client.fetch_funding_rate_history,
+            self._ccxt_symbol(symbol),
+            to_epoch_ms(since) if since is not None else None,
+            limit,
+        )
+        out: list[tuple[datetime, Decimal]] = []
+        for row in rows or []:
+            stamp = row.get("timestamp")
+            rate = row.get("fundingRate")
+            if stamp is None or rate is None:
+                continue
+            out.append(
+                (
+                    datetime.fromtimestamp(int(stamp) / 1000, tz=UTC),
+                    Decimal(str(rate)),
+                )
+            )
+        out.sort(key=lambda item: item[0])
+        return out
+
+    async def set_leverage(self, symbol: Symbol, leverage: Decimal) -> bool:
+        """Set a symbol's leverage on the venue before trading it.
+
+        The bot assumes 1x. Assuming is not enough: if Bybit has the symbol at 10x it
+        reserves a tenth of the margin the bot believes, so free margin, exposure and every
+        equity-derived limit are computed against a reservation that does not exist. Setting
+        it explicitly makes the venue agree with the assumption rather than the other way
+        round.
+
+        Returns whether the venue accepted the change. Bybit rejects a no-op change with
+        "leverage not modified" (110043), which is success for our purposes - the symbol is
+        already where we want it.
+        """
+        if self._settings.market_type is not MarketType.FUTURE:
+            return False
+        try:
+            await self._call(
+                "set_leverage",
+                self._client.set_leverage,
+                float(leverage),
+                self._ccxt_symbol(symbol),
+            )
+        except ExchangeError as exc:
+            message = str(exc).lower()
+            if "not modified" in message or "110043" in message:
+                logger.debug(
+                    "exchange.leverage_already_set", symbol=str(symbol), leverage=str(leverage)
+                )
+                return True
+            logger.warning(
+                "exchange.set_leverage_failed",
+                symbol=str(symbol),
+                leverage=str(leverage),
+                error=str(exc)[:160],
+            )
+            return False
+        logger.info("exchange.leverage_set", symbol=str(symbol), leverage=str(leverage))
+        return True
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
         """Open derivative positions.

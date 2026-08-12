@@ -347,7 +347,18 @@ export const api = {
   sessions: () => request<Session[]>(`${BASE}/portfolio/sessions`),
 
   riskStatus: () => request<RiskStatus>(`${BASE}/risk/status`),
-  riskEvents: (limit = 50) => request<RiskEvent[]>(`${BASE}/risk/events?limit=${limit}`),
+  /**
+   * Risk events. Pass `sessionId` to scope them to one run.
+   *
+   * Unscoped, this returns events from every session ever run, so a fresh session shows
+   * hours-old rejections from an unrelated one and reads as though the current session is
+   * being blocked. The API has always supported the filter; the client simply never sent it.
+   */
+  riskEvents: (limit = 50, sessionId?: string | null) =>
+    request<RiskEvent[]>(
+      `${BASE}/risk/events?limit=${limit}` +
+        (sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""),
+    ),
 
   /** Engage or clear the kill switch. A reason is mandatory when engaging. */
   setKillSwitch: (engaged: boolean, reason: string, actor = "dashboard") =>

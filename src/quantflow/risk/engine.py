@@ -139,9 +139,13 @@ class RiskEngine:
         #: Equity at the start of the rolling seven-day window, and when it was taken.
         self._week_start_equity: Decimal | None = None
         self._week_started_at: datetime | None = None
-        #: Losing trades closed back-to-back, and when the last one closed.
-        self._consecutive_losses = 0
-        self._last_loss_at: datetime | None = None
+        #: Losing trades closed back-to-back **per symbol**, and when the last one closed.
+        #: Tracked per symbol deliberately: a portfolio-wide counter meant five losses
+        #: spread across five unrelated markets paused entries on every symbol at once,
+        #: including ones with no losing history. The cooldown is meant to step back from
+        #: the market that is going against the strategy, not from all of them.
+        self._consecutive_losses: dict[Symbol, int] = {}
+        self._last_loss_at: dict[Symbol, datetime] = {}
         #: Return correlations between traded symbols. Supplied from outside because the
         #: engine has no market data of its own and must never acquire any.
         self._correlations = CorrelationMatrix(values={})
@@ -242,8 +246,8 @@ class RiskEngine:
             kill_switch_engaged=self._kill_switch.engaged,
             trading_halted=self.is_halted,
             week_start_equity=self._weekly_baseline(portfolio.equity, now),
-            consecutive_losses=self._consecutive_losses,
-            last_loss_at=self._last_loss_at,
+            consecutive_losses=self._consecutive_losses.get(request.symbol, 0),
+            last_loss_at=self._last_loss_at.get(request.symbol),
             correlated_open_symbols=self._correlated_open(request.symbol, portfolio),
         )
 
@@ -419,17 +423,21 @@ class RiskEngine:
         """
         self._correlations = matrix
 
-    def record_trade_result(self, net_pnl: Decimal, *, closed_at: datetime) -> None:
+    def record_trade_result(self, net_pnl: Decimal, *, closed_at: datetime, symbol: Symbol) -> None:
         """Record a closed trade so the loss-streak cooldown can track it.
 
         A break-even trade counts as a loss: after fees it *is* one, and treating it as a
         reset would let a strategy grind through the streak limit indefinitely.
+
+        The streak is kept per symbol, so a run of losses in one market pauses entries in
+        that market only and leaves unrelated symbols tradable.
         """
         if net_pnl > ZERO:
-            self._consecutive_losses = 0
+            self._consecutive_losses.pop(symbol, None)
+            self._last_loss_at.pop(symbol, None)
             return
-        self._consecutive_losses += 1
-        self._last_loss_at = closed_at
+        self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
+        self._last_loss_at[symbol] = closed_at
 
     def _weekly_baseline(self, equity: Decimal, now: datetime) -> Decimal | None:
         """Equity at the start of the current seven-day window.

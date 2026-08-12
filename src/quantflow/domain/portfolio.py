@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
+from quantflow.core.config import MarketType
 from quantflow.core.errors import ValidationError
 from quantflow.core.precision import ZERO, safe_divide
 from quantflow.domain.instruments import Symbol
@@ -50,6 +51,14 @@ class PortfolioSnapshot:
     day_start_equity: Decimal = ZERO
     realized_pnl: Decimal = ZERO
     fees_paid: Decimal = ZERO
+    #: Spot and futures value an account differently, and every equity-derived limit reads
+    #: this. On spot a held asset IS part of equity. On a linear perp the position is not an
+    #: asset at all - only its unrealised PnL is - and margin is a reservation against the
+    #: wallet, not a purchase. Valuing a perp like spot double-counts and makes every limit
+    #: fictional, which is the defect this field exists to remove.
+    market_type: MarketType = MarketType.SPOT
+    #: Margin currently reserved against open perp positions.
+    margin_posted: Decimal = ZERO
 
     def __post_init__(self) -> None:
         """Validate the snapshot."""
@@ -83,8 +92,22 @@ class PortfolioSnapshot:
 
     @property
     def equity(self) -> Decimal:
-        """Total account value: cash plus position value."""
+        """Total account value.
+
+        Spot: cash plus what the held assets are worth. Futures: the wallet balance plus
+        unrealised PnL - the position itself is not an asset, and counting its notional
+        would inflate equity by the whole position on every trade.
+        """
+        if self.market_type is MarketType.FUTURE:
+            return self.cash + self.unrealized_pnl
         return self.cash + self.positions_value
+
+    @property
+    def free_margin(self) -> Decimal:
+        """Equity not reserved against open positions. Futures only; spot returns cash."""
+        if self.market_type is MarketType.FUTURE:
+            return self.equity - self.margin_posted
+        return self.cash
 
     @property
     def unrealized_pnl(self) -> Decimal:
@@ -175,6 +198,10 @@ class EquityPoint:
     drawdown_pct: Decimal = ZERO
     realized_pnl: Decimal = ZERO
     unrealized_pnl: Decimal = ZERO
+    #: Sum of absolute position market values at this sample. Carried on the point itself
+    #: because the persistence layer had no other source for it and defaulted it to zero,
+    #: so a snapshot could report a flat book while four positions were open.
+    gross_exposure: Decimal = ZERO
 
 
 def build_equity_curve(points: Sequence[EquityPoint]) -> tuple[EquityPoint, ...]:

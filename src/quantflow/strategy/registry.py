@@ -124,6 +124,11 @@ def load_builtin_strategies() -> StrategyRegistry:
     Called by the API, CLI and engines at startup rather than at module import, keeping
     import side effects explicit and testable.
     """
+    # The orchestrator registers like any other strategy so `--strategy orchestrator`
+    # works, but it lives outside the library package because it composes it. Imported
+    # here, inside the function, because it calls back into this module at construction
+    # time — at module scope the two would import each other.
+    from quantflow import orchestrator  # noqa: F401 — import triggers registration
     from quantflow.strategy import library  # noqa: F401 — import triggers registration
 
     logger.debug("strategy.registry_loaded", count=len(registry), names=registry.names())

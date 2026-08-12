@@ -24,7 +24,7 @@ from quantflow.domain.enums import MarketRegime, PositionSide, Timeframe
 from quantflow.domain.instruments import Symbol
 from quantflow.domain.market import Candle, CandleSeries
 from quantflow.domain.portfolio import PortfolioSnapshot
-from quantflow.domain.positions import Position
+from quantflow.domain.positions import ClosedTrade, Position
 from quantflow.domain.signals import Signal
 
 logger = get_logger(__name__)
@@ -231,6 +231,20 @@ class Strategy(ABC):
 
     def on_fill(self, symbol: Symbol, position: Position) -> None:  # noqa: B027 - optional hook
         """Called after a fill updates a position. Default: no-op."""
+
+    def on_trade_closed(self, trade: ClosedTrade) -> None:  # noqa: B027 - optional hook
+        """Called when a round-trip completes. Default: no-op.
+
+        A composite strategy uses this to keep a realised record of its members; a plain
+        strategy has no use for it and ignores it.
+        """
+
+    def on_restore(self, positions: Sequence[Position]) -> None:  # noqa: B027 - optional hook
+        """Called after state is rebuilt from the database. Default: no-op.
+
+        Lets a composite strategy re-adopt positions opened before a restart, so an
+        existing trade is still managed by the member that opened it.
+        """
 
     def on_finish(self) -> None:  # noqa: B027 - optional hook
         """Called once after the last bar. Default: no-op."""

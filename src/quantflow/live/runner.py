@@ -32,7 +32,7 @@ from typing import Any, Final
 
 from quantflow.cache.redis import Cache, EventBus
 from quantflow.core.clock import Clock, SystemClock
-from quantflow.core.config import Settings, TradingMode
+from quantflow.core.config import ExchangeEnv, Settings, TradingMode
 from quantflow.core.errors import (
     ConfigurationError,
     LiveTradingNotArmedError,
@@ -44,6 +44,7 @@ from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle
 from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.exchange.bybit.ws import BybitStream
+from quantflow.execution.router import LiveOrderRouter, OrderRouter
 from quantflow.notifications.dispatcher import NotificationDispatcher, build_dispatcher
 from quantflow.paper.engine import PaperConfig, PaperSessionState, PaperTradingEngine
 from quantflow.persistence.database import Database
@@ -133,7 +134,10 @@ def check_live_arming(settings: Settings) -> LiveArmingCheck:
         mode_is_live=settings.trading.mode is TradingMode.LIVE,
         confirmation_token=settings.trading.is_live_armed,
         has_credentials=settings.exchange.has_credentials,
-        not_testnet=not settings.exchange.testnet,
+        # Testnet is refused because an 'armed' session that cannot reach a real
+        # order venue looks like it is trading and is not. Demo IS a real order venue -
+        # it fills, it holds positions - it simply does not use real money, so it arms.
+        not_testnet=settings.exchange.resolved_env is not ExchangeEnv.TESTNET,
     )
 
 
@@ -226,11 +230,46 @@ class TradingRunner:
                 "live trading is not armed: " + "; ".join(check.blockers()),
                 blockers=check.blockers(),
             )
+        # Deliberately does NOT log "armed" here. The gates say the operator *intends* live
+        # trading; they say nothing about where orders will actually go. That claim is only
+        # made in `_assert_live_execution_wired`, once the constructed engine has been shown
+        # to hold a real router. Logging it here is how a simulated session came to announce
+        # that real orders would be sent.
+
+    def _assert_live_execution_wired(self) -> None:
+        """Refuse to run a LIVE session whose orders would be simulated.
+
+        This is the check that makes "armed" honest. A LIVE session holding a simulated
+        router reports fills that never happened, on a venue that never saw an order, while
+        every downstream number - equity, PnL, risk headroom - describes a market position
+        the account does not have.
+
+        Raises:
+            LiveTradingNotArmedError: if the engine is missing or routes to a simulator.
+
+        """
+        if self._config.mode is not TradingMode.LIVE:
+            return
+        if self._engine is None:
+            raise LiveTradingNotArmedError(
+                "live trading refused: no execution engine was constructed",
+                blockers=["engine not constructed"],
+            )
+        router = self._engine.router
+        if router.is_simulated:
+            raise LiveTradingNotArmedError(
+                "live trading refused: this session routes orders to "
+                f"{type(router).__name__}, which simulates fills. A LIVE session must route "
+                "through ExecutionEngine and the real BybitGateway. Refusing to arm rather "
+                "than simulate under a live label.",
+                blockers=["order router is simulated"],
+            )
         logger.critical(
             "runner.live_trading_armed",
             session_id=self._config.session_id,
             symbols=[str(symbol) for symbol in self._config.symbols],
             strategy_id=self._config.strategy_id,
+            router=type(router).__name__,
         )
 
     # ------------------------------------------------------------------ #
@@ -299,6 +338,12 @@ class TradingRunner:
                 f"({risk.kill_switch.state.reason}). Clear it explicitly first."
             )
 
+        router: OrderRouter | None = None
+        if self._config.mode is TradingMode.LIVE:
+            # Real venue. Constructed here rather than defaulted, so a LIVE session that
+            # cannot build one fails loudly instead of falling back to the simulator.
+            router = LiveOrderRouter(self._gateway)
+
         self._engine = PaperTradingEngine(
             self._strategy,
             PaperConfig(
@@ -315,10 +360,15 @@ class TradingRunner:
             database=self._database,
             event_bus=event_bus,
             clock=self._clock,
+            router=router,
         )
         # The engine builds its own risk engine; replace it with the one already started
         # and wired to notifications, so alerts and the loaded kill-switch state apply.
         self._engine._risk = risk
+
+        # Only now can "armed" be asserted honestly: the engine exists and its router is
+        # known. Raises rather than trading if a LIVE session would have been simulated.
+        self._assert_live_execution_wired()
 
         await self._engine.prepare(self._gateway)
         self._stream = BybitStream(settings.exchange, clock=self._clock)

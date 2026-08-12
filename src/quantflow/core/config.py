@@ -175,6 +175,33 @@ class RedisSettings(BaseModel):
         return f"redis://{auth}{self.host}:{self.port}/{self.db}"
 
 
+class ExchangeEnv(StrEnum):
+    """Which Bybit deployment to talk to.
+
+    Supersedes the older ``testnet`` boolean, which could only express two of the three
+    real options. Demo trading is a distinct host with its own credentials — it is not
+    testnet, and conflating them was how a demo key would have been sent to production.
+    """
+
+    MAINNET = "mainnet"
+    TESTNET = "testnet"
+    DEMO = "demo"
+
+    @property
+    def is_mainnet(self) -> bool:
+        """Whether this environment trades real money."""
+        return self is ExchangeEnv.MAINNET
+
+
+#: Host per environment. The verification harness asserts against these by name, so a
+#: mis-resolved endpoint fails loudly rather than quietly trading somewhere unintended.
+EXCHANGE_HOSTS: dict[ExchangeEnv, str] = {
+    ExchangeEnv.MAINNET: "https://api.bybit.com",
+    ExchangeEnv.TESTNET: "https://api-testnet.bybit.com",
+    ExchangeEnv.DEMO: "https://api-demo.bybit.com",
+}
+
+
 class ExchangeSettings(BaseModel):
     """Bybit V5 (or other CCXT venue) connection settings."""
 
@@ -183,6 +210,13 @@ class ExchangeSettings(BaseModel):
     name: str = "bybit"
     api_key: OptionalSecret = None
     api_secret: OptionalSecret = None
+    #: Demo-trading credentials. Kept separate from the mainnet pair so switching
+    #: environments cannot accidentally carry a live key onto a demo host or the reverse.
+    demo_api_key: OptionalSecret = None
+    demo_api_secret: OptionalSecret = None
+    #: Takes precedence over ``testnet``. Left unset, it is derived from that boolean so
+    #: existing configurations keep working unchanged.
+    env: ExchangeEnv | None = None
     testnet: bool = True
     #: Read public market data from production even when trading on testnet. Bybit's
     #: testnet carries thin history and synthetic prices, so backtesting or warming up a
@@ -199,14 +233,67 @@ class ExchangeSettings(BaseModel):
     ws_reconnect_max_seconds: float = Field(default=60.0, gt=0)
 
     @property
+    def resolved_env(self) -> ExchangeEnv:
+        """The environment in force.
+
+        ``env`` wins when set; otherwise the legacy ``testnet`` boolean decides, so nothing
+        that predates this field changes behaviour.
+        """
+        if self.env is not None:
+            return self.env
+        return ExchangeEnv.TESTNET if self.testnet else ExchangeEnv.MAINNET
+
+    @property
+    def endpoint(self) -> str:
+        """The REST host this configuration resolves to."""
+        return EXCHANGE_HOSTS[self.resolved_env]
+
+    @property
+    def active_api_key(self) -> SecretStr | None:
+        """The key for the resolved environment."""
+        if self.resolved_env is ExchangeEnv.DEMO:
+            return self.demo_api_key
+        return self.api_key
+
+    @property
+    def active_api_secret(self) -> SecretStr | None:
+        """The secret for the resolved environment."""
+        if self.resolved_env is ExchangeEnv.DEMO:
+            return self.demo_api_secret
+        return self.api_secret
+
+    @property
     def has_credentials(self) -> bool:
-        """Whether both an API key and secret are configured."""
-        return self.api_key is not None and self.api_secret is not None
+        """Whether both a key and secret are configured **for the resolved environment**."""
+        return self.active_api_key is not None and self.active_api_secret is not None
 
     @property
     def use_production_market_data(self) -> bool:
-        """Whether public market data should come from the production venue."""
-        return self.testnet and self.market_data_from_production
+        """Whether public market data should come from the production venue.
+
+        Demo and testnet both carry thin or synthetic books, so public reads come from
+        production in either case. This never carries credentials.
+        """
+        return not self.resolved_env.is_mainnet and self.market_data_from_production
+
+    def assert_not_mainnet(self) -> None:
+        """Refuse to proceed if this configuration would reach production.
+
+        Raises:
+            ValueError: if the resolved endpoint is the mainnet host while the environment
+                claims to be something else, or the environment is mainnet outright.
+
+        """
+        if self.resolved_env.is_mainnet:
+            raise ValueError(
+                "refusing to proceed: exchange env resolves to mainnet "
+                f"({self.endpoint}). Set QF_EXCHANGE__ENV=demo for verification."
+            )
+        if self.endpoint == EXCHANGE_HOSTS[ExchangeEnv.MAINNET]:
+            raise ValueError(
+                f"refusing to proceed: env is {self.resolved_env.value} but the endpoint "
+                f"resolved to {self.endpoint}"
+            )
 
 
 class TradingSettings(BaseModel):

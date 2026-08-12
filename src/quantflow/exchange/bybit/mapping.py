@@ -286,11 +286,19 @@ def parse_order(
     strategy_id: str | None = None,
     stop_loss_price: Decimal | None = None,
     take_profit_price: Decimal | None = None,
+    fallback_quantity: Decimal | None = None,
 ) -> Order:
     """Build an :class:`Order` from a CCXT order dict.
 
     ``local_order_id`` preserves our own identifier so an order fetched back from the venue
     still reconciles against the local OMS record.
+
+    ``fallback_quantity`` is the quantity we asked for. Bybit V5's create_order acknowledges
+    with only ``orderId``/``orderLinkId`` - it does not echo the amount - so parsing the
+    acknowledgement alone yields zero and the Order invariant rejects it. Raising there
+    would report a *failure for an order the venue has already accepted*, which is the
+    orphan case: real position, no local record. The requested size is the correct fallback
+    because it is what was sent.
     """
     symbol = from_ccxt_symbol(str(raw.get("symbol", "")))
     venue_order_id = str(raw.get("id") or "")
@@ -298,6 +306,8 @@ def parse_order(
     updated = _timestamp(raw.get("lastTradeTimestamp") or raw.get("timestamp"), fallback=created)
 
     quantity = _decimal_or(raw.get("amount"))
+    if quantity <= ZERO and fallback_quantity is not None:
+        quantity = fallback_quantity
     filled = _decimal_or(raw.get("filled"))
     # A venue that reports more filled than ordered would violate the Order invariant;
     # clamping keeps a reconciliation pass from crashing on a bad payload.

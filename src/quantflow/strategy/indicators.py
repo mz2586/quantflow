@@ -21,6 +21,9 @@ from quantflow.domain.market import Candle
 
 Series = tuple[Decimal | None, ...]
 
+#: Directional movement compares each bar with the one before, so it needs a pair.
+MIN_BARS_FOR_DIRECTIONAL_MOVEMENT = 2
+
 
 def _require_period(period: int, minimum: int = 1) -> None:
     if period < minimum:
@@ -276,6 +279,138 @@ def last_value(series: Series) -> Decimal | None:
         if value is not None:
             return value
     return None
+
+
+def rolling_vwap(candles: Sequence[Candle], period: int) -> Series:
+    """Volume-weighted average price over a trailing window.
+
+    A rolling window rather than a session-anchored VWAP: an anchored one needs a session
+    boundary, and crypto trades continuously. Windows whose volume is zero yield ``None``
+    rather than a divide-by-zero or a silent fallback to the unweighted mean — no volume
+    means no volume-weighted price, and pretending otherwise invents a level.
+    """
+    _require_period(period)
+    out: list[Decimal | None] = [None] * len(candles)
+    for index in range(period - 1, len(candles)):
+        window = candles[index - period + 1 : index + 1]
+        volume = sum((candle.volume for candle in window), ZERO)
+        if volume <= ZERO:
+            continue
+        typical = sum(
+            (((candle.high + candle.low + candle.close) / 3) * candle.volume for candle in window),
+            ZERO,
+        )
+        out[index] = typical / volume
+    return tuple(out)
+
+
+def stochastic(
+    candles: Sequence[Candle], period: int = 14, smooth: int = 3
+) -> tuple[Series, Series]:
+    """Stochastic oscillator as ``(%K, %D)``, both in 0–100.
+
+    %K is where the close sits inside the period's high–low range; %D is its moving
+    average. A flat range (high == low) gives ``None`` rather than 50: a range of zero
+    carries no information about position within it.
+    """
+    _require_period(period)
+    _require_period(smooth)
+    raw: list[Decimal | None] = [None] * len(candles)
+    for index in range(period - 1, len(candles)):
+        window = candles[index - period + 1 : index + 1]
+        highest = max(candle.high for candle in window)
+        lowest = min(candle.low for candle in window)
+        span = highest - lowest
+        if span <= ZERO:
+            continue
+        raw[index] = ((candles[index].close - lowest) / span) * Decimal("100")
+
+    # %D smooths %K, so it can only be computed where a full run of %K values exists.
+    smoothed: list[Decimal | None] = [None] * len(candles)
+    for index in range(smooth - 1, len(candles)):
+        recent = raw[index - smooth + 1 : index + 1]
+        values = [value for value in recent if value is not None]
+        if len(values) == smooth:
+            smoothed[index] = sum(values, ZERO) / smooth
+    return tuple(raw), tuple(smoothed)
+
+
+def directional_movement(
+    candles: Sequence[Candle], period: int = 14
+) -> tuple[Series, Series, Series]:
+    """Wilder's ``(+DI, -DI, ADX)``, all on a 0–100 scale.
+
+    ADX measures how *strongly* a market is trending without saying which way, which is
+    what makes it a regime input rather than a direction signal. Built on Wilder smoothing
+    to match the original definition — an EMA-based approximation drifts from published
+    values and would make any threshold chosen here mean something slightly different.
+    """
+    _require_period(period)
+    size = len(candles)
+    if size < MIN_BARS_FOR_DIRECTIONAL_MOVEMENT:
+        return (None,) * size, (None,) * size, (None,) * size
+
+    plus_moves: list[Decimal] = [ZERO]
+    minus_moves: list[Decimal] = [ZERO]
+    for index in range(1, size):
+        up = candles[index].high - candles[index - 1].high
+        down = candles[index - 1].low - candles[index].low
+        plus_moves.append(up if up > down and up > ZERO else ZERO)
+        minus_moves.append(down if down > up and down > ZERO else ZERO)
+
+    ranges = [value if value is not None else ZERO for value in true_range(candles)]
+    smoothed_range = wilder_smoothing(ranges, period)
+    smoothed_plus = wilder_smoothing(plus_moves, period)
+    smoothed_minus = wilder_smoothing(minus_moves, period)
+
+    plus_di: list[Decimal | None] = [None] * size
+    minus_di: list[Decimal | None] = [None] * size
+    dx: list[Decimal | None] = [None] * size
+    for index in range(size):
+        span = smoothed_range[index]
+        up_value = smoothed_plus[index]
+        down_value = smoothed_minus[index]
+        if span is None or up_value is None or down_value is None or span <= ZERO:
+            continue
+        positive = (up_value / span) * Decimal("100")
+        negative = (down_value / span) * Decimal("100")
+        plus_di[index] = positive
+        minus_di[index] = negative
+        total = positive + negative
+        if total > ZERO:
+            dx[index] = (abs(positive - negative) / total) * Decimal("100")
+
+    defined = [value for value in dx if value is not None]
+    adx: list[Decimal | None] = [None] * size
+    if len(defined) >= period:
+        smoothed_dx = wilder_smoothing(defined, period)
+        # Map the smoothed run back onto the original indices it came from.
+        positions = [index for index, value in enumerate(dx) if value is not None]
+        for offset, index in enumerate(positions):
+            adx[index] = smoothed_dx[offset]
+    return tuple(plus_di), tuple(minus_di), tuple(adx)
+
+
+def obv(candles: Sequence[Candle]) -> Series:
+    """On-balance volume: a running total that adds volume on up closes and subtracts on down.
+
+    The point is divergence — OBV can keep climbing while price stalls, which says buying
+    is being absorbed. It is cumulative from the first bar, so only *changes* in it are
+    meaningful; the absolute level depends on where the series happens to start.
+    """
+    if not candles:
+        return ()
+    out: list[Decimal | None] = [ZERO]
+    total = ZERO
+    for index in range(1, len(candles)):
+        previous = candles[index - 1].close
+        current = candles[index].close
+        if current > previous:
+            total += candles[index].volume
+        elif current < previous:
+            total -= candles[index].volume
+        out.append(total)
+    return tuple(out)
 
 
 def require_value(series: Series, index: int, name: str) -> Decimal:

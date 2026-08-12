@@ -38,7 +38,7 @@ import {
 } from "./lib/api";
 import { ago, chartValue, money, percent, quantity, signed, time, tone } from "./lib/format";
 
-const POLL_INTERVAL_MS = 10_000;
+const POLL_INTERVAL_MS = 5_000;
 
 function Panel({
   title,
@@ -217,7 +217,7 @@ export default function App() {
     await Promise.all([
       settle(api.readiness(), setReadiness),
       settle(api.riskStatus(), setRisk),
-      settle(api.riskEvents(25), setEvents),
+      settle(api.riskEvents(25, sessionId), setEvents),
       settle(api.trades(200, sessionId), setTrades),
       settle(api.strategies(), setStrategies),
       settle(api.series(), setSeries),
@@ -273,18 +273,29 @@ export default function App() {
 
   useEffect(() => {
     if (selected) return;
-    const first = series[0];
-    if (first) setSelected(first.symbol);
-  }, [series, selected]);
+    // Prefer a symbol the running session actually trades. `series[0]` is whatever sorts
+    // first, which in practice is a daily series from an unrelated backfill - it cannot
+    // move intraday, so the chart reads as frozen while the session is running fine.
+    const sessionSymbol = session?.symbols.find((symbol) =>
+      series.some((item) => item.symbol === symbol),
+    );
+    const first = sessionSymbol ?? series[0]?.symbol;
+    if (first) setSelected(first);
+  }, [series, selected, session]);
 
   useEffect(() => {
     if (!selected) return;
-    const entry = series.find((item) => item.symbol === selected);
+    // Match the session's timeframe when that series exists, so the chart and the engine
+    // are looking at the same bars. Falls back to whatever is stored for the symbol.
+    const entry =
+      series.find(
+        (item) => item.symbol === selected && item.timeframe === session?.timeframe,
+      ) ?? series.find((item) => item.symbol === selected);
     void api
       .candles(selected, entry?.timeframe ?? "1h", 300)
       .then(setCandles)
       .catch(() => { setCandles(null); });
-  }, [selected, series]);
+  }, [selected, series, session]);
 
   const toggleKillSwitch = useCallback(async () => {
     const engaged = risk?.kill_switch.engaged ?? false;

@@ -758,16 +758,21 @@ class EquityRepository(Repository[EquitySnapshotRecord]):
         session_id: str,
         point: EquityPoint,
         *,
-        gross_exposure: Decimal = ZERO,
+        gross_exposure: Decimal | None = None,
     ) -> None:
-        """Append an equity sample, replacing any sample at the same instant."""
+        """Append an equity sample, replacing any sample at the same instant.
+
+        ``gross_exposure`` falls back to the point's own value. It used to default to zero,
+        and every caller relied on that default, so persisted snapshots reported a flat book
+        regardless of how many positions were open.
+        """
         statement = pg_insert(EquitySnapshotRecord).values(
             session_id=session_id,
             timestamp=point.timestamp,
             equity=point.equity,
             cash=point.cash,
             position_count=point.position_count,
-            gross_exposure=gross_exposure,
+            gross_exposure=gross_exposure if gross_exposure is not None else point.gross_exposure,
             realized_pnl=point.realized_pnl,
             unrealized_pnl=point.unrealized_pnl,
             drawdown_pct=point.drawdown_pct,
@@ -810,6 +815,7 @@ class EquityRepository(Repository[EquitySnapshotRecord]):
                 drawdown_pct=record.drawdown_pct,
                 realized_pnl=record.realized_pnl,
                 unrealized_pnl=record.unrealized_pnl,
+                gross_exposure=record.gross_exposure,
             )
             for record in reversed(list(await self._scalars(statement)))
         ]

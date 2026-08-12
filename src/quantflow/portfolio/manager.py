@@ -8,12 +8,13 @@ risk limit is measured against.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 
 from quantflow.core.clock import Clock, SystemClock, start_of_utc_day
+from quantflow.core.config import MarketType
 from quantflow.core.errors import ValidationError
 from quantflow.core.logging import get_logger
 from quantflow.core.precision import ZERO
@@ -22,6 +23,12 @@ from quantflow.domain.instruments import Symbol
 from quantflow.domain.orders import Fill
 from quantflow.domain.portfolio import EquityPoint, PortfolioSnapshot
 from quantflow.domain.positions import ClosedTrade, Position
+from quantflow.portfolio.funding import (
+    FundingCharge,
+    charge_for,
+    funding_stamps,
+    total_funding,
+)
 
 logger = get_logger(__name__)
 
@@ -37,6 +44,12 @@ class PortfolioManager:
     base_currency: str = "USDT"
     starting_equity: Decimal = Decimal("10000")
     clock: Clock = field(default_factory=SystemClock)
+    #: Spot subtracts the full notional to buy and credits it to sell. A linear perp does
+    #: neither: you post margin and settle PnL, so a short cannot create cash. Defaulting to
+    #: SPOT keeps every existing caller unchanged.
+    market_type: MarketType = MarketType.SPOT
+    #: Leverage assumed when reserving initial margin.
+    leverage: Decimal = Decimal("1")
 
     _cash: Decimal = field(init=False)
     _positions: dict[Symbol, Position] = field(default_factory=dict, init=False)
@@ -49,6 +62,9 @@ class PortfolioManager:
     _current_day: datetime | None = field(default=None, init=False)
     _realized_pnl: Decimal = field(default=ZERO, init=False)
     _fees_paid: Decimal = field(default=ZERO, init=False)
+    _margin_by_symbol: dict[Symbol, Decimal] = field(default_factory=dict, init=False)
+    _funding_paid: Decimal = field(default=ZERO, init=False)
+    _last_funding_at: datetime | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         """Initialise cash and the equity high-water mark."""
@@ -106,7 +122,12 @@ class PortfolioManager:
         return self._mark_prices.get(symbol)
 
     def equity(self) -> Decimal:
-        """Cash plus the mark-to-market value of open positions."""
+        """Account value under the configured market's accounting.
+
+        Spot: cash plus what the held assets are worth. Futures: the wallet balance plus
+        unrealised PnL. Adding a perp's notional to cash would count the same money twice
+        and inflate every equity-derived limit.
+        """
         total = self._cash
         for position in self.positions:
             price = self._mark_prices.get(position.symbol)
@@ -115,8 +136,98 @@ class PortfolioManager:
                     f"cannot value the portfolio: no mark price for {position.symbol}",
                     symbol=str(position.symbol),
                 )
-            total += position.market_value(price)
+            if self.market_type is MarketType.FUTURE:
+                total += position.unrealized_pnl(price)
+            else:
+                total += position.market_value(price)
         return total
+
+    @property
+    def funding_paid(self) -> Decimal:
+        """Net funding settled so far. Negative means the account has paid out."""
+        return self._funding_paid
+
+    def settle_funding(
+        self,
+        now: datetime,
+        *,
+        rate_for: Callable[[Symbol, datetime], Decimal | None],
+    ) -> tuple[FundingCharge, ...]:
+        """Charge every funding stamp that has elapsed since the last settlement.
+
+        Shared by backtest and paper deliberately: funding is a real cash movement, and a
+        backtest that models it differently from paper is describing a different account.
+        Spot has no funding and is skipped entirely.
+
+        ``rate_for`` returns ``None`` where no rate is known, and that stamp is skipped -
+        inventing a rate would fabricate a cost, which is no better than ignoring a real one.
+        """
+        if self.market_type is not MarketType.FUTURE:
+            return ()
+
+        since = self._last_funding_at or now
+        self._last_funding_at = now
+        charges: list[FundingCharge] = []
+        for stamp in funding_stamps(since, now):
+            for position in self.positions:
+                price = self._mark_prices.get(position.symbol)
+                if price is None:
+                    continue
+                rate = rate_for(position.symbol, stamp)
+                if rate is None:
+                    continue
+                charge = charge_for(position, price=price, rate=rate, settled_at=stamp)
+                if charge is None:
+                    continue
+                # Funding settles in cash, exactly as the venue does it.
+                self._cash += charge.amount
+                self._funding_paid += charge.amount
+                charges.append(charge)
+
+        if charges:
+            logger.info(
+                "portfolio.funding_settled",
+                stamps=len({c.settled_at for c in charges}),
+                charges=len(charges),
+                net=str(total_funding(charges)),
+            )
+        return tuple(charges)
+
+    @property
+    def margin_posted(self) -> Decimal:
+        """Margin currently reserved against open positions."""
+        return sum(self._margin_by_symbol.values(), ZERO)
+
+    def _apply_margin_cash(
+        self,
+        before: Position,
+        after: Position,
+        fill: Fill,
+        closed: tuple[ClosedTrade, ...],
+    ) -> None:
+        """Move cash the way a linear perp actually does.
+
+        The wallet changes on exactly two things: fees, and realised PnL when a position
+        closes. Opening reserves margin - a reservation against the same wallet, not a
+        spend - so a short credits nothing and cannot inflate cash. That inflation was the
+        defect: on spot maths a short looked like income, and every limit read from it.
+        """
+        previous = abs(before.quantity)
+        current = abs(after.quantity)
+        reserved = self._margin_by_symbol.get(fill.symbol, ZERO)
+
+        if current > previous:
+            added_notional = (current - previous) * fill.price
+            self._margin_by_symbol[fill.symbol] = reserved + added_notional / self.leverage
+        elif previous > ZERO:
+            released_fraction = (previous - current) / previous
+            self._margin_by_symbol[fill.symbol] = reserved - reserved * released_fraction
+
+        if after.is_flat:
+            self._margin_by_symbol.pop(fill.symbol, None)
+
+        self._cash -= fill.fee
+        self._cash += sum((trade.gross_pnl for trade in closed), ZERO)
 
     def snapshot(self, at: datetime | None = None) -> PortfolioSnapshot:
         """An immutable view for the risk engine and the strategies."""
@@ -124,6 +235,8 @@ class PortfolioManager:
             timestamp=at or self.clock.now(),
             base_currency=self.base_currency,
             cash=self._cash,
+            market_type=self.market_type,
+            margin_posted=self.margin_posted,
             positions=self.positions,
             mark_prices=dict(self._mark_prices),
             peak_equity=self._peak_equity,
@@ -179,8 +292,10 @@ class PortfolioManager:
             position = replace(position, strategy_id=strategy_id)
         updated, closed = position.apply_fill(fill)
 
-        # Cash: a buy spends notional plus fee, a sell receives notional minus fee.
-        if fill.side is OrderSide.BUY:
+        if self.market_type is MarketType.FUTURE:
+            self._apply_margin_cash(position, updated, fill, closed)
+        # Spot: a buy spends notional plus fee, a sell receives notional minus fee.
+        elif fill.side is OrderSide.BUY:
             self._cash -= fill.notional + fill.fee
         else:
             self._cash += fill.notional - fill.fee
@@ -253,6 +368,17 @@ class PortfolioManager:
             ZERO,
         )
 
+        # Positions without a mark are skipped rather than raising: a sample is a
+        # measurement, and one unmarked symbol must not stop the curve advancing.
+        exposure = sum(
+            (
+                position.notional(self._mark_prices[position.symbol])
+                for position in self.positions
+                if position.symbol in self._mark_prices
+            ),
+            ZERO,
+        )
+
         point = EquityPoint(
             timestamp=moment,
             equity=equity,
@@ -261,6 +387,7 @@ class PortfolioManager:
             drawdown_pct=max(ZERO, drawdown),
             realized_pnl=self._realized_pnl,
             unrealized_pnl=unrealized,
+            gross_exposure=exposure,
         )
         self._equity_curve.append(point)
         return point

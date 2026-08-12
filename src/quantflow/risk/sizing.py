@@ -107,10 +107,49 @@ class PositionSizer(ABC):
         quantity = instrument.normalize_quantity(capped)
 
         if quantity < instrument.min_quantity:
-            return SizingResult(ZERO, ZERO, ZERO, method, capped_by="below_venue_min_quantity")
+            # Rounding down has taken the order under the venue's lot minimum. Rounding UP to
+            # that minimum is allowed only when the larger position still respects every
+            # hard cap - otherwise honouring the venue's floor would breach our own ceiling,
+            # which is not a trade worth making. Skipping is the correct outcome, and it is
+            # logged rather than silently dropped.
+            bumped = instrument.min_quantity
+            bumped_notional = instrument.notional(bumped, request.price)
+            max_position_value = request.equity * self.settings.max_position_pct
+            if (
+                bumped_notional <= max_position_value
+                and bumped_notional <= self.settings.max_order_notional
+            ):
+                logger.info(
+                    "sizing.rounded_up_to_venue_minimum",
+                    symbol=str(instrument.symbol),
+                    requested=str(quantity),
+                    minimum=str(bumped),
+                    notional=str(bumped_notional),
+                )
+                quantity = bumped
+            else:
+                logger.info(
+                    "sizing.skipped_below_venue_minimum",
+                    symbol=str(instrument.symbol),
+                    requested=str(quantity),
+                    minimum=str(bumped),
+                    minimum_notional=str(bumped_notional),
+                    max_position_value=str(max_position_value),
+                    max_order_notional=str(self.settings.max_order_notional),
+                    reason="the venue minimum would breach a position or order cap",
+                )
+                return SizingResult(ZERO, ZERO, ZERO, method, capped_by="below_venue_min_quantity")
 
         notional = instrument.notional(quantity, request.price)
         if notional < instrument.min_notional or notional < self.settings.min_order_notional:
+            logger.info(
+                "sizing.skipped_below_min_notional",
+                symbol=str(instrument.symbol),
+                quantity=str(quantity),
+                notional=str(notional),
+                venue_minimum=str(instrument.min_notional),
+                configured_minimum=str(self.settings.min_order_notional),
+            )
             return SizingResult(ZERO, ZERO, ZERO, method, capped_by="below_min_notional")
 
         distance = request.stop_distance
