@@ -81,7 +81,8 @@ services:
       - --maxmemory-policy
       - noeviction
     ports:
-      - "${QF_REDIS_PORT:-6379}:6379"
+      # Bound to loopback: Redis has no password, so the network must be the boundary.
+      - "127.0.0.1:${QF_REDIS_PORT:-56379}:6379"
     volumes:
       - qf-redis:/data
     healthcheck:
@@ -110,7 +111,9 @@ services:
       - "8000"
       - --no-access-log
     ports:
-      - "${QF_API_HOST_PORT:-8000}:8000"
+      # Bound to loopback: the dashboard talks to this from the same machine. Reaching it
+      # from another device needs a tunnel or a reverse proxy, not an open port.
+      - "127.0.0.1:${QF_API_HOST_PORT:-8100}:8000"
     depends_on:
       db:
         condition: service_healthy
