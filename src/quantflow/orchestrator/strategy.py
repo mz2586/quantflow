@@ -32,7 +32,7 @@ from pydantic import Field
 from quantflow.ai.regime import RuleBasedRegimeDetector
 from quantflow.core.errors import InsufficientDataError, StrategyError
 from quantflow.core.logging import get_logger
-from quantflow.core.precision import ZERO
+from quantflow.core.precision import ONE, ZERO
 from quantflow.domain.enums import MarketRegime, SignalDirection
 from quantflow.domain.instruments import Symbol
 from quantflow.domain.positions import ClosedTrade, Position
@@ -51,8 +51,17 @@ from quantflow.orchestrator.scoring import (
     rank,
     score_candidate,
 )
+from quantflow.orchestrator.selection import (
+    SelectionInputs,
+    assess_candidate,
+    strategy_family,
+)
 from quantflow.strategy.base import Strategy, StrategyContext, StrategyParams
-from quantflow.strategy.registry import load_builtin_strategies, register_strategy
+from quantflow.strategy.registry import (
+    StrategyRegistry,
+    load_builtin_strategies,
+    register_strategy,
+)
 
 logger = get_logger(__name__)
 
@@ -71,6 +80,12 @@ class OrchestratorParams(StrategyParams):
 
     min_score: Decimal = Field(default=MIN_SCORE_TO_TRADE, ge=0, le=1)
     cost_rate: Decimal = Field(default=DEFAULT_COST_RATE, ge=0, le=1)
+    #: Restrict the candidate pool to these strategy ids. ``None`` means the whole
+    #: registry; an explicit empty list is a mistake and is rejected, matching how
+    #: ``members`` already behaves. A live session builds its strategy through the
+    #: registry, which cannot reach the keyword-only ``members`` argument, so retiring
+    #: strategies from a live rotation has to travel as a parameter.
+    pool: list[str] | None = Field(default=None)
 
 
 @dataclass(slots=True)
@@ -121,9 +136,13 @@ class StrategyOrchestrator(Strategy):
         super().__init__(params)
         # `None` means "use the whole registry"; an explicit empty sequence is a mistake and
         # is rejected rather than silently replaced with every strategy there is.
-        self._members: tuple[Strategy, ...] = (
-            tuple(members) if members is not None else _default_members()
-        )
+        pool: list[str] | None = getattr(self.params, "pool", None)
+        if members is not None:
+            self._members: tuple[Strategy, ...] = tuple(members)
+        elif pool is not None:
+            self._members = _members_from_pool(pool)
+        else:
+            self._members = _default_members()
         if not self._members:
             from quantflow.core.errors import ValidationError
 
@@ -140,6 +159,59 @@ class StrategyOrchestrator(Strategy):
     # ------------------------------------------------------------------ #
     # Introspection
     # ------------------------------------------------------------------ #
+    def _select(
+        self,
+        candidates: list[Candidate],
+        *,
+        regime: MarketRegime,
+        field: list[Candidate] | None = None,
+    ) -> tuple[list[Candidate], list[tuple[str, str]]]:
+        """Apply the selection layer, returning survivors and why the rest were refused.
+
+        The measurements handed to :func:`assess_candidate` all come from state the
+        orchestrator already holds — the candidate field for confluence, per-regime memory
+        for expectancy, open positions for duplication. Nothing is fetched, so nothing here
+        can see a bar the strategies did not.
+        """
+        survivors: list[Candidate] = []
+        refused: list[tuple[str, str]] = []
+        # Corroboration is counted over every candidate that FIRED, not over the ones that
+        # survived the economic gate. A strategy whose own reward:risk was too thin to
+        # trade is still an independent opinion about direction, and deleting it before
+        # counting would let the gate quietly destroy the evidence this layer weighs.
+        opinions = field if field is not None else candidates
+        # What the pool could corroborate with, at best. A roster that cannot produce two
+        # independent families is not asked to.
+        available = len({strategy_family(member.strategy_id) for member in self._members})
+
+        for candidate in candidates:
+            record = self._memory.for_regime(candidate.strategy_id, regime)
+            # Expectancy per trade, from the record's own totals. Record exposes counts and
+            # PnL rather than a ratio, so it is derived here instead of assumed to exist.
+            expectancy = (record.net_pnl / Decimal(record.trades)) if record.trades > 0 else None
+            # A candidate whose symbol is already held is the clearest possible duplicate;
+            # anything else is treated as uncorrelated because this class holds no return
+            # series of its own, and inventing a correlation would be worse than omitting
+            # one. The portfolio-level correlation rule in the risk engine still applies.
+            duplicate = ONE if candidate.symbol in self._owners else ZERO
+            verdict = assess_candidate(
+                SelectionInputs(
+                    strategy_id=candidate.strategy_id,
+                    agreeing_families=_count_agreeing_families(opinions, candidate),
+                    regime_expectancy=expectancy,
+                    regime_samples=record.trades,
+                    max_correlation=duplicate,
+                    volume_share=ZERO,
+                    available_families=available,
+                )
+            )
+            if verdict.accepted:
+                survivors.append(candidate)
+            else:
+                refused.append((candidate.strategy_id, "; ".join(verdict.reasons)))
+
+        return survivors, refused
+
     @property
     def members(self) -> tuple[Strategy, ...]:
         """The member strategies, in evaluation order."""
@@ -218,6 +290,34 @@ class StrategyOrchestrator(Strategy):
             )
         return signal
 
+    def _deselected(
+        self,
+        context: StrategyContext,
+        decision: Decision,
+        candidates: list[Candidate],
+        rejects: list[tuple[str, str]],
+        regime: MarketRegime,
+    ) -> Signal:
+        """Record and explain a bar where every candidate failed selection.
+
+        Not trading is the expected outcome most of the time now, so it is logged with the
+        first reason attached: a silent hold and a hold caused by a broken rule look
+        identical otherwise.
+        """
+        decision.reason = (
+            f"all {len(candidates)} candidates failed selection "
+            "(confluence, regime expectancy or correlation)"
+        )
+        self._last_decision = decision
+        logger.info(
+            "orchestrator.all_deselected",
+            symbol=str(context.symbol),
+            regime=regime.value,
+            candidates=len(candidates),
+            first_reason=rejects[0][1] if rejects else "",
+        )
+        return context.hold(decision.reason, self.strategy_id)
+
     def generate(self, context: StrategyContext) -> Signal:
         """Poll every member, score the actionable ones, return the winner."""
         if context.has_position:
@@ -295,6 +395,16 @@ class StrategyOrchestrator(Strategy):
                 first_reason=rejected[-1][1] if rejected else "",
             )
             return context.hold(decision.reason, self.strategy_id)
+
+        # Selection layer: corroboration, regime-conditional evidence and duplication.
+        # These are questions about the field and about history, so they come after the
+        # per-candidate economics and before ranking — ranking a set of uncorroborated
+        # candidates just finds the most confident one.
+        viable, selection_rejects = self._select(viable, regime=regime, field=candidates)
+        rejected.extend(selection_rejects)
+        decision.gated = [(name, reason) for name, reason in rejected]
+        if not viable:
+            return self._deselected(context, decision, candidates, selection_rejects, regime)
 
         open_symbols = frozenset(self._owners)
         scored = [
@@ -476,10 +586,88 @@ def _to_candidate(signal: Signal, context: StrategyContext) -> Candidate:
     )
 
 
+def _count_agreeing_families(candidates: list[Candidate], candidate: Candidate) -> int:
+    """How many distinct information sources back this candidate's direction.
+
+    Counted over *families*, not strategies: five moving-average variants agreeing is one
+    observation restated five times, and treating it as five was how a single weak
+    indicator came to justify an entry.
+    """
+    return len(
+        {
+            strategy_family(other.strategy_id)
+            for other in candidates
+            if other.direction is candidate.direction and other.symbol == candidate.symbol
+        }
+    )
+
+
+#: Env switch for short generation. Defaults ON: a long-only book cannot be right in a
+#: falling market, and every strategy below already implements its own short path — they
+#: were simply never asked for one.
+SHORTS_ENABLED_VAR = "QF_ALLOW_SHORT"
+
+
+def _short_enabled() -> bool:
+    """Whether members should be built with short generation allowed."""
+    import os
+
+    return os.environ.get(SHORTS_ENABLED_VAR, "true").strip().lower() == "true"
+
+
+def _create_member(registry: StrategyRegistry, name: str) -> Strategy:
+    """Build one member, enabling shorts only where the strategy actually supports them.
+
+    ``allow_short`` is passed ONLY to strategies whose params model declares it. The five
+    long-only strategies have no short path, and their params models forbid extra fields —
+    passing the flag would either raise or, worse, imply a capability that does not exist.
+    Enabling a direction a strategy cannot compute is how a system starts taking trades
+    nobody designed.
+    """
+    if _short_enabled() and "allow_short" in registry.params_model(name).model_fields:
+        return registry.create(name, {"allow_short": True})
+    return registry.create(name)
+
+
 def _default_members(excluded: frozenset[str] = DEFAULT_EXCLUDED) -> tuple[Strategy, ...]:
     """Every registered strategy except the excluded ones, in stable order."""
     registry = load_builtin_strategies()
-    return tuple(registry.create(name) for name in sorted(registry.names()) if name not in excluded)
+    return tuple(
+        _create_member(registry, name) for name in sorted(registry.names()) if name not in excluded
+    )
+
+
+def _members_from_pool(pool: Sequence[str]) -> tuple[Strategy, ...]:
+    """Build exactly the named strategies, refusing anything that cannot be honoured.
+
+    Every rejection here is a case where carrying on would produce a roster the operator
+    did not ask for: an unknown id would quietly shrink the pool, and self-inclusion would
+    recurse. Both are worse than a startup failure.
+    """
+    from quantflow.core.errors import ValidationError
+
+    registry = load_builtin_strategies()
+    known = set(registry.names())
+    requested = list(dict.fromkeys(pool))  # de-duplicate, keep the caller's order
+
+    if not requested:
+        raise ValidationError("orchestrator pool cannot be empty", field="pool")
+
+    unknown = [name for name in requested if name not in known]
+    if unknown:
+        raise ValidationError(
+            f"unknown strategies in orchestrator pool: {', '.join(sorted(unknown))}",
+            field="pool",
+        )
+
+    excluded = [name for name in requested if name in DEFAULT_EXCLUDED]
+    if excluded:
+        raise ValidationError(
+            f"these cannot be orchestrator members: {', '.join(sorted(excluded))}",
+            field="pool",
+        )
+
+    return tuple(_create_member(registry, name) for name in sorted(requested))
 
 
 __all__ = [
