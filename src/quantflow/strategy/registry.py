@@ -39,7 +39,7 @@ class StrategyRegistry:
         existing = self._strategies.get(identifier)
         if existing is not None and existing is not strategy_class:
             raise StrategyError(
-                f"strategy id {identifier!r} is already registered to " f"{existing.__name__}",
+                f"strategy id {identifier!r} is already registered to {existing.__name__}",
                 strategy_id=identifier,
             )
         self._strategies[identifier] = strategy_class

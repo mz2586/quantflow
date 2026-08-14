@@ -40,8 +40,7 @@ class EmaCrossParams(StrategyParams):
     def _validate_periods(self) -> Self:
         if self.fast_period >= self.slow_period:
             raise ValueError(
-                f"fast_period ({self.fast_period}) must be below "
-                f"slow_period ({self.slow_period})"
+                f"fast_period ({self.fast_period}) must be below slow_period ({self.slow_period})"
             )
         if self.atr_target_multiple <= self.atr_stop_multiple:
             raise ValueError("atr_target_multiple must exceed atr_stop_multiple")

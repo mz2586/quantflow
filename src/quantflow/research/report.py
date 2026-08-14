@@ -371,12 +371,14 @@ def build_html(outcome: ResearchOutcome) -> str:
 <p class="meta"><b>Costs:</b> {html.escape(config.costs.summary)}</p>
 
 <div class="verdict {"" if accepted_count else "none"}">
-  {(
-    f"<b>{accepted_count} strategy(ies) passed</b> every threshold on every symbol."
-    if accepted_count else
-    "<b>No strategy passed.</b> Every non-benchmark strategy failed at least one "
-    "threshold on at least one symbol."
-  )}
+  {
+        (
+            f"<b>{accepted_count} strategy(ies) passed</b> every threshold on every symbol."
+            if accepted_count
+            else "<b>No strategy passed.</b> Every non-benchmark strategy failed at least one "
+            "threshold on at least one symbol."
+        )
+    }
 </div>
 
 <h2>Acceptance thresholds</h2>

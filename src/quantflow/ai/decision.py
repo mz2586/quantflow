@@ -203,8 +203,7 @@ class RegimeAdvisor:
             if self._veto_counter_trend:
                 veto = True
                 reasons.append(
-                    f"{signal.direction.value} entry opposes a confident "
-                    f"{observation.regime.value}"
+                    f"{signal.direction.value} entry opposes a confident {observation.regime.value}"
                 )
             else:
                 multiplier *= COUNTER_TREND_MULTIPLIER

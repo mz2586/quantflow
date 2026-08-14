@@ -120,8 +120,7 @@ class AcceptanceThresholds:
             failures.append(
                 Rejection(
                     RejectionCode.LOW_PROFIT_FACTOR,
-                    f"profit factor {metrics.profit_factor:.2f} below "
-                    f"{self.min_profit_factor:.2f}",
+                    f"profit factor {metrics.profit_factor:.2f} below {self.min_profit_factor:.2f}",
                     metrics.profit_factor,
                     self.min_profit_factor,
                 )
@@ -141,8 +140,7 @@ class AcceptanceThresholds:
             failures.append(
                 Rejection(
                     RejectionCode.EXCESSIVE_DRAWDOWN,
-                    f"max drawdown {metrics.max_drawdown_pct:.2%} exceeds "
-                    f"{self.max_drawdown:.2%}",
+                    f"max drawdown {metrics.max_drawdown_pct:.2%} exceeds {self.max_drawdown:.2%}",
                     metrics.max_drawdown_pct,
                     self.max_drawdown,
                 )

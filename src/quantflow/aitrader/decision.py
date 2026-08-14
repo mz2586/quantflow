@@ -129,8 +129,7 @@ def parse_decision(  # noqa: PLR0911 - one guarded return per validation rule
     if symbol is None:
         permitted = ", ".join(str(item) for item in allowed)
         return DecisionError(
-            f"symbol {parsed.get('symbol')!r} is not one of the permitted symbols "
-            f"({permitted})",
+            f"symbol {parsed.get('symbol')!r} is not one of the permitted symbols ({permitted})",
             text,
         )
 

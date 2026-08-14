@@ -228,8 +228,7 @@ class EnsembleStrategy(Strategy):
                 participating=len(active),
                 abstaining=abstaining,
                 reason=(
-                    f"only {len(active)} member(s) voted; "
-                    f"{self.params.min_participants} required"
+                    f"only {len(active)} member(s) voted; {self.params.min_participants} required"
                 ),
             )
 
@@ -249,7 +248,7 @@ class EnsembleStrategy(Strategy):
                 participating=len(active),
                 abstaining=abstaining,
                 reason=(
-                    f"members disagree across {len(tally)} directions " "and dissent is not allowed"
+                    f"members disagree across {len(tally)} directions and dissent is not allowed"
                 ),
             )
 

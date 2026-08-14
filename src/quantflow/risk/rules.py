@@ -442,8 +442,7 @@ class OrderRateRule(RiskRule):
         if context.orders_last_minute >= limit:
             return RiskVerdict.deny(
                 self.name,
-                f"{context.orders_last_minute} orders in the last minute, "
-                f"at the limit of {limit}",
+                f"{context.orders_last_minute} orders in the last minute, at the limit of {limit}",
                 observed=Decimal(context.orders_last_minute),
                 limit=Decimal(limit),
                 severity=Severity.CRITICAL,
