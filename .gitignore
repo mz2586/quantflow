@@ -50,3 +50,8 @@ dashboard/.vite/
 .idea/
 .vscode/
 *.swp
+
+# --- Local bot working directory --------------------------------------------
+# Run logs, venue snapshots and one-off probe scripts for the demo session. Local
+# operational state, not source: it also holds the supervisor lock and stop file.
+scratchpad/
