@@ -71,6 +71,10 @@ class SizingResult:
     capped_by: str | None = None
     """Which constraint bound the size, if any. Surfaced so an operator can see *why*
     a position came out smaller than expected."""
+    detail: str | None = None
+    """The numbers behind a refusal, in words. ``capped_by`` names the rule; this says
+    which values tripped it, so a rejection can be diagnosed from the log line alone
+    instead of being re-derived from the venue afterwards."""
 
     @property
     def is_tradable(self) -> bool:
@@ -138,7 +142,20 @@ class PositionSizer(ABC):
                     max_order_notional=str(self.settings.max_order_notional),
                     reason="the venue minimum would breach a position or order cap",
                 )
-                return SizingResult(ZERO, ZERO, ZERO, method, capped_by="below_venue_min_quantity")
+                return SizingResult(
+                    ZERO,
+                    ZERO,
+                    ZERO,
+                    method,
+                    capped_by="below_venue_min_quantity",
+                    detail=(
+                        f"the venue's smallest {instrument.symbol} lot is {bumped} "
+                        f"(worth {bumped_notional} at {request.price}), which exceeds the "
+                        f"{max_position_value} allowed by max_position_pct on equity "
+                        f"{request.equity} or the {self.settings.max_order_notional} "
+                        f"max_order_notional"
+                    ),
+                )
 
         notional = instrument.notional(quantity, request.price)
         if notional < instrument.min_notional or notional < self.settings.min_order_notional:
@@ -150,7 +167,35 @@ class PositionSizer(ABC):
                 venue_minimum=str(instrument.min_notional),
                 configured_minimum=str(self.settings.min_order_notional),
             )
-            return SizingResult(ZERO, ZERO, ZERO, method, capped_by="below_min_notional")
+            return SizingResult(
+                ZERO,
+                ZERO,
+                ZERO,
+                method,
+                capped_by="below_min_notional",
+                detail=(
+                    f"{quantity} {instrument.symbol} is worth {notional} at {request.price}, "
+                    f"under the venue minimum {instrument.min_notional} / configured minimum "
+                    f"{self.settings.min_order_notional}"
+                ),
+            )
+
+        # Last gate before the size leaves the risk layer. Every rule above works on one
+        # constraint at a time; this re-checks the finished number against the venue's whole
+        # rule set, so a quantity that is legal by each step but illegal overall is refused
+        # here rather than by the exchange.
+        try:
+            instrument.validate_order(quantity, request.price, check_price_tick=False)
+        except ValidationError as exc:
+            logger.warning(
+                "sizing.rejected_by_venue_rules",
+                symbol=str(instrument.symbol),
+                quantity=str(quantity),
+                error=exc.message,
+            )
+            return SizingResult(
+                ZERO, ZERO, ZERO, method, capped_by="violates_venue_rules", detail=exc.message
+            )
 
         distance = request.stop_distance
         risk_amount = quantity * distance if distance is not None else ZERO

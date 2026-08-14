@@ -91,6 +91,46 @@ class RiskDecision:
         }
 
 
+def as_maker_entry(
+    order_type: OrderType,
+    *,
+    limit_price: Decimal | None,
+    reference_price: Decimal,
+    enabled: bool,
+    is_entry: bool = True,
+) -> tuple[OrderType, Decimal | None, bool]:
+    """Convert an aggressive entry into a passive one, or leave it alone.
+
+    Applied at the single point where a Signal becomes an OrderRequest, so all twenty-two
+    strategies get maker pricing without any of them knowing about it, and there is exactly
+    one place this can be wrong.
+
+    Four things are deliberately NOT converted:
+
+    * **Exits.** A reduce-only order waiting for a passive fill is not protection. The fee
+      saved is bounded; the loss from a stop that never fills is not.
+    * **Stop entries.** A stop is triggered *by* price moving away from you. Quoting
+      passively at the same time contradicts the entry it is trying to make.
+    * **A strategy's own limit price.** If a strategy chose a price, it knows something
+      this layer does not; it becomes post-only but keeps its price.
+    * **Anything at all when disabled**, so the default path is byte-identical to before.
+
+    Returns:
+        ``(order_type, price, post_only)`` for the request.
+
+    """
+    if not enabled or not is_entry:
+        return order_type, limit_price, False
+    if order_type.requires_trigger_price:
+        return order_type, limit_price, False
+    if order_type is OrderType.LIMIT and limit_price is not None:
+        return order_type, limit_price, True
+    # At the touch: rest where the market currently is rather than trying to guess a
+    # better price. A limit further away fills less often and, when it does fill, fills
+    # precisely because the market ran past it.
+    return OrderType.LIMIT, reference_price, True
+
+
 class RiskEngine:
     """Sizes, protects and validates every order before it can reach a venue."""
 
@@ -181,6 +221,25 @@ class RiskEngine:
         """Restore latched state. Must be called before the first order."""
         await self._kill_switch.load()
 
+    async def refresh_kill_switch(self) -> None:
+        """Re-read the kill switch from storage.
+
+        The switch is engaged from *other processes* — the CLI, and the dashboard through
+        the API — but a long-running session loaded it once at startup and never looked
+        again. So a halt was written, persisted, and correctly reported by every tool that
+        read it fresh, while the bot it was meant to stop went on opening positions with a
+        stale "clear" in memory.
+
+        Called on the entry path, so the halt takes effect on the next decision rather than
+        the next restart. A storage failure leaves the last known state in place rather
+        than raising: losing the ability to read the switch must not become an inability
+        to trade, and if it was already engaged it stays engaged.
+        """
+        try:
+            await self._kill_switch.load()
+        except Exception as exc:
+            logger.warning("risk.kill_switch_refresh_failed", error=str(exc)[:200])
+
     def halt_for_the_day(self, reason: str) -> None:
         """Stop new entries until the next UTC day."""
         if self._halted_until is not None:
@@ -234,6 +293,10 @@ class RiskEngine:
             A decision carrying either the approved request or the reasons for refusal.
 
         """
+        # An operator halting from the CLI or the dashboard is a different process; without
+        # this the running session would not notice until it restarted.
+        await self.refresh_kill_switch()
+
         now = self._clock.now()
         context = RiskContext(
             request=request,
@@ -332,18 +395,27 @@ class RiskEngine:
             return RiskDecision(approved=False, reason=f"sizing failed: {exc.message}")
 
         if not sizing.is_tradable:
-            return RiskDecision(
-                approved=False,
-                sizing=sizing,
-                reason=f"position size resolved to zero ({sizing.capped_by})",
-            )
+            # Name the rule *and* the numbers. "resolved to zero" alone sent an operator
+            # back to the venue to work out which limit had bound, and a wrong-but-plausible
+            # rejection then looks identical to a correct one.
+            explanation = f"position size resolved to zero ({sizing.capped_by})"
+            if sizing.detail:
+                explanation = f"{explanation}: {sizing.detail}"
+            return RiskDecision(approved=False, sizing=sizing, reason=explanation)
 
+        entry_type, entry_price, post_only = as_maker_entry(
+            signal.order_type,
+            limit_price=signal.limit_price,
+            reference_price=reference_price,
+            enabled=self._settings.maker_first_entries,
+        )
         request = OrderRequest(
             symbol=signal.symbol,
             side=side,
-            order_type=signal.order_type,
+            order_type=entry_type,
             quantity=sizing.quantity,
-            price=signal.limit_price,
+            price=entry_price,
+            post_only=post_only,
             stop_loss_price=stop_loss,
             take_profit_price=signal.take_profit_price,
             time_in_force=signal.time_in_force,

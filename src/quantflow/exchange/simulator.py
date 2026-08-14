@@ -198,6 +198,14 @@ def match_against_candle(  # noqa: PLR0911 - one explicit branch per order type
         limit = order.price
         if limit is None:
             return FillDecision(filled=False, reason="limit order without a price")
+        # Post-only never crosses. If the bar opens beyond the limit, the order would have
+        # been marketable on arrival: a real venue rejects it rather than filling it at a
+        # better price. Treating that as a fill would gift the backtest price improvement
+        # on exactly the fastest-moving bars, which is where maker execution is hardest.
+        if order.post_only:
+            crossed = candle.open <= limit if order.side is OrderSide.BUY else candle.open >= limit
+            if crossed:
+                return FillDecision(filled=False, reason="post-only would cross the spread")
         if order.side is OrderSide.BUY and candle.low < limit:
             return FillDecision(filled=True, price=limit, role=LiquidityRole.MAKER)
         if order.side is OrderSide.SELL and candle.high > limit:
@@ -237,6 +245,11 @@ class SimulatedBroker:
     fees: FeeModel = field(default_factory=FeeModel)
     reject_oversized: bool = True
     _open_orders: dict[str, Order] = field(default_factory=dict, init=False)
+    #: order_id -> bars this order may rest for before it is cancelled unfilled. A
+    #: passive entry that never fills is a MISSED setup; leaving it working lets it
+    #: fill many bars later on a signal that has long since expired, which is a
+    #: slow-motion form of look-ahead.
+    _lifetimes: dict[str, int] = field(default_factory=dict, init=False)
     _fill_sequence: int = field(default=0, init=False)
 
     @property
@@ -252,7 +265,12 @@ class SimulatedBroker:
         return instrument
 
     def submit(
-        self, request: OrderRequest, *, now: datetime, reference_price: Decimal | None = None
+        self,
+        request: OrderRequest,
+        *,
+        now: datetime,
+        reference_price: Decimal | None = None,
+        max_bars: int | None = None,
     ) -> Order:
         """Accept an order into the book, validated against venue rules.
 
@@ -265,6 +283,10 @@ class SimulatedBroker:
             now: Current engine time.
             reference_price: Price used for the notional check on market orders, which
                 carry no price of their own. Validation is skipped when neither is known.
+            max_bars: Bars this order may rest for before it is cancelled unfilled. ``None``
+                leaves it working indefinitely. A passive entry needs a bound: a setup that
+                never filled is a setup that was missed, and an unbounded resting order can
+                fill much later on a signal that no longer applies.
 
         """
         instrument = self.instrument_for(request.symbol)
@@ -277,6 +299,8 @@ class SimulatedBroker:
         order = Order.from_request(request, now=now)
         order = order.acknowledge(f"sim-{uuid.uuid4().hex[:12]}", now=now)
         self._open_orders[order.order_id] = order
+        if max_bars is not None:
+            self._lifetimes[order.order_id] = max_bars
         return order
 
     def cancel(self, order_id: str, *, now: datetime) -> Order:
@@ -297,6 +321,25 @@ class SimulatedBroker:
         ]
         return [self.cancel(order.order_id, now=now) for order in targets]
 
+    def _expire_stale(self, candle: Candle) -> None:
+        """Cancel resting orders that have outlived their bounded lifetime.
+
+        Decremented before matching, so an order with one bar left is matched against this
+        bar and then retired. A passive entry that never filled is a setup that was missed;
+        keeping it working would let it fill on a later bar under a signal that no longer
+        exists.
+        """
+        for order_id in list(self._lifetimes):
+            order = self._open_orders.get(order_id)
+            if order is None or order.symbol != candle.symbol:
+                continue
+            remaining = self._lifetimes[order_id] - 1
+            if remaining < 0:
+                self.cancel(order_id, now=candle.close_time)
+                del self._lifetimes[order_id]
+            else:
+                self._lifetimes[order_id] = remaining
+
     def process_candle(self, candle: Candle) -> list[tuple[Order, Fill]]:
         """Match every working order for the bar's symbol.
 
@@ -306,6 +349,7 @@ class SimulatedBroker:
         """
         results: list[tuple[Order, Fill]] = []
         instrument = self.instruments.get(candle.symbol)
+        self._expire_stale(candle)
         if instrument is None:
             return results
 
