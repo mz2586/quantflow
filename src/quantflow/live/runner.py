@@ -45,6 +45,11 @@ from quantflow.domain.market import Candle
 from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.exchange.bybit.ws import BybitStream
 from quantflow.execution.router import LiveOrderRouter, OrderRouter
+from quantflow.live.intrabar_manager import (
+    IntrabarManager,
+    intrabar_config_from_env,
+    reconcile_seconds_from_env,
+)
 from quantflow.notifications.dispatcher import NotificationDispatcher, build_dispatcher
 from quantflow.paper.engine import PaperConfig, PaperSessionState, PaperTradingEngine
 from quantflow.persistence.database import Database
@@ -150,6 +155,10 @@ class RunnerConfig:
     timeframe: Timeframe
     mode: TradingMode = TradingMode.PAPER
     starting_equity: Decimal = Decimal("10000")
+    #: True only when ``starting_equity`` was read from the venue's own balance. It is what
+    #: entitles the engine to correct a restored session's cash: a configured fallback says
+    #: nothing about the account and must never override the session's own history.
+    equity_is_authoritative: bool = False
     strategy_params: dict[str, Any] = field(default_factory=dict)
     history_bars: int = 500
     persist: bool = True
@@ -179,6 +188,7 @@ class TradingRunner:
         "_dispatcher",
         "_engine",
         "_gateway",
+        "_intrabar",
         "_settings",
         "_stopping",
         "_strategy",
@@ -203,6 +213,9 @@ class TradingRunner:
         self._cache: Cache | None = None
         self._dispatcher: NotificationDispatcher | None = None
         self._gateway: BybitGateway | None = None
+        #: Ticker-driven profit protection. Runs beside the candle loop, never inside
+        #: it, so a favourable move mid-bar is acted on without waiting for the close.
+        self._intrabar: IntrabarManager | None = None
         self._stream: BybitStream | None = None
         self._engine: PaperTradingEngine | None = None
         self._stopping = asyncio.Event()
@@ -289,6 +302,7 @@ class TradingRunner:
             assert self._stream is not None
 
             await self._announce(started=True)
+            await self._start_intrabar()
             try:
                 state = await self._engine.run(self._feed())
             except asyncio.CancelledError:
@@ -350,11 +364,21 @@ class TradingRunner:
                 symbols=self._config.symbols,
                 timeframe=self._config.timeframe,
                 starting_equity=self._config.starting_equity,
+                equity_is_authoritative=self._config.equity_is_authoritative,
                 base_currency=settings.trading.base_currency,
                 risk=settings.risk,
                 history_bars=self._config.history_bars,
                 persist=self._config.persist,
                 session_id=self._config.session_id,
+                # Carry the session's real mode so a live session is not recorded as paper.
+                mode=self._config.mode,
+                # And the venue's actual market type. Left at the SPOT default, a linear-perp
+                # account is valued as though every position were an asset bought with cash:
+                # a long debits its whole notional and a short *credits* it, so equity on a
+                # book holding one of each is wrong by twice the short's notional. That went
+                # unnoticed only because no position ever reached the local book.
+                market_type=settings.exchange.market_type,
+                leverage=settings.risk.max_leverage,
             ),
             instruments=instruments,
             database=self._database,
@@ -391,9 +415,37 @@ class TradingRunner:
         restarting a process rarely intends to liquidate the book.
         """
         self._stopping.set()
+        if self._intrabar is not None:
+            await self._intrabar.stop()
         if self._engine is not None:
             await self._engine.stop(flatten=flatten)
         logger.info("runner.stop_requested", flatten=flatten)
+
+    async def _start_intrabar(self) -> None:
+        """Bring up ticker-driven profit protection for the traded symbols.
+
+        The manager reconciles against the venue before its first tick and keeps doing so
+        on a cadence, so a restart resumes management of existing positions, and a position
+        opened, closed or replaced *after* startup is picked up without anything having to
+        tell it. Never fatal: if protection cannot start, the session still trades with its
+        exchange-side stops, and the failure is loud rather than silent.
+        """
+        if self._gateway is None or self._stream is None:
+            return
+        config = intrabar_config_from_env()
+        self._intrabar = IntrabarManager(
+            self._gateway,
+            self._stream,
+            config,
+            reconcile_seconds=reconcile_seconds_from_env(),
+            clock=self._clock.now,
+        )
+        if not config.enabled:
+            return
+        try:
+            await self._intrabar.start(list(self._config.symbols))
+        except Exception as exc:
+            logger.warning("intrabar.start_failed", error=str(exc)[:200])
 
     async def _announce(self, *, started: bool) -> None:
         """Notify that the session started or stopped."""
