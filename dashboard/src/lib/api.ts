@@ -49,13 +49,23 @@ export interface RiskLimits {
   max_orders_per_minute: number;
 }
 
+/**
+ * Nested objects and lists below are declared **optional across these interfaces**, even
+ * where the current API always sends them.
+ *
+ * This is not pedantry. These types describe JSON arriving from a process deployed
+ * separately from this bundle: a stale or half-rebuilt API omits fields the frontend was
+ * written against. `undefined.engaged` throws, a throw during render unmounts React's
+ * whole tree, and the operator gets a blank page instead of a kill switch. Marking them
+ * optional makes the compiler enforce the handling rather than leaving it to discipline.
+ */
 export interface RiskStatus {
   trading_halted: boolean;
-  kill_switch: KillSwitch;
-  limits: RiskLimits;
-  headroom: Record<string, string>;
-  sizer: string;
-  rules: string[];
+  kill_switch?: KillSwitch;
+  limits?: RiskLimits;
+  headroom?: Record<string, string>;
+  sizer?: string;
+  rules?: string[];
 }
 
 export interface RiskEvent {
@@ -98,8 +108,8 @@ export interface Portfolio {
   leverage: Money;
   drawdown_pct: Money;
   daily_pnl: Money;
-  position_count: number;
-  positions: Position[];
+  position_count?: number;
+  positions?: Position[];
 }
 
 export interface Candle {
@@ -117,7 +127,7 @@ export interface CandlesResponse {
   symbol: string;
   timeframe: string;
   count: number;
-  candles: Candle[];
+  candles?: Candle[];
   /** Missing bars detected. Non-zero means the chart has holes. */
   gaps: number;
 }
@@ -145,7 +155,7 @@ export interface Trade {
   entry_price: Money;
   exit_price: Money;
   entry_time: string;
-  exit_time: string;
+  exit_time?: string;
   gross_pnl: Money;
   fees: Money;
   net_pnl: Money;
@@ -172,18 +182,18 @@ export interface Attribution {
 
 export interface PerformanceReview {
   trade_count: number;
-  by_strategy: Attribution[];
-  by_symbol: Attribution[];
-  by_side: Attribution[];
-  streaks: { longest_win: number; longest_loss: number; current: number };
-  concentration: {
+  by_strategy?: Attribution[];
+  by_symbol?: Attribution[];
+  by_side?: Attribution[];
+  streaks?: { longest_win: number; longest_loss: number; current: number };
+  concentration?: {
     top_trade_share: Money;
     profit_without_best: Money;
     is_concentrated: boolean;
     rests_on_one_trade: boolean;
   };
   /** Plain-language caveats. Rendered prominently rather than buried. */
-  warnings: string[];
+  warnings?: string[];
 }
 
 export interface LiveBalance {
@@ -213,22 +223,26 @@ export interface LiveOrder {
   quantity: Money;
   filled: Money;
   price: Money | null;
+  /** What a conditional order is for. Null for ordinary orders, which have no purpose. */
+  purpose: "stop_loss" | "take_profit" | null;
+  trigger_price: Money | null;
+  reduce_only: boolean;
   created_at: string;
 }
 
 /** Live exchange account, read straight from the venue. Never stored state. */
 export interface LiveAccount {
-  venue: string;
-  network: string;
+  venue?: string;
+  network?: string;
   authenticated: boolean;
   total_balance: Money;
   available_balance: Money;
-  balances: LiveBalance[];
-  positions: LivePosition[];
-  position_count: number;
+  balances?: LiveBalance[];
+  positions?: LivePosition[];
+  position_count?: number;
   unrealized_pnl: Money;
-  open_orders: LiveOrder[];
-  open_order_count: number;
+  open_orders?: LiveOrder[];
+  open_order_count?: number;
 }
 
 export interface LiveFill {
@@ -248,7 +262,7 @@ export interface LiveFills {
   count: number;
   realized_pnl: Money;
   total_fees: Money;
-  fills: LiveFill[];
+  fills?: LiveFill[];
 }
 
 export interface Session {
@@ -256,7 +270,7 @@ export interface Session {
   mode: string;
   status: string;
   strategy_id: string;
-  symbols: string[];
+  symbols?: string[];
   timeframe: string;
   starting_equity: Money;
   final_equity: Money | null;
@@ -297,6 +311,17 @@ export function pathSymbol(symbol: string): string {
   return encodeURIComponent(symbol.replace("/", "-"));
 }
 
+/**
+ * How long a single call may hang before it is abandoned.
+ *
+ * A request with no timeout never fails when the API is merely unreachable — it simply
+ * stays pending. The dashboard re-polls every few seconds, so an API that is down (a
+ * stopped container still holding its published port, say) leaves the tab accumulating
+ * never-resolving requests until it locks up. Comfortably longer than any healthy call,
+ * and shorter than the poll interval's patience.
+ */
+const REQUEST_TIMEOUT_MS = 10_000;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // Built through `Headers` rather than object spread: `HeadersInit` is legitimately a
   // `Headers` instance or an entry array, and spreading either into an object literal
@@ -304,7 +329,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
-  const response = await fetch(path, { ...init, headers });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      ...init,
+      headers,
+      signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    // Surfaced as an ApiError so callers have one error type to handle, and the panel
+    // says "unreachable" rather than sitting on a spinner forever.
+    const unreachable = error instanceof DOMException && error.name === "TimeoutError";
+    throw new ApiError(
+      0,
+      unreachable ? "timeout" : "network_error",
+      unreachable ? `no response from the API within ${REQUEST_TIMEOUT_MS / 1000}s` : "API unreachable",
+      null,
+    );
+  }
 
   if (!response.ok) {
     let code = "http_error";

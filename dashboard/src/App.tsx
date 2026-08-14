@@ -37,25 +37,45 @@ import {
   type Trade,
 } from "./lib/api";
 import { ago, chartValue, money, percent, quantity, signed, time, tone } from "./lib/format";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 const POLL_INTERVAL_MS = 5_000;
 
+/**
+ * Coerce an API collection to an array before rendering.
+ *
+ * The difference between one empty panel and a blank page: `.map` and `.length` on
+ * `undefined` throw, and a throw during render unmounts the entire tree. An API that
+ * omits a field, or returns an object where a list was expected, must cost one panel.
+ */
+function list<T>(value: readonly T[] | null | undefined): readonly T[] {
+  return Array.isArray(value) ? (value as readonly T[]) : [];
+}
+
 function Panel({
   title,
+  subtitle,
   children,
   action,
 }: {
   title: string;
+  subtitle?: string;
   children: React.ReactNode;
   action?: React.ReactNode;
 }) {
   return (
     <section className="rounded-lg border border-zinc-800 bg-zinc-900/60">
       <header className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{title}</h2>
+        <div>
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{title}</h2>
+          {subtitle ? <p className="mt-0.5 text-[11px] text-zinc-500">{subtitle}</p> : null}
+        </div>
         {action}
       </header>
-      <div className="p-4">{children}</div>
+      {/* Per-panel containment: a malformed payload costs this panel, not the page. */}
+      <div className="p-4">
+        <ErrorBoundary label={title}>{children}</ErrorBoundary>
+      </div>
     </section>
   );
 }
@@ -89,6 +109,7 @@ function Header({
   readiness,
   risk,
   session,
+  account,
   connected,
   onToggleKillSwitch,
   busy,
@@ -96,20 +117,46 @@ function Header({
   readiness: ReadinessResponse | null;
   risk: RiskStatus | null;
   session: Session | null;
+  account: LiveAccount | null;
   connected: boolean;
   onToggleKillSwitch: () => void;
   busy: boolean;
 }) {
-  const engaged = risk?.kill_switch.engaged ?? false;
+  const engaged = risk?.kill_switch?.engaged ?? false;
   const halted = risk?.trading_halted ?? false;
+  // The venue the orders actually reach, not the API process's own configured mode.
+  // Those disagree — the API can be configured `paper` while a live session trades a
+  // demo venue — and the badge that says whether the money is real must follow the venue.
+  const venueEnv = account?.network ?? null;
+  const isDemo = venueEnv === "demo";
+  const isMainnet = venueEnv === "mainnet";
 
   return (
     <header className="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
         <h1 className="text-sm font-semibold tracking-tight">QuantFlow</h1>
 
-        <span className="rounded bg-zinc-800 px-2 py-0.5 text-[11px] uppercase tracking-wider text-zinc-300">
-          {readiness?.trading_mode ?? "…"}
+        <span
+          className={`rounded px-2 py-0.5 text-[11px] uppercase tracking-wider ${
+            isMainnet
+              ? "bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40"
+              : isDemo
+                ? "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30"
+                : "bg-zinc-800 text-zinc-300"
+          }`}
+          title={
+            isDemo
+              ? "Bybit demo venue — real orders, virtual funds. No real money."
+              : isMainnet
+                ? "MAINNET — real money at risk."
+                : undefined
+          }
+        >
+          {isDemo
+            ? "Demo · virtual funds"
+            : isMainnet
+              ? "Mainnet · real money"
+              : (venueEnv ?? readiness?.trading_mode ?? "…")}
         </span>
 
         <span className="flex items-center gap-1.5 text-[11px] text-zinc-400">
@@ -133,7 +180,7 @@ function Header({
         {session ? (
           <span
             className="truncate text-[11px] text-zinc-500"
-            title={`${session.strategy_id} · ${session.symbols.join(", ")} · ${session.timeframe}`}
+            title={`${session.strategy_id} · ${list(session.symbols).join(", ")} · ${session.timeframe}`}
           >
             session <span className="text-zinc-300">{session.session_id}</span>
             <span className="text-zinc-600"> · {session.status}</span>
@@ -150,7 +197,7 @@ function Header({
           {engaged ? (
             <span
               className="rounded bg-rose-500/15 px-2 py-1 text-[11px] font-medium text-rose-300"
-              title={risk?.kill_switch.reason ?? undefined}
+              title={risk?.kill_switch?.reason ?? undefined}
             >
               KILL SWITCH ENGAGED
             </span>
@@ -276,10 +323,10 @@ export default function App() {
     // Prefer a symbol the running session actually trades. `series[0]` is whatever sorts
     // first, which in practice is a daily series from an unrelated backfill - it cannot
     // move intraday, so the chart reads as frozen while the session is running fine.
-    const sessionSymbol = session?.symbols.find((symbol) =>
-      series.some((item) => item.symbol === symbol),
+    const sessionSymbol = list(session?.symbols).find((symbol) =>
+      list(series).some((item) => item.symbol === symbol),
     );
-    const first = sessionSymbol ?? series[0]?.symbol;
+    const first = sessionSymbol ?? list(series)[0]?.symbol;
     if (first) setSelected(first);
   }, [series, selected, session]);
 
@@ -288,9 +335,9 @@ export default function App() {
     // Match the session's timeframe when that series exists, so the chart and the engine
     // are looking at the same bars. Falls back to whatever is stored for the symbol.
     const entry =
-      series.find(
+      list(series).find(
         (item) => item.symbol === selected && item.timeframe === session?.timeframe,
-      ) ?? series.find((item) => item.symbol === selected);
+      ) ?? list(series).find((item) => item.symbol === selected);
     void api
       .candles(selected, entry?.timeframe ?? "1h", 300)
       .then(setCandles)
@@ -298,7 +345,7 @@ export default function App() {
   }, [selected, series, session]);
 
   const toggleKillSwitch = useCallback(async () => {
-    const engaged = risk?.kill_switch.engaged ?? false;
+    const engaged = risk?.kill_switch?.engaged ?? false;
     let reason = "";
     if (!engaged) {
       // A halt with no recorded cause is close to useless in the post-mortem, so the
@@ -320,9 +367,9 @@ export default function App() {
     }
   }, [risk, refresh]);
 
-  const equityCurve = trades
+  const equityCurve = list(trades)
     .slice()
-    .sort((a, b) => a.exit_time.localeCompare(b.exit_time))
+    .sort((a, b) => (a.exit_time ?? "").localeCompare(b.exit_time ?? ""))
     .reduce<{ time: string; pnl: number }[]>((accumulated, trade) => {
       const previous = accumulated.at(-1)?.pnl ?? 0;
       accumulated.push({
@@ -332,30 +379,42 @@ export default function App() {
       return accumulated;
     }, []);
 
-  const priceSeries =
-    candles?.candles.map((candle) => ({
-      time: time(candle.open_time),
-      close: chartValue(candle.close),
-    })) ?? [];
+  const priceSeries = list(candles?.candles).map((candle) => ({
+    time: time(candle.open_time),
+    close: chartValue(candle.close),
+  }));
 
   return (
     <div className="min-h-full bg-zinc-950 text-zinc-100">
-      <Header
-        readiness={readiness}
-        risk={risk}
-        session={session}
-        connected={connected}
-        onToggleKillSwitch={() => void toggleKillSwitch()}
-        busy={busy}
-      />
+      <ErrorBoundary label="Header">
+        <Header
+          readiness={readiness}
+          risk={risk}
+          session={session}
+          account={account}
+          connected={connected}
+          onToggleKillSwitch={() => void toggleKillSwitch()}
+          busy={busy}
+        />
+      </ErrorBoundary>
 
       <main className="mx-auto max-w-7xl space-y-4 px-4 py-5">
         <Panel
           title={
             account
-              ? `Live ${account.venue.toUpperCase()} account (${account.network})`
-              : "Live exchange account"
+              ? account.network === "demo"
+                ? `${(account.venue ?? "venue").toUpperCase()} demo account — virtual funds`
+                : account.network === "mainnet"
+                  ? `${(account.venue ?? "venue").toUpperCase()} MAINNET account — REAL MONEY`
+                  : `${(account.venue ?? "venue").toUpperCase()} ${account.network ?? ""} account`
+              : "Exchange account"
           }
+          {...(account?.network === "demo"
+            ? {
+                subtitle:
+                  "Authoritative balance. Orders are real and fill on the venue; the funds are not.",
+              }
+            : {})}
         >
           {accountError ? (
             <Empty message={`Not connected: ${accountError}`} />
@@ -377,20 +436,23 @@ export default function App() {
                   valueClass={fills ? tone(fills.realized_pnl) : ""}
                   {...(fills ? { hint: `fees ${money(fills.total_fees)}` } : {})}
                 />
-                <Stat label="Open orders" value={String(account.open_order_count)} />
+                <Stat
+                  label="Open orders"
+                  value={String(account.open_order_count ?? list(account.open_orders).length)}
+                />
               </div>
 
               <div className="mt-4 grid gap-4 lg:grid-cols-2">
                 <div>
                   <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Positions ({account.position_count})
+                    Positions ({account.position_count ?? list(account.positions).length})
                   </div>
-                  {account.positions.length === 0 ? (
+                  {list(account.positions).length === 0 ? (
                     <p className="text-sm text-zinc-500">No open positions.</p>
                   ) : (
                     <table className="w-full text-sm">
                       <tbody className="font-mono tabular-nums">
-                        {account.positions.map((position) => (
+                        {list(account.positions).map((position) => (
                           <tr key={position.symbol} className="border-t border-zinc-800">
                             <td className="py-1.5 font-sans">{position.symbol}</td>
                             <td className="py-1.5">{position.side}</td>
@@ -412,12 +474,12 @@ export default function App() {
                   <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
                     Recent fills{fills ? ` (${fills.symbol}, ${fills.count})` : ""}
                   </div>
-                  {!fills || fills.fills.length === 0 ? (
+                  {list(fills?.fills).length === 0 ? (
                     <p className="text-sm text-zinc-500">No fills on the venue.</p>
                   ) : (
                     <table className="w-full text-sm">
                       <tbody className="font-mono tabular-nums">
-                        {fills.fills.slice(0, 6).map((fill) => (
+                        {list(fills?.fills).slice(0, 6).map((fill) => (
                           <tr key={fill.fill_id} className="border-t border-zinc-800">
                             <td className="py-1.5 font-sans">{time(fill.timestamp)}</td>
                             <td className="py-1.5">{fill.side}</td>
@@ -431,22 +493,40 @@ export default function App() {
                 </div>
               </div>
 
-              {account.open_orders.length > 0 ? (
+              {list(account.open_orders).length > 0 ? (
                 <div className="mt-4">
                   <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
                     Working orders
+                    <span className="ml-2 normal-case tracking-normal text-zinc-600">
+                      a bracketed position has two: a stop and a target
+                    </span>
                   </div>
                   <table className="w-full text-sm">
                     <tbody className="font-mono tabular-nums">
-                      {account.open_orders.map((order) => (
+                      {list(account.open_orders).map((order) => (
                         <tr key={order.order_id} className="border-t border-zinc-800">
                           <td className="py-1.5 font-sans">{order.symbol}</td>
-                          <td className="py-1.5">
-                            {order.side} {order.type}
+                          <td className="py-1.5 font-sans">
+                            {order.purpose === "stop_loss" ? (
+                              <span className="text-rose-300">stop</span>
+                            ) : order.purpose === "take_profit" ? (
+                              <span className="text-emerald-300">target</span>
+                            ) : (
+                              <span className="text-zinc-400">
+                                {order.side} {order.type}
+                              </span>
+                            )}
                           </td>
                           <td className="py-1.5 text-right">{quantity(order.quantity)}</td>
                           <td className="py-1.5 text-right">
-                            {order.price ? money(order.price) : "market"}
+                            {order.trigger_price
+                              ? `@ ${money(order.trigger_price)}`
+                              : order.price
+                                ? money(order.price)
+                                : "market"}
+                          </td>
+                          <td className="py-1.5 text-right text-zinc-500">
+                            {order.reduce_only ? "reduce-only" : ""}
                           </td>
                           <td className="py-1.5 text-right">{order.status}</td>
                         </tr>
@@ -465,13 +545,13 @@ export default function App() {
           </div>
         ) : null}
 
-        {review?.warnings.length ? (
+        {list(review?.warnings).length > 0 ? (
           <div className="rounded border border-amber-500/30 bg-amber-500/10 px-4 py-3">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-amber-300">
               Read before acting on these numbers
             </h3>
             <ul className="mt-2 space-y-1 text-sm text-amber-100/90">
-              {review.warnings.map((warning) => (
+              {list(review?.warnings).map((warning) => (
                 <li key={warning}>• {warning}</li>
               ))}
             </ul>
@@ -480,7 +560,10 @@ export default function App() {
 
         <div className="grid gap-4 lg:grid-cols-3">
           <div className="lg:col-span-2">
-            <Panel title="Portfolio">
+            <Panel
+              title="Session book"
+              subtitle="This bot session's own accounting, starting from its configured equity — not the venue balance above."
+            >
               {portfolio ? (
                 <>
                   <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
@@ -509,9 +592,9 @@ export default function App() {
                   </div>
 
                   <h3 className="mt-6 mb-2 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Open positions ({portfolio.position_count})
+                    Open positions ({portfolio.position_count ?? list(portfolio.positions).length})
                   </h3>
-                  {portfolio.positions.length === 0 ? (
+                  {list(portfolio.positions).length === 0 ? (
                     <Empty message="No open positions." />
                   ) : (
                     <div className="overflow-x-auto">
@@ -528,7 +611,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody className="font-mono tabular-nums">
-                          {portfolio.positions.map((position) => (
+                          {list(portfolio.positions).map((position) => (
                             <tr key={position.symbol} className="border-t border-zinc-800">
                               <td className="py-1.5 font-sans">{position.symbol}</td>
                               <td className="py-1.5 font-sans uppercase">{position.side}</td>
@@ -568,12 +651,12 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <span className="text-zinc-400">Kill switch</span>
                   <span
-                    className={risk.kill_switch.engaged ? "text-rose-400" : "text-emerald-400"}
+                    className={risk.kill_switch?.engaged ? "text-rose-400" : "text-emerald-400"}
                   >
-                    {risk.kill_switch.engaged ? "ENGAGED" : "clear"}
+                    {risk.kill_switch?.engaged ? "ENGAGED" : "clear"}
                   </span>
                 </div>
-                {risk.kill_switch.reason ? (
+                {risk.kill_switch?.reason ? (
                   <p className="rounded bg-zinc-800/60 px-2 py-1.5 text-xs text-zinc-300">
                     {risk.kill_switch.reason}
                     {risk.kill_switch.engaged_by ? ` — ${risk.kill_switch.engaged_by}` : ""}
@@ -593,31 +676,31 @@ export default function App() {
                   <dl className="space-y-1 font-mono text-xs tabular-nums">
                     <div className="flex justify-between">
                       <dt className="font-sans text-zinc-400">Max position</dt>
-                      <dd>{percent(risk.limits.max_position_pct, 0)}</dd>
+                      <dd>{percent(risk.limits?.max_position_pct, 0)}</dd>
                     </div>
                     <div className="flex justify-between">
                       <dt className="font-sans text-zinc-400">Max exposure</dt>
-                      <dd>{percent(risk.limits.max_total_exposure_pct, 0)}</dd>
+                      <dd>{percent(risk.limits?.max_total_exposure_pct, 0)}</dd>
                     </div>
                     <div className="flex justify-between">
                       <dt className="font-sans text-zinc-400">Daily loss</dt>
-                      <dd>{percent(risk.limits.max_daily_loss_pct, 0)}</dd>
+                      <dd>{percent(risk.limits?.max_daily_loss_pct, 0)}</dd>
                     </div>
                     <div className="flex justify-between">
                       <dt className="font-sans text-zinc-400">Max drawdown</dt>
-                      <dd>{percent(risk.limits.max_drawdown_pct, 0)}</dd>
+                      <dd>{percent(risk.limits?.max_drawdown_pct, 0)}</dd>
                     </div>
                     <div className="flex justify-between">
                       <dt className="font-sans text-zinc-400">Stop required</dt>
-                      <dd className={risk.limits.require_stop_loss ? "" : "text-rose-400"}>
-                        {risk.limits.require_stop_loss ? "yes" : "NO"}
+                      <dd className={risk.limits?.require_stop_loss ? "" : "text-rose-400"}>
+                        {risk.limits?.require_stop_loss ? "yes" : "NO"}
                       </dd>
                     </div>
                   </dl>
                 </div>
 
                 <div className="border-t border-zinc-800 pt-2 text-[11px] text-zinc-500">
-                  {risk.rules.length} rules active · sizer {risk.sizer}
+                  {risk.rules?.length ?? 0} rules active · sizer {risk.sizer ?? "—"}
                 </div>
               </div>
             ) : (
@@ -635,7 +718,7 @@ export default function App() {
                 onChange={(event) => { setSelected(event.target.value); }}
                 className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs"
               >
-                {series.map((entry) => (
+                {list(series).map((entry) => (
                   <option key={`${entry.symbol}-${entry.timeframe}`} value={entry.symbol}>
                     {entry.symbol} {entry.timeframe}
                   </option>
@@ -714,11 +797,11 @@ export default function App() {
 
         <div className="grid gap-4 lg:grid-cols-2">
           <Panel title="Recent risk events">
-            {events.length === 0 ? (
+            {list(events).length === 0 ? (
               <Empty message="No risk events recorded." />
             ) : (
               <ul className="space-y-2">
-                {events.slice(0, 8).map((event, index) => (
+                {list(events).slice(0, 8).map((event, index) => (
                   <li
                     key={`${event.created_at}-${index}`}
                     className="border-l-2 border-zinc-700 pl-3 text-sm"
@@ -743,7 +826,7 @@ export default function App() {
           </Panel>
 
           <Panel title="Strategy attribution">
-            {!review || review.by_strategy.length === 0 ? (
+            {list(review?.by_strategy).length === 0 ? (
               <Empty message="No closed trades to attribute." />
             ) : (
               <table className="w-full text-sm">
@@ -756,7 +839,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="font-mono tabular-nums">
-                  {review.by_strategy.map((entry) => (
+                  {list(review?.by_strategy).map((entry) => (
                     <tr key={entry.key} className="border-t border-zinc-800">
                       <td className="py-1.5 font-sans">
                         {entry.key}
@@ -782,12 +865,12 @@ export default function App() {
           </Panel>
         </div>
 
-        <Panel title={`Registered strategies (${strategies.length})`}>
-          {strategies.length === 0 ? (
+        <Panel title={`Registered strategies (${list(strategies).length})`}>
+          {list(strategies).length === 0 ? (
             <Empty message="Loading…" />
           ) : (
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {strategies.map((strategy) => (
+              {list(strategies).map((strategy) => (
                 <div key={strategy.strategy_id} className="rounded border border-zinc-800 p-3">
                   <div className="font-mono text-sm text-blue-300">{strategy.strategy_id}</div>
                   <p className="mt-1 text-xs text-zinc-400">{strategy.description}</p>

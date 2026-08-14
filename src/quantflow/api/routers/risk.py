@@ -31,8 +31,17 @@ router = APIRouter(prefix="/risk", tags=["risk"])
 
 @router.get("/status", response_model=RiskStatusResponse, summary="Current risk state")
 async def get_status(state: StateDep, risk: RiskDep) -> RiskStatusResponse:
-    """Report limits, kill-switch state and remaining headroom."""
+    """Report limits, kill-switch state and remaining headroom.
+
+    The switch is re-read from storage on every request rather than served from whatever
+    this process loaded at startup. The switch is engaged and cleared from *other*
+    processes — the CLI, the trading engine — so a cached copy goes stale the moment
+    anyone else touches it, and a dashboard that reports HALTED while the engine trades
+    normally is worse than one that reports nothing: it is confidently wrong about the one
+    control an operator reaches for in an emergency.
+    """
     settings = state.settings.risk
+    await risk.refresh_kill_switch()
     switch = risk.kill_switch.state
 
     headroom: dict[str, str] = {}

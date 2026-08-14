@@ -83,7 +83,8 @@ async def get_account(state: StateDep) -> dict[str, Any]:
 
     return {
         "venue": gateway.name,
-        "network": "testnet" if gateway.is_testnet else "mainnet",
+        # Ask the gateway, rather than inferring from a testnet flag that predates demo.
+        "network": getattr(gateway, "network", "testnet" if gateway.is_testnet else "mainnet"),
         "authenticated": bool(getattr(gateway, "supports_trading", False)),
         "total_balance": str(total),
         "available_balance": str(available),
@@ -111,6 +112,13 @@ async def get_account(state: StateDep) -> dict[str, Any]:
                 "quantity": str(order.quantity),
                 "filled": str(order.filled_quantity),
                 "price": str(order.price) if order.price is not None else None,
+                # A stop and a target are both "sell market" once normalised; without
+                # these two fields a protective bracket reads as a duplicated exit.
+                "purpose": order.metadata.get("purpose"),
+                "trigger_price": (
+                    str(order.trigger_price) if order.trigger_price is not None else None
+                ),
+                "reduce_only": order.reduce_only,
                 "created_at": order.created_at.isoformat(),
             }
             for order in orders
