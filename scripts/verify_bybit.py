@@ -119,8 +119,7 @@ async def verify(*, place_order: bool, symbol: Symbol) -> Report:
             report.add(
                 "account_type",
                 False,
-                f"could not determine: {exc}. Balance parsing may be wrong for this "
-                "account type.",
+                f"could not determine: {exc}. Balance parsing may be wrong for this account type.",
             )
 
         # --- 3. Balances --------------------------------------------------------
