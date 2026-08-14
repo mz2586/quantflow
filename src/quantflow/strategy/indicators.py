@@ -413,6 +413,62 @@ def obv(candles: Sequence[Candle]) -> Series:
     return tuple(out)
 
 
+def simple_returns(values: Sequence[Decimal]) -> Series:
+    """Bar-to-bar fractional returns, aligned to ``values``.
+
+    The first element is ``None`` because a return needs a prior price, and a bar whose
+    predecessor is non-positive is ``None`` rather than a fabricated zero — a zero return
+    is a statement about the market, and inventing one would quietly pull a volatility
+    estimate toward calm exactly where the data is broken.
+    """
+    if not values:
+        return ()
+    out: list[Decimal | None] = [None]
+    for previous, current in pairwise(values):
+        out.append(None if previous <= ZERO else (current - previous) / previous)
+    return tuple(out)
+
+
+def return_volatility(values: Sequence[Decimal], period: int) -> Series:
+    """Rolling population standard deviation of bar-to-bar returns, aligned to ``values``.
+
+    A *close-to-close* dispersion measure, and deliberately not ATR. ATR summarises how far
+    price travels **within** a bar, so a market that whipsaws all session and closes flat
+    reads as violent; this reads it as calm. The two disagree most exactly where the
+    distinction matters, which is why both live in the library rather than one standing in
+    for the other.
+
+    Returns ``None`` for any window that does not hold a full ``period`` of defined returns.
+    """
+    _require_period(period, minimum=2)
+    changes = simple_returns(values)
+    out: list[Decimal | None] = [None] * len(values)
+    for index in range(period, len(values)):
+        window = [value for value in changes[index - period + 1 : index + 1] if value is not None]
+        if len(window) < period:
+            continue
+        mean = sum(window, ZERO) / period
+        variance = sum(((value - mean) ** 2 for value in window), ZERO) / period
+        out[index] = variance.sqrt()
+    return tuple(out)
+
+
+def percentile_rank(window: Sequence[Decimal], value: Decimal) -> Decimal | None:
+    """Where ``value`` sits inside ``window``, as a percentile in ``[0, 100]``.
+
+    Ties count half, which is the standard mid-rank convention: without it a series that
+    has printed the same price a hundred times reads as either the extreme top or the
+    extreme bottom of its own range depending purely on the comparison operator chosen.
+
+    Returns ``None`` for an empty window — there is no distribution to rank against.
+    """
+    if not window:
+        return None
+    below = sum(1 for item in window if item < value)
+    ties = sum(1 for item in window if item == value)
+    return (Decimal(below) + Decimal(ties) / 2) / Decimal(len(window)) * Decimal("100")
+
+
 def require_value(series: Series, index: int, name: str) -> Decimal:
     """Read an indicator value, raising a clear error if it is still warming up.
 
@@ -432,3 +488,227 @@ def require_value(series: Series, index: int, name: str) -> Decimal:
     value = series[index]
     assert value is not None
     return value
+
+
+# --------------------------------------------------------------------------- #
+# Trend-structure indicators
+#
+# Everything below is *stateful in time*: each value depends on the one before it, or on
+# a pivot that only becomes knowable some bars after it printed. That is exactly the shape
+# in which look-ahead bias hides, so each one is written so that the value at index ``i``
+# is a function of bars ``<= i`` only, and each is covered by a prefix-invariance test
+# (``f(candles)[:k] == f(candles[:k])``) rather than by inspection.
+# --------------------------------------------------------------------------- #
+
+
+def supertrend(
+    candles: Sequence[Candle], period: int = 10, multiplier: Decimal = Decimal("3")
+) -> tuple[Series, Series]:
+    """SuperTrend as ``(line, direction)``; direction is ``+1`` up, ``-1`` down.
+
+    An ATR band either side of the bar's midpoint, ratcheted so it can only ever move
+    *toward* price while the trend holds. Direction flips when a close breaches the
+    opposite band, and the line then jumps to the other side of price — which is what makes
+    it a trailing stop rather than another moving average.
+
+    The ratchet is why this cannot be computed pointwise: the band at ``i`` depends on the
+    band at ``i-1``. It is seeded on the first bar where ATR is defined and never looks
+    forward.
+    """
+    _require_period(period)
+    if multiplier <= ZERO:
+        raise ValidationError(f"multiplier must be positive, got {multiplier}")
+
+    size = len(candles)
+    ranges = atr(candles, period)
+    line: list[Decimal | None] = [None] * size
+    direction: list[Decimal | None] = [None] * size
+
+    upper: Decimal | None = None
+    lower: Decimal | None = None
+    trend = ONE
+    for index in range(size):
+        volatility = ranges[index]
+        if volatility is None:
+            continue
+        candle = candles[index]
+        midpoint = (candle.high + candle.low) / 2
+        basic_upper = midpoint + multiplier * volatility
+        basic_lower = midpoint - multiplier * volatility
+
+        if upper is None or lower is None:
+            # Seed: pick the side the close already sits on, so the first reading is not
+            # an immediate spurious flip.
+            upper, lower = basic_upper, basic_lower
+            trend = ONE if candle.close >= midpoint else -ONE
+        else:
+            previous_close = candles[index - 1].close
+            upper = basic_upper if basic_upper < upper or previous_close > upper else upper
+            lower = basic_lower if basic_lower > lower or previous_close < lower else lower
+            if trend > ZERO:
+                trend = -ONE if candle.close < lower else ONE
+            else:
+                trend = ONE if candle.close > upper else -ONE
+
+        line[index] = lower if trend > ZERO else upper
+        direction[index] = trend
+    return tuple(line), tuple(direction)
+
+
+def ichimoku(
+    candles: Sequence[Candle],
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+    displacement: int = 26,
+) -> tuple[Series, Series, Series, Series]:
+    """Ichimoku as ``(tenkan, kijun, senkou_a, senkou_b)``.
+
+    The two span series are returned **already aligned to the bar they govern**: the value
+    at index ``i`` is the cloud that is in force at bar ``i``, which by Ichimoku's own
+    definition was computed ``displacement`` bars earlier. Returning the undisplaced spans
+    and leaving callers to shift them is the single easiest way to write a look-ahead bug
+    in this indicator — a caller who forgets the shift reads a cloud built from bars that
+    had not printed yet.
+    """
+    _require_period(tenkan_period)
+    _require_period(kijun_period)
+    _require_period(senkou_b_period)
+    _require_period(displacement)
+
+    highs = [candle.high for candle in candles]
+    lows = [candle.low for candle in candles]
+
+    def midline(period: int) -> Series:
+        top = rolling_max(highs, period)
+        bottom = rolling_min(lows, period)
+        return tuple(
+            None if high is None or low is None else (high + low) / 2
+            for high, low in zip(top, bottom, strict=True)
+        )
+
+    tenkan = midline(tenkan_period)
+    kijun = midline(kijun_period)
+    raw_a: Series = tuple(
+        None if fast is None or slow is None else (fast + slow) / 2
+        for fast, slow in zip(tenkan, kijun, strict=True)
+    )
+    raw_b = midline(senkou_b_period)
+
+    def shifted(series: Series) -> Series:
+        return tuple(
+            series[index - displacement] if index >= displacement else None
+            for index in range(len(candles))
+        )
+
+    return tenkan, kijun, shifted(raw_a), shifted(raw_b)
+
+
+def parabolic_sar(
+    candles: Sequence[Candle], step: Decimal = Decimal("0.02"), maximum: Decimal = Decimal("0.2")
+) -> tuple[Series, Series]:
+    """Wilder's parabolic SAR as ``(sar, direction)``; direction is ``+1`` up, ``-1`` down.
+
+    A stop that accelerates toward price every time the trend makes a new extreme, so a
+    move that keeps running is given progressively less room. It is always in the market —
+    a stop-out *is* the reversal — which makes it the cleanest available expression of
+    "trend until proven otherwise" and also its main weakness in a range.
+
+    The clamp against the two prior bars' extremes is part of the original definition, not
+    a refinement: without it the stop can be placed inside the current bar's range and the
+    reversal fires on the bar that created it.
+    """
+    if step <= ZERO:
+        raise ValidationError(f"step must be positive, got {step}")
+    if maximum < step:
+        raise ValidationError(f"maximum {maximum} must be at least step {step}")
+
+    size = len(candles)
+    sar_out: list[Decimal | None] = [None] * size
+    direction: list[Decimal | None] = [None] * size
+    if size < MIN_BARS_FOR_DIRECTIONAL_MOVEMENT:
+        return tuple(sar_out), tuple(direction)
+
+    rising = candles[1].close >= candles[0].close
+    if rising:
+        sar = min(candles[0].low, candles[1].low)
+        extreme = max(candles[0].high, candles[1].high)
+    else:
+        sar = max(candles[0].high, candles[1].high)
+        extreme = min(candles[0].low, candles[1].low)
+    acceleration = step
+    sar_out[1] = sar
+    direction[1] = ONE if rising else -ONE
+
+    for index in range(2, size):
+        candle = candles[index]
+        sar = sar + acceleration * (extreme - sar)
+        if rising:
+            sar = min(sar, candles[index - 1].low, candles[index - 2].low)
+            if candle.low < sar:
+                rising = False
+                sar = extreme
+                extreme = candle.low
+                acceleration = step
+            elif candle.high > extreme:
+                extreme = candle.high
+                acceleration = min(acceleration + step, maximum)
+        else:
+            sar = max(sar, candles[index - 1].high, candles[index - 2].high)
+            if candle.high > sar:
+                rising = True
+                sar = extreme
+                extreme = candle.high
+                acceleration = step
+            elif candle.low < extreme:
+                extreme = candle.low
+                acceleration = min(acceleration + step, maximum)
+        sar_out[index] = sar
+        direction[index] = ONE if rising else -ONE
+    return tuple(sar_out), tuple(direction)
+
+
+def swing_pivots(candles: Sequence[Candle], left: int = 3, right: int = 3) -> tuple[Series, Series]:
+    """Confirmed swing pivots as ``(pivot_highs, pivot_lows)``.
+
+    A pivot high at bar ``p`` is a high that exceeds the ``left`` bars before it and the
+    ``right`` bars after it — so it is not *knowable* until bar ``p + right``. Each pivot is
+    therefore published at the index that confirms it, carrying the pivot's price, and the
+    bar it actually printed on holds ``None``.
+
+    Charting the pivot back at ``p`` is correct for a human reading history and catastrophic
+    for a backtest: it hands the strategy a swing low ``right`` bars before the market could
+    possibly have known it was one. Publishing at the confirmation bar makes that mistake
+    unrepresentable rather than merely discouraged.
+
+    Extremes are strict on both sides, so a flat plateau produces no pivot at all rather
+    than several identical ones.
+    """
+    _require_period(left)
+    _require_period(right)
+
+    size = len(candles)
+    pivot_highs: list[Decimal | None] = [None] * size
+    pivot_lows: list[Decimal | None] = [None] * size
+    for pivot in range(left, size - right):
+        window = range(pivot - left, pivot + right + 1)
+        candidate = candles[pivot]
+        if all(candles[other].high < candidate.high for other in window if other != pivot):
+            pivot_highs[pivot + right] = candidate.high
+        if all(candles[other].low > candidate.low for other in window if other != pivot):
+            pivot_lows[pivot + right] = candidate.low
+    return tuple(pivot_highs), tuple(pivot_lows)
+
+
+def higher_timeframe_closes(candles: Sequence[Candle], factor: int) -> tuple[Decimal, ...]:
+    """Closing price of each **completed** bucket of ``factor`` consecutive bars.
+
+    The honest way to get a higher timeframe out of a lower one without a second data feed.
+    Buckets are counted from the *start* of the series, so an already-formed bucket never
+    changes as bars arrive, and the partial bucket at the end is dropped entirely — its
+    close is the current price, and treating it as a finished higher-timeframe bar means
+    confirming a signal with the very bar that produced it.
+    """
+    _require_period(factor, minimum=2)
+    completed = len(candles) // factor
+    return tuple(candles[(bucket + 1) * factor - 1].close for bucket in range(completed))
