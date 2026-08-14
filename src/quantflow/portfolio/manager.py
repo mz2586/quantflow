@@ -112,6 +112,17 @@ class PortfolioManager:
         """Highest equity seen, the reference for drawdown."""
         return self._peak_equity
 
+    @property
+    def applied_fill_ids(self) -> frozenset[str]:
+        """Every fill id already folded in.
+
+        Exposed because a venue reconciler has to know what it has *already* applied before
+        it replays an execution report: the exchange re-delivers the same execution on every
+        poll, and only this set makes a poll idempotent. It is also what must be persisted
+        and restored, or a restart re-applies the whole window.
+        """
+        return frozenset(self._applied_fill_ids)
+
     def position_for(self, symbol: Symbol) -> Position | None:
         """The open position in ``symbol``, if any."""
         position = self._positions.get(symbol)
@@ -440,6 +451,43 @@ class PortfolioManager:
             positions=len(self._positions),
             known_fills=len(self._applied_fill_ids),
         )
+
+    def anchor_cash(self, cash: Decimal, *, reason: str) -> bool:
+        """Set the wallet balance to a figure read from the venue.
+
+        Only for a live account, and only from an authoritative read. Cash on a linear-perp
+        account is the venue's wallet balance — not a quantity this process derives — so once
+        the exchange has been asked, its answer replaces whatever the local fold produced.
+        Reconstructing it from fills is a *model* of the wallet, and a model that has been
+        replaying a bounded execution window will differ from the wallet by every fee and
+        every realised PnL that fell outside it.
+
+        Returns whether the balance moved. Non-positive figures are refused: they are a
+        failed read rather than an empty account, and sizing against zero would stop the
+        session as surely as sizing against a fiction.
+        """
+        if cash <= ZERO:
+            logger.warning("portfolio.cash_anchor_rejected", value=str(cash), reason=reason)
+            return False
+        if cash == self._cash:
+            return False
+        logger.warning(
+            "portfolio.cash_anchored",
+            previous=str(self._cash),
+            venue_cash=str(cash),
+            reason=reason,
+        )
+        self._cash = cash
+        self._peak_equity = max(self._peak_equity, cash)
+        return True
+
+    def mark_fill_applied(self, fill_id: str) -> None:
+        """Record a fill id as already folded in without applying it.
+
+        Used when a venue execution has been superseded by a state repair taken from the
+        same venue: applying it afterwards would count the same trade twice.
+        """
+        self._applied_fill_ids.add(fill_id)
 
     def reconcile(self, venue_positions: Mapping[Symbol, Decimal]) -> dict[Symbol, Decimal]:
         """Compare local positions against the venue's.

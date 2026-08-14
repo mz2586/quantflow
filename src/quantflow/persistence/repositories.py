@@ -505,6 +505,22 @@ class OrderRepository(Repository[OrderRecord]):
         statement = statement.order_by(OrderRecord.created_at.desc()).limit(limit)
         return [_to_order(record) for record in await self._scalars(statement)]
 
+    async def venue_fill_ids(self, *, session_id: str | None = None) -> set[str]:
+        """Every venue execution id already recorded against this session's orders.
+
+        Restored into the portfolio on startup. The venue re-delivers executions on every
+        poll and keeps them for days, so without a record of what has already been applied
+        a restart folds the same fills in again — doubling positions, duplicating closed
+        trades, and moving cash twice for money that moved once.
+        """
+        statement = select(FillRecord.venue_fill_id).join(
+            OrderRecord, OrderRecord.id == FillRecord.order_id
+        )
+        if session_id is not None:
+            statement = statement.where(OrderRecord.session_id == session_id)
+        result = await self._session.execute(statement)
+        return {str(value) for value in result.scalars().all()}
+
     async def count_since(self, since: datetime, *, session_id: str | None = None) -> int:
         """Orders created since ``since`` — backs the order-rate risk limit."""
         statement = (
