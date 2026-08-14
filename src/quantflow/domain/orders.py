@@ -100,6 +100,11 @@ class OrderRequest:
     stop_loss_price: Decimal | None = None
     take_profit_price: Decimal | None = None
     reduce_only: bool = False
+    #: Passive-only. The venue must reject this order rather than let it cross the
+    #: spread and pay the taker fee. Modelled explicitly because a post-only order
+    #: that quietly fills as taker is the difference between a 0.01% and a 0.06%
+    #: entry, which is the whole economics of maker-first execution.
+    post_only: bool = False
     client_order_id: str = field(default_factory=new_client_order_id)
     strategy_id: str | None = None
     signal_id: str | None = None
@@ -199,6 +204,10 @@ class Fill:
     fee_currency: str
     timestamp: datetime
     role: LiquidityRole = LiquidityRole.TAKER
+    #: Realised PnL the venue attributed to this execution, when it reported one.
+    #: ``None`` means the venue said nothing — deliberately not zero, since "no figure"
+    #: and "closed flat" are different facts and only one of them is a result.
+    realized_pnl: Decimal | None = None
 
     def __post_init__(self) -> None:
         """Validate the fill."""
@@ -251,6 +260,11 @@ class Order:
     stop_loss_price: Decimal | None = None
     take_profit_price: Decimal | None = None
     reduce_only: bool = False
+    #: Passive-only. The venue must reject this order rather than let it cross the
+    #: spread and pay the taker fee. Modelled explicitly because a post-only order
+    #: that quietly fills as taker is the difference between a 0.01% and a 0.06%
+    #: entry, which is the whole economics of maker-first execution.
+    post_only: bool = False
     strategy_id: str | None = None
     signal_id: str | None = None
     reject_reason: str | None = None
@@ -292,6 +306,7 @@ class Order:
             stop_loss_price=request.stop_loss_price,
             take_profit_price=request.take_profit_price,
             reduce_only=request.reduce_only,
+            post_only=request.post_only,
             strategy_id=request.strategy_id,
             signal_id=request.signal_id,
             metadata=dict(request.metadata),

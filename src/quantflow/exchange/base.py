@@ -235,8 +235,12 @@ def normalize_order(request: OrderRequest, instrument: Instrument) -> OrderReque
         if request.trigger_price is not None
         else None
     )
+    # The stop takes its direction from the *position*, not from the order that would
+    # close it. Using the closing side here (``not side_is_buy``) rounded a long's stop up,
+    # toward its own entry — tightening the risk the engine sized for, and at a wide tick
+    # putting the stop the wrong side of its trigger.
     stop_loss = (
-        instrument.normalize_price(request.stop_loss_price, side_is_buy=not side_is_buy)
+        instrument.normalize_stop_price(request.stop_loss_price, position_is_long=side_is_buy)
         if request.stop_loss_price is not None
         else None
     )

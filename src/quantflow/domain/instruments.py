@@ -8,7 +8,7 @@ from typing import Self
 
 from quantflow.core.config import MarketType
 from quantflow.core.errors import ValidationError
-from quantflow.core.precision import ZERO, round_price, round_quantity
+from quantflow.core.precision import ZERO, round_price, round_quantity, round_stop_price
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -125,6 +125,10 @@ class Instrument:
     def normalize_price(self, price: Decimal, *, side_is_buy: bool = True) -> Decimal:
         """Snap a price to the venue's tick grid, conservatively for the given side."""
         return round_price(price, self.price_tick, side_is_buy=side_is_buy)
+
+    def normalize_stop_price(self, price: Decimal, *, position_is_long: bool) -> Decimal:
+        """Snap a protective stop to the tick grid, away from the position it protects."""
+        return round_stop_price(price, self.price_tick, position_is_long=position_is_long)
 
     def normalize_quantity(self, quantity: Decimal) -> Decimal:
         """Snap a quantity down to the venue's lot grid."""

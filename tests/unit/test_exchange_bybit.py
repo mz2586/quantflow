@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from quantflow.core.config import MarketType
+from quantflow.core.config import ExchangeSettings, MarketType
 from quantflow.core.errors import (
     ExchangeAuthenticationError,
     ExchangeConnectionError,
@@ -41,6 +42,7 @@ from quantflow.exchange.bybit.mapping import (
     to_ccxt_symbol,
     translate_exception,
 )
+from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.exchange.bybit.ws import (
     CandleGapDetector,
     _parse_kline,
@@ -178,6 +180,63 @@ class TestInstrumentParsing:
         instrument = parse_instrument(spot_market(active=False))
         assert instrument is not None
         assert not instrument.active
+
+
+class TestInstrumentSymbolCollisions:
+    """Two venue markets can normalise onto one Symbol; only one may survive.
+
+    Which one is not a matter of taste. The lot step and the minimum notional come from
+    whichever wins, so resolving the tie by dict ordering means an order is sized against a
+    grid chosen at random — and the venue rejects it without saying why.
+    """
+
+    @staticmethod
+    def _gateway(markets: dict[str, Any]) -> BybitGateway:
+        gateway = BybitGateway(
+            ExchangeSettings(
+                name="bybit",
+                api_key="k" * 18,
+                api_secret="s" * 36,
+                testnet=True,
+                market_type=MarketType.SPOT,
+            )
+        )
+
+        async def load_markets(reload: bool = False) -> dict[str, Any]:
+            return markets
+
+        gateway._data_client = SimpleNamespace(load_markets=load_markets)  # type: ignore[assignment]
+        return gateway
+
+    async def test_the_first_market_wins(self) -> None:
+        gateway = self._gateway(
+            {
+                "a": spot_market(precision={"price": 2, "amount": 3}),
+                "b": spot_market(symbol="BTC/USDT:USDT", precision={"price": 2, "amount": 1}),
+            }
+        )
+
+        loaded = await gateway.load_instruments()
+
+        assert loaded[Symbol.parse("BTC/USDT")].quantity_step == Decimal("0.001")
+
+    async def test_only_one_instrument_survives_the_collision(self) -> None:
+        gateway = self._gateway(
+            {
+                "a": spot_market(precision={"price": 2, "amount": 3}),
+                "b": spot_market(symbol="BTC/USDT:USDT", precision={"price": 2, "amount": 1}),
+            }
+        )
+
+        loaded = await gateway.load_instruments()
+
+        assert len(loaded) == 1
+
+    async def test_markets_of_another_type_are_not_loaded(self) -> None:
+        """A spot gateway must not adopt a perpetual's rules, or vice versa."""
+        gateway = self._gateway({"a": spot_market(symbol="ETH/USDT:USDT", spot=False, linear=True)})
+
+        assert await gateway.load_instruments() == {}
 
 
 class TestOrderParsing:
@@ -334,10 +393,20 @@ class TestOrderNormalisation:
         )
         assert normalize_order(request, btc_instrument).price == Decimal("50000.57")
 
-    def test_stop_loss_rounds_conservatively_for_the_holder(
+    def test_stop_loss_rounds_away_from_the_position(
         self, btc: Symbol, btc_instrument: Instrument
     ) -> None:
-        # A long's stop rounds up, so it triggers no later than intended.
+        """A long's stop rounds DOWN — away from entry.
+
+        This reverses the convention this test previously asserted ("rounds up, so it
+        triggers no later than intended"). Rounding up moves a long's stop *toward* its own
+        entry, which tightens the risk the engine sized for and, on a wide tick, can put
+        the stop at or above the trigger price it is supposed to sit below — a venue
+        rejection, which leaves the position unprotected entirely.
+
+        The cost of the new rule is that a realised loss can exceed the intended one by up
+        to a single tick. That is a bounded, known error; a rejected stop is not.
+        """
         request = OrderRequest(
             symbol=btc,
             side=OrderSide.BUY,
@@ -346,7 +415,21 @@ class TestOrderNormalisation:
             price=Decimal("50000.00"),
             stop_loss_price=Decimal("49000.001"),
         )
-        assert normalize_order(request, btc_instrument).stop_loss_price == Decimal("49000.01")
+        assert normalize_order(request, btc_instrument).stop_loss_price == Decimal("49000.00")
+
+    def test_short_stop_loss_rounds_up_away_from_the_position(
+        self, btc: Symbol, btc_instrument: Instrument
+    ) -> None:
+        """The mirror case: a short's stop sits above entry, so it rounds up."""
+        request = OrderRequest(
+            symbol=btc,
+            side=OrderSide.SELL,
+            order_type=OrderType.LIMIT,
+            quantity=Decimal("1"),
+            price=Decimal("50000.00"),
+            stop_loss_price=Decimal("51000.001"),
+        )
+        assert normalize_order(request, btc_instrument).stop_loss_price == Decimal("51000.01")
 
     def test_normalisation_preserves_metadata(
         self, btc: Symbol, btc_instrument: Instrument

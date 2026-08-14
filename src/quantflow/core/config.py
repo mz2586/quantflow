@@ -325,7 +325,7 @@ class TradingSettings(BaseModel):
     def _validate_live(self) -> Self:
         if self.mode is TradingMode.LIVE and not self.is_live_armed:
             raise ValueError(
-                "live mode requires QF_TRADING__LIVE_CONFIRMATION=" f"{LIVE_CONFIRMATION_TOKEN!r}"
+                f"live mode requires QF_TRADING__LIVE_CONFIRMATION={LIVE_CONFIRMATION_TOKEN!r}"
             )
         return self
 
@@ -353,6 +353,17 @@ class RiskSettings(BaseModel):
     max_stop_loss_pct: Fraction = Decimal("0.20")
     max_leverage: Annotated[Decimal, Field(ge=Decimal("1"), le=Decimal("20"))] = Decimal("1")
     require_stop_loss: bool = True
+    #: Enter passively with post-only limit orders instead of crossing the spread.
+    #: Maker is 0.01% against taker 0.06%, so this cuts a round trip from ~0.24% to
+    #: ~0.04% — the difference between most signals being uneconomic and viable. The
+    #: cost is that entries sometimes do not fill. Missing a trade costs nothing;
+    #: paying taker costs on every one of them.
+    #: OFF by default: this changes how every order in the system is priced, so it must
+    #: be switched on deliberately rather than inherited by an older config.
+    maker_first_entries: bool = False
+    #: Bars a passive entry may rest before it is abandoned. A setup that never filled is
+    #: missed, not pending; an unbounded resting order can fill on an expired signal.
+    entry_limit_max_bars: int = 3
     max_order_notional: PositiveDecimal = Decimal("5000")
     min_order_notional: PositiveDecimal = Decimal("10")
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)

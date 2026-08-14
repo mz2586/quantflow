@@ -71,11 +71,29 @@ ENDPOINT_WEIGHTS: dict[str, float] = {
     "submit_order": 1.0,
     "cancel_order": 1.0,
     "fetch_order": 2.0,
+    "fetch_closed_order": 2.0,
     "fetch_open_orders": 6.0,
     "fetch_my_trades": 10.0,
     "fetch_balances": 10.0,
     "server_time": 1.0,
 }
+
+#: Params for ``fetchOrder``. CCXT refuses the call outright unless the caller acknowledges
+#: that Bybit only serves the last 500 orders of any status — it raises ArgumentsRequired
+#: rather than returning nothing. Without this every post-submit enrichment logged a warning
+#: and fell back to the ack-derived record, so a freshly placed order was never read back
+#: from the venue that had just accepted it.
+FETCH_ORDER_PARAMS: dict[str, Any] = {"acknowledged": True}
+
+#: Extra params tried, in order, when an order has left the realtime feed and has to be
+#: looked up in order *history* instead.
+#:
+#: Bybit files a conditional order under a different history filter from a plain one, and
+#: CCXT only sets that filter when told to. A protective stop is precisely the order most
+#: likely to end without our having cancelled it — it triggers, or the venue deactivates it
+#: when the position goes — so leaving it unfindable would mean the one order class we never
+#: submit an exit for is also the one whose outcome we can never read.
+FINISHED_ORDER_FILTERS: tuple[dict[str, Any], ...] = ({}, {"trigger": True})
 
 #: Maximum tolerated difference between our clock and Bybit's. V5 rejects a signed request
 #: whose timestamp falls outside ``recvWindow`` (error 10002), so drift beyond this is a
@@ -207,6 +225,17 @@ class BybitGateway:
         return self._settings.testnet
 
     @property
+    def network(self) -> str:
+        """The environment this gateway is actually connected to.
+
+        Not derivable from :attr:`is_testnet`: demo is neither testnet nor mainnet, so a
+        two-way flag reported a demo session as ``mainnet`` — beside a real balance and
+        real open positions, on the one field an operator reads to decide whether the
+        money is real.
+        """
+        return str(self._settings.resolved_env.value)
+
+    @property
     def supports_trading(self) -> bool:
         """Whether credentials are configured for order placement."""
         return self._settings.has_credentials
@@ -300,6 +329,21 @@ class BybitGateway:
                 continue
             if instrument.market_type is not self._settings.market_type:
                 continue
+            existing = loaded.get(instrument.symbol)
+            if existing is not None:
+                # Two venue markets can normalise onto one Symbol. Whichever arrived first
+                # is kept, because silently replacing it would make the lot step and the
+                # minimum notional depend on dict ordering - and an order sized against the
+                # wrong grid is rejected by the venue with no clue as to why.
+                if existing != instrument:
+                    logger.warning(
+                        "exchange.instrument_symbol_collision",
+                        symbol=str(instrument.symbol),
+                        kept_min_quantity=str(existing.min_quantity),
+                        discarded_min_quantity=str(instrument.min_quantity),
+                        discarded_market=str(market.get("symbol")),
+                    )
+                continue
             loaded[instrument.symbol] = instrument
         self._instruments.put_many(list(loaded.values()))
         logger.debug("exchange.instruments_loaded", count=len(loaded))
@@ -314,7 +358,7 @@ class BybitGateway:
         instrument = self._instruments.get(symbol)
         if instrument is None:
             raise InvalidSymbolError(
-                f"{symbol} is not listed on {self.name} " f"({self._settings.market_type.value})",
+                f"{symbol} is not listed on {self.name} ({self._settings.market_type.value})",
                 symbol=str(symbol),
             )
         return instrument
@@ -383,8 +427,16 @@ class BybitGateway:
 
         reference = normalised.price or normalised.trigger_price
         if reference is None:
+            # A MARKET order carries no price of its own, so the ticker stands in purely as
+            # a reference for the tick and notional checks. It is a quote, not an order
+            # price, and nothing guarantees it sits on the venue's grid — the last trade or
+            # a derived mid need not. Validating it unsnapped is what killed every market
+            # entry on ETH/USDT with "price 1893.93 is not a multiple of tick 0.1".
             ticker = await self.fetch_ticker(normalised.symbol)
-            reference = ticker.price_for(normalised.side)
+            reference = instrument.normalize_price(
+                ticker.price_for(normalised.side),
+                side_is_buy=normalised.side is OrderSide.BUY,
+            )
         instrument.validate_order(normalised.quantity, reference)
 
         # An entry with no stop must never reach the venue. The in-memory portfolio used to
@@ -680,20 +732,114 @@ class BybitGateway:
         return cancelled
 
     async def fetch_order(self, order_id: str, symbol: Symbol) -> Order:
-        """Fetch the current state of one order."""
+        """Fetch the current state of one order, whether it is still working or finished.
+
+        Two venue reads, not one. CCXT's ``fetchOrder`` serves Bybit's *realtime* order
+        endpoint, which carries open orders plus a brief tail of recently-finished ones;
+        past that window it raises ``OrderNotFound``. Treating that as the answer meant the
+        only orders whose status could ever be read were the ones still working — so an
+        order that had filled, been cancelled or been rejected an hour ago was
+        indistinguishable from one the venue had never heard of, and the OMS had no way to
+        learn any terminal state except by seeing an execution. A rejection and a cancel
+        produce no execution at all.
+
+        Order history answers for the rest, and only a miss in *both* is a genuine miss.
+
+        Raises:
+            NotFoundError: if neither the realtime feed nor order history knows the id.
+
+        """
         self._require_trading()
         venue_id = self._venue_id_for(order_id)
+        ccxt_symbol = self._ccxt_symbol(symbol)
+
         try:
             raw = await self._call(
-                "fetch_order", self._client.fetch_order, venue_id, self._ccxt_symbol(symbol)
+                "fetch_order",
+                self._client.fetch_order,
+                venue_id,
+                ccxt_symbol,
+                # CCXT's signature here is ``(id, symbol, params)`` — three arguments, not
+                # the ``(id, symbol, since, params)`` shape several other endpoints use.
+                # An extra positional made every call raise TypeError before it reached the
+                # network, so no order in a live session was ever read back from the venue:
+                # a rejection or a cancel, neither of which produces an execution, was
+                # invisible, and the order sat at NEW for the life of the session.
+                FETCH_ORDER_PARAMS,
             )
         except ExchangeError as exc:
-            if "not found" in str(exc).lower():
-                raise NotFoundError(
-                    f"order {order_id} not found on {self.name}", order_id=order_id
-                ) from exc
-            raise
+            if not _is_order_not_found(exc):
+                raise
+            raw = await self._fetch_finished_order(venue_id, ccxt_symbol, order_id=order_id)
         return parse_order(raw, local_order_id=order_id)
+
+    async def _fetch_finished_order(
+        self, venue_id: str, ccxt_symbol: str, *, order_id: str
+    ) -> dict[str, Any]:
+        """Look an order up in Bybit's order history, plain first then conditional."""
+        for extra in FINISHED_ORDER_FILTERS:
+            try:
+                raw = await self._call(
+                    "fetch_closed_order",
+                    self._client.fetch_closed_order,
+                    venue_id,
+                    ccxt_symbol,
+                    dict(extra),
+                )
+            except ExchangeError as exc:
+                if not _is_order_not_found(exc):
+                    raise
+                continue
+            if isinstance(raw, dict):
+                return raw
+        raise NotFoundError(f"order {order_id} not found on {self.name}", order_id=order_id)
+
+    async def set_trading_stop(
+        self, symbol: Symbol, *, stop_loss: Decimal | None = None
+    ) -> Decimal | None:
+        """Amend the venue-side protective stop on an open position.
+
+        Bybit carries the stop on the *position*, not as a separate order, so moving it is
+        a position amendment rather than a cancel-and-replace — which matters, because a
+        cancel-and-replace leaves a window with no protection at all.
+
+        The new level is read back from the venue before it is returned. An amendment that
+        was silently rejected would otherwise leave the caller believing a position is
+        protected at a level the exchange never accepted, which is worse than not having
+        moved it: the risk is unchanged but the reported risk is not.
+
+        Returns:
+            The stop the venue confirms it is holding, or ``None`` if it reports none.
+
+        Raises:
+            ExchangeError: if the venue rejects the amendment.
+
+        """
+        self._require_trading()
+        instrument = await self.get_instrument(symbol)
+        params: dict[str, Any] = {
+            "category": bybit_category(self._settings.market_type),
+            "symbol": to_ccxt_symbol(symbol).replace("/", "").replace(":USDT", ""),
+            "positionIdx": 0,
+        }
+        if stop_loss is not None:
+            snapped = instrument.normalize_stop_price(stop_loss, position_is_long=True)
+            params["stopLoss"] = str(snapped)
+            params["slTriggerBy"] = STOP_TRIGGER_BY
+
+        await self._call(
+            "set_trading_stop",
+            self._client.private_post_v5_position_trading_stop,
+            params,
+        )
+
+        for position in await self.fetch_positions():
+            if str(position.get("symbol")) != to_ccxt_symbol(symbol):
+                continue
+            info = position.get("info") or {}
+            confirmed = info.get("stopLoss")
+            return Decimal(str(confirmed)) if confirmed else None
+        return None
 
     async def fetch_open_orders(self, symbol: Symbol | None = None) -> list[Order]:
         """Fetch every order still working on the venue."""
@@ -864,6 +1010,20 @@ class BybitGateway:
     def register_venue_id(self, order_id: str, venue_order_id: str) -> None:
         """Record a local-to-venue id mapping recovered from the database on restart."""
         self._local_by_venue_id[venue_order_id] = order_id
+
+
+def _is_order_not_found(exc: ExchangeError) -> bool:
+    """Whether the venue's answer was "no such order" rather than a failure to ask.
+
+    CCXT reports it as ``OrderNotFound``, which ``translate_exception`` folds into the same
+    ``OrderRejectedError`` as a genuine rejection — so the class alone cannot separate "the
+    venue has never heard of this" from "the venue refused it". The venue error name is
+    checked first because it is the exact signal; the message is a fallback for the paths
+    that lose it.
+    """
+    if exc.details.get("venue_error") == "OrderNotFound":
+        return True
+    return "not found" in str(exc).lower()
 
 
 # --------------------------------------------------------------------------- #

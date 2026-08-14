@@ -77,6 +77,22 @@ def round_price(value: Decimal, tick_size: Decimal, *, side_is_buy: bool) -> Dec
     return quantize_down(value, tick_size) if side_is_buy else quantize_up(value, tick_size)
 
 
+def round_stop_price(value: Decimal, tick_size: Decimal, *, position_is_long: bool) -> Decimal:
+    """Snap a protective stop to the tick grid, always *away* from the position.
+
+    Not the same rule as :func:`round_price`, and the difference matters. A stop is placed
+    by the side opposite the position — a long is closed by a sell — so applying the limit
+    convention to the closing side rounds a long's stop **up**, toward the entry it is
+    protecting. That silently tightens the risk the engine sized for, and on a wide tick it
+    can put the stop on the wrong side of its own trigger price.
+
+    So the direction is taken from the *position*, not from the order that closes it: a
+    long's stop rounds down, a short's rounds up. Both move it further from entry, which
+    is the safe direction to be wrong in by one tick.
+    """
+    return quantize_down(value, tick_size) if position_is_long else quantize_up(value, tick_size)
+
+
 def round_quantity(value: Decimal, step_size: Decimal) -> Decimal:
     """Snap an order quantity to the exchange lot grid, always downward."""
     return quantize_down(value, step_size)
