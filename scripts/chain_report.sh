@@ -28,12 +28,15 @@ fi
 trap 'rmdir "${LOCK}" 2>/dev/null' EXIT
 
 echo "[$(stamp)] chain start (pid $$)"
-echo "[$(stamp)] step 1/2: scripts/validate_edge.py"
+echo "[$(stamp)] step 1/2: scripts/validate_edge_parallel.py"
 
-"${PY}" "${REPO}/scripts/validate_edge.py"
+# The parallel driver imports its methodology from validate_edge.py and only decides which
+# process each candidate runs in. Smoke mode must never be inherited from the environment.
+unset QF_VALIDATE_SMOKE_BARS
+"${PY}" "${REPO}/scripts/validate_edge_parallel.py"
 rc=$?
 
-echo "[$(stamp)] validate_edge.py exited ${rc}"
+echo "[$(stamp)] validate_edge_parallel.py exited ${rc}"
 
 if [ "${rc}" -ne 0 ]; then
     echo "[$(stamp)] validation did not succeed — not writing a report from a partial run"
@@ -49,5 +52,12 @@ echo "[$(stamp)] step 2/2: scripts/write_validation_report.py"
 "${PY}" "${REPO}/scripts/write_validation_report.py"
 wrc=$?
 echo "[$(stamp)] write_validation_report.py exited ${wrc}"
+
+# Glanceable top line, appended so an earlier run's verdict is never overwritten.
+if [ "${wrc}" -eq 0 ]; then
+    "${PY}" "${REPO}/scripts/write_verdict_line.py" >> "${REPO}/scratchpad/VERDICT.txt" 2>&1
+    echo "[$(stamp)] verdict appended to scratchpad/VERDICT.txt"
+fi
+
 echo "[$(stamp)] chain done"
 exit "${wrc}"

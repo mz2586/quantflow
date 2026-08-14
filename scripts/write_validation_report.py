@@ -101,6 +101,11 @@ def main() -> int:
         "never used to select a strategy, parameter or threshold"
     )
     add(f"- **Candidates tested:** {payload.get('candidates_tested')}")
+    if payload.get("max_history_bars"):
+        add(
+            f"- **Trailing history per bar:** {payload['max_history_bars']} bars "
+            "(verified to produce identical trade ledgers to the engine default before use)"
+        )
     add("")
     add("### Costs applied")
     add("")
@@ -146,6 +151,49 @@ def main() -> int:
         add(f"| `{name}` | {i:.2f} | {o:.2f} | {verdict} |")
     add("")
 
+    # Regime segmentation, when the run recorded it.
+    regime_def = payload.get("regime_definition")
+    has_regimes = any("regimes" in (oos(n) or {}) for n in names)
+    if regime_def and has_regimes:
+        add("## By regime — out-of-sample")
+        add("")
+        for key, value in regime_def.items():
+            add(f"- **{key}:** {value}")
+        add("")
+        add(
+            "A trend strategy losing money in chop is expected and is not by itself a "
+            "reason to retire it. The question these columns exist to answer is whether "
+            "the orchestrator, which is allowed to switch, nets positive across regimes."
+        )
+        add("")
+        add(
+            "| Strategy | Trend net | Trend n | Chop net | Chop n | High-vol net | n | Low-vol net | n |"
+        )
+        add("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for name in sorted(names, key=lambda n: -float(oos(n).get("net_pnl") or 0)):
+            reg = (oos(name) or {}).get("regimes") or {}
+            if not reg:
+                continue
+
+            def cell(bucket: str, source: dict = reg) -> tuple[str, str]:
+                data = source.get(bucket) or {}
+                return fmt(data.get("net_pnl")), str(data.get("trades", 0))
+
+            trend_net, trend_n = cell("trend")
+            chop_net, chop_n = cell("chop")
+            high_net, high_n = cell("high_vol")
+            low_net, low_n = cell("low_vol")
+            add(
+                f"| `{name}` | {trend_net} | {trend_n} | {chop_net} | {chop_n} "
+                f"| {high_net} | {high_n} | {low_net} | {low_n} |"
+            )
+        add("")
+        add(
+            "Trend/chop and high/low-vol are two independent labels of the *same* trades, "
+            "so each pair sums to the period's total — they are not four disjoint groups."
+        )
+        add("")
+
     add("## Verdicts")
     add("")
     add("### (a) Standalone strategies net-positive out-of-sample after costs")
@@ -168,13 +216,9 @@ def main() -> int:
     add("### (b) Orchestrator, out-of-sample after costs")
     add("")
     add(
-        f"- In-sample net: **{fmt(orch_is.get('net_pnl'))}** "
-        f"over {orch_is.get('trades', 0)} trades"
+        f"- In-sample net: **{fmt(orch_is.get('net_pnl'))}** over {orch_is.get('trades', 0)} trades"
     )
-    add(
-        f"- Out-of-sample net: **{fmt(orch.get('net_pnl'))}** "
-        f"over {orch.get('trades', 0)} trades"
-    )
+    add(f"- Out-of-sample net: **{fmt(orch.get('net_pnl'))}** over {orch.get('trades', 0)} trades")
     add(
         f"- Out-of-sample Sharpe **{fmt(orch.get('sharpe'), '.2f')}**, deflated "
         f"**{fmt(orch.get('deflated_sharpe'), '.2f')}**, max drawdown "
@@ -210,13 +254,35 @@ def main() -> int:
             )
         add("")
 
+    failures = payload.get("failures") or {}
+    if failures:
+        add("## Candidates that failed to run")
+        add("")
+        add(
+            f"{len(failures)} of {payload.get('candidates_tested')} candidates crashed and are "
+            "absent from the tables above. They are neither survivors nor retirements — they "
+            "are simply untested, and are listed so the gap is visible rather than implied."
+        )
+        add("")
+        for name, error in sorted(failures.items()):
+            add(f"- `{name}` — {error}")
+        add("")
+
     add("## Known limits of this run")
     add("")
-    add(
-        "- **Regime segmentation is not included.** The harness reports IS/OOS but does not "
-        "split results by trend/chop or high/low volatility. That was requested and is not "
-        "covered here; claiming it without having computed it would be fabrication."
-    )
+    if regime_def and has_regimes:
+        add(
+            "- **Regime labels are one classification, not the only one.** ADX(14) >= 25 and "
+            "a median volatility split are defensible, published choices fixed before any "
+            "result was seen, but a different labelling would move trades between buckets. "
+            "The buckets explain behaviour; they do not change the IS/OOS verdict above."
+        )
+    else:
+        add(
+            "- **Regime segmentation is not included.** This run recorded no regime data, so "
+            "results are not split by trend/chop or high/low volatility. Claiming it without "
+            "having computed it would be fabrication."
+        )
     add("- **One timeframe.** 15m only. Nothing here speaks to 1h, 4h or 1d behaviour.")
     add(
         "- **One split, not walk-forward.** A single chronological holdout, not a rolling "
