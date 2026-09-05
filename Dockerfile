@@ -4,7 +4,7 @@
 # --------------------------------------------------------------------------- #
 # Stage 1 — builder: resolve and install dependencies into a self-contained venv
 # --------------------------------------------------------------------------- #
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 # UV_HTTP_TIMEOUT: Polars and PyArrow ship wheels well over 100 MB, and uv's 30s
 # default is not enough for them on a slow or contended connection. The resulting failure
@@ -49,7 +49,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --------------------------------------------------------------------------- #
 # Stage 2 — runtime: no compilers, no uv, non-root
 # --------------------------------------------------------------------------- #
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
