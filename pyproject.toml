@@ -17,7 +17,7 @@ dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.32.0",
   "pydantic>=2.9.0",
-  "pydantic-settings>=2.6.0",
+  "pydantic-settings>=2.15.0",
   "python-multipart>=0.0.12",
   # --- Persistence ---
   "sqlalchemy[asyncio]>=2.0.36",
