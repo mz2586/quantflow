@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling>=1.32.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -53,32 +53,32 @@ dependencies = [
 # Research / optimisation extras. Kept out of the runtime image so the
 # production container stays small and the dependency graph stays resolvable.
 ai = [
-  "optuna>=4.1.0",
-  "scikit-learn>=1.5.2",
-  "scipy>=1.14.1",
-  "joblib>=1.4.2",
+  "optuna>=4.9.0",
+  "scikit-learn>=1.9.0",
+  "scipy>=1.18.1",
+  "joblib>=1.6.0",
 ]
 # Third-party backtesting frameworks. Pinned loosely and isolated because both
 # libraries carry heavy, frequently-conflicting transitive pins.
 research = [
-  "vectorbt>=0.27.2",
+  "vectorbt>=1.1.0",
   "backtrader>=1.9.78.123",
 ]
 dev = [
-  "pytest>=8.3.3",
-  "pytest-asyncio>=0.24.0",
-  "pytest-cov>=6.0.0",
-  "pytest-randomly>=3.16.0",
-  "hypothesis>=6.119.0",
-  "respx>=0.21.1",
-  "freezegun>=1.5.1",
-  "ruff>=0.8.0",
-  "black>=24.10.0",
-  "mypy>=1.13.0",
-  "types-python-dateutil>=2.9.0",
-  "pandas-stubs>=2.2.3",
-  "fakeredis>=2.26.1",
-  "anyio>=4.6.2",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
+  "pytest-cov>=7.1.0",
+  "pytest-randomly>=5.0.0",
+  "hypothesis>=6.167.1",
+  "respx>=0.23.1",
+  "freezegun>=1.5.5",
+  "ruff>=0.16.5",
+  "black>=26.5.1",
+  "mypy>=2.3.1",
+  "types-python-dateutil>=2.9.0.20260807",
+  "pandas-stubs>=3.0.5.260730",
+  "fakeredis>=2.37.1",
+  "anyio>=4.14.2",
 ]
 
 [project.scripts]
