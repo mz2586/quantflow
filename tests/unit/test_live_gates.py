@@ -238,13 +238,29 @@ class TestDefaultsAreSafe:
             TradingSettings(mode=TradingMode.LIVE)
 
     def test_env_example_does_not_arm_anything(self) -> None:
+        """The shipped example must not arm live trading, in any of its three ways.
+
+        Only *active* assignments count. The file documents the live block in full so an
+        operator can see exactly what arming costs, and every line of it is commented out
+        - a commented `QF_TRADING__LIVE_CONFIRMATION=<token>` is documentation, not a
+        setting, and reading it as one would fail this test on the safest possible file.
+        """
         from pathlib import Path
 
         example = Path(__file__).resolve().parents[2] / ".env.example"
-        text = example.read_text()
-        assert "QF_TRADING__MODE=paper" in text
-        assert "QF_TRADING__LIVE_CONFIRMATION=\n" in text or (
-            "QF_TRADING__LIVE_CONFIRMATION=" in text
-            and LIVE_CONFIRMATION_TOKEN
-            not in text.split("QF_TRADING__LIVE_CONFIRMATION=")[1].split("\n")[0]
-        )
+        active: dict[str, str] = {}
+        for raw in example.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            # Trailing `# ...` comments are used throughout the file to annotate values.
+            active[key.strip()] = value.split("#")[0].strip()
+
+        assert active.get("QF_TRADING__MODE") == "paper"
+        assert active.get("QF_EXCHANGE__ENV") == "demo"
+        assert active.get("QF_TRADING__LIVE_CONFIRMATION", "") != LIVE_CONFIRMATION_TOKEN
+        # No credential ships filled in.
+        for key, value in active.items():
+            if key.endswith(("API_KEY", "API_SECRET", "BOT_TOKEN", "SECRET_KEY")):
+                assert value == "", f"{key} ships with a value"
