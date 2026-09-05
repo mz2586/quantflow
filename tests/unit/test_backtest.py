@@ -69,7 +69,12 @@ def instrument(symbol: Symbol) -> Instrument:
 def permissive_risk(**overrides: object) -> RiskSettings:
     kwargs: dict[str, object] = {
         "max_position_pct": Decimal("0.9"),
-        "max_total_exposure_pct": Decimal("0.95"),
+        # Well above 1.0 so the exposure cap genuinely does not bind. Resting entry orders
+        # now count toward committed exposure — correctly, since they become positions
+        # without a further decision — and two scripted 6,600 entries on a 10,000 account
+        # really do commit 132%. At 0.95 this fixture was measuring the cap rather than
+        # the engine, which is the one thing it exists not to do.
+        "max_total_exposure_pct": Decimal("5"),
         "max_order_notional": Decimal("1000000"),
         "min_order_notional": Decimal("1"),
         "max_concurrent_positions": 10,

@@ -638,9 +638,9 @@ class PositionState:
             opened_at=datetime.fromisoformat(str(payload["opened_at"])),
             stages_done=frozenset(int(index) for index in payload.get("stages_done", ())),
             realized_pnl=to_decimal(payload.get("realized_pnl", ZERO)),
-            last_price_at=None
-            if last_price_at is None
-            else datetime.fromisoformat(str(last_price_at)),
+            last_price_at=(
+                None if last_price_at is None else datetime.fromisoformat(str(last_price_at))
+            ),
             last_price=None if last_price is None else to_decimal(last_price),
         )
 

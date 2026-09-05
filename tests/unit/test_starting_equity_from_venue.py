@@ -72,3 +72,51 @@ class TestResolveStartingEquity:
         assert resolve_starting_equity(held, configured=Decimal("10000"), quote="USDT") == Decimal(
             "1000"
         )
+
+
+class TestAllocationCap:
+    """A session may be allocated less capital than the wallet holds.
+
+    The demo wallet carries roughly 50,000 USDT, but a run can be deliberately scoped to a
+    smaller book. Every risk limit is a percentage of equity, so the cap is what makes
+    "5% per position" mean 5% of the allocation rather than 5% of the whole wallet — the
+    allocation is not a display preference, it is the base of every limit in the session.
+    """
+
+    def test_the_allocation_caps_a_larger_wallet(self) -> None:
+        equity = resolve_starting_equity(
+            balances(USDT="49901.61959601"),
+            configured=Decimal("10000"),
+            quote="USDT",
+            allocation=Decimal("10000"),
+        )
+
+        assert equity == Decimal("10000")
+
+    def test_a_wallet_smaller_than_the_allocation_is_not_inflated(self) -> None:
+        # Allocating capital the account does not have would size every position against
+        # money that cannot be posted as margin.
+        equity = resolve_starting_equity(
+            balances(USDT="2500"),
+            configured=Decimal("10000"),
+            quote="USDT",
+            allocation=Decimal("10000"),
+        )
+
+        assert equity == Decimal("2500")
+
+    def test_no_allocation_keeps_the_previous_behaviour(self) -> None:
+        equity = resolve_starting_equity(
+            balances(USDT="49901.61959601"), configured=Decimal("10000"), quote="USDT"
+        )
+
+        assert equity == Decimal("49901.61959601")
+
+    def test_the_cap_applies_even_when_the_venue_read_failed(self) -> None:
+        # Falling back to a configured 50,000 while allocated 10,000 would silently
+        # quadruple every position size at exactly the moment the venue is unreadable.
+        equity = resolve_starting_equity(
+            {}, configured=Decimal("50000"), quote="USDT", allocation=Decimal("10000")
+        )
+
+        assert equity == Decimal("10000")

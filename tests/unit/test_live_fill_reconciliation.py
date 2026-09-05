@@ -29,6 +29,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import MarketType, RiskSettings
 from quantflow.domain.enums import (
@@ -147,6 +148,7 @@ class FakeGateway:
 
     def __init__(self) -> None:
         self.positions: list[dict[str, Any]] = []
+        self.positions_error: Exception | None = None
         self.executions: dict[Symbol, list[Fill]] = {}
         self.orders: dict[str, Order] = {}
         self.wallet = Decimal("10000")
@@ -173,6 +175,8 @@ class FakeGateway:
         return rows[:limit]
 
     async def fetch_positions(self) -> list[dict[str, Any]]:
+        if self.positions_error is not None:
+            raise self.positions_error
         return list(self.positions)
 
     async def fetch_balances(self) -> dict[str, Balance]:
@@ -836,9 +840,11 @@ class TestTheOrderReadBackReachesTheVenue:
             }
 
         gateway = BybitGateway(
-            ExchangeSettings(api_key="k", api_secret="s", market_type=MarketType.FUTURE)
+            ExchangeSettings(
+                api_key=SecretStr("k"), api_secret=SecretStr("s"), market_type=MarketType.FUTURE
+            )
         )
-        gateway._client.fetch_order = stub_fetch_order  # type: ignore[method-assign]
+        gateway._client.fetch_order = stub_fetch_order
         gateway.register_venue_id("local-1", "venue-1")
 
         order = await gateway.fetch_order("local-1", BTC)
@@ -947,3 +953,183 @@ class TestTheEngineWiring:
         assert "venue-stop-1" in persisted
         assert persisted["venue-stop-1"].fills[0].fill_id == "exit-1"
         assert engine.state.fills == 1
+
+
+class TestSessionStartFloorsTheExecutionLookback:
+    """A session cannot have made a fill before it existed.
+
+    The execution query reaches back 24 hours so a fill missed during a disconnect is still
+    recovered. On a *new* session that same reach adopts a whole day of the venue's history
+    — every fill from whatever ran before — and books it as this session's trades.
+
+    Observed live on 2026-08-14: a session three minutes old opened with 39 closed trades
+    and −49.42 realised PnL, all of it belonging to the run it replaced, all of it with no
+    strategy attribution. The equity curve then measures a 10,000 allocation against
+    another session's losses.
+    """
+
+    async def test_fills_from_before_the_session_started_are_not_adopted(self) -> None:
+        book = portfolio()
+        gateway = FakeGateway()
+        # One fill from an hour before this session began, one from after.
+        gateway.executions[BTC] = [
+            execution(BTC, fill_id="old-fill", order_id="o1", at=NOW - timedelta(hours=1)),
+            execution(BTC, fill_id="new-fill", order_id="o2", at=NOW + timedelta(seconds=30)),
+        ]
+        subject = LiveReconciler(
+            gateway,
+            book,
+            symbols=(BTC,),
+            clock=lambda: NOW + timedelta(minutes=1),
+            repair_confirmations=1,
+            not_before=NOW,
+        )
+
+        await subject.reconcile([])
+
+        adopted = book.applied_fill_ids
+        assert "old-fill" not in adopted
+        assert "new-fill" in adopted
+
+    async def test_without_a_floor_the_lookback_is_unchanged(self) -> None:
+        # The recovery behaviour a long-running session depends on must not regress.
+        book = portfolio()
+        gateway = FakeGateway()
+        gateway.executions[BTC] = [
+            execution(BTC, fill_id="old-fill", order_id="o1", at=NOW - timedelta(hours=1)),
+        ]
+        subject = reconciler(gateway, book)
+
+        await subject.reconcile([])
+
+        assert "old-fill" in book.applied_fill_ids
+
+
+class TestVenueHeldSymbolsAreReported:
+    """The pass must say which symbols the venue holds, not only what changed.
+
+    Ownership synchronisation needs the venue's answer, and the local book is not a
+    substitute for it: between an order filling and the fill being reconciled there is a
+    window in which the venue holds a position the portfolio has not seen. Observed live on
+    2026-08-14 — an ETH short opened at 18:30:13 and had its ownership released at 18:30:27
+    because the local book was still empty, leaving a real position with no owning strategy.
+
+    ``None`` rather than an empty set when the position read failed: "the venue holds
+    nothing" and "the venue could not be asked" must never be the same value, because the
+    first is a reason to release ownership and the second is a reason to leave it alone.
+    """
+
+    async def test_the_pass_reports_every_symbol_the_venue_holds(self) -> None:
+        book = portfolio()
+        gateway = FakeGateway()
+        gateway.positions = [venue_position(BTC, quantity="1", entry="100")]
+
+        outcome = await reconciler(gateway, book).reconcile([])
+
+        assert outcome.venue_symbols == {BTC}
+
+    async def test_an_empty_venue_reports_an_empty_set_not_none(self) -> None:
+        outcome = await reconciler(FakeGateway(), portfolio()).reconcile([])
+
+        assert outcome.venue_symbols == set()
+
+    async def test_a_failed_position_read_reports_none(self) -> None:
+        gateway = FakeGateway()
+        gateway.positions_error = RuntimeError("venue timed out")
+
+        outcome = await reconciler(gateway, portfolio()).reconcile([])
+
+        assert outcome.venue_symbols is None
+
+
+class TestStrategyAttributionSurvivesReconciliation:
+    """A reconciled fill must still name the strategy that opened the trade.
+
+    Orders carry two identities: the local ``order_id`` this process generates, and the
+    ``venue_order_id`` Bybit assigns. Executions come back from ``fetch_my_trades``
+    referencing the *venue's* id, and the strategy lookup was keyed only by the local one.
+    The two never match, so every fill applied through reconciliation was attributed to
+    nobody.
+
+    On a live venue this is not an edge case — reconciliation is the *only* path by which
+    fills reach the portfolio, so it means no trade is ever attributed. Session
+    demo-10k-fresh: 13 closed trades, 13 with ``strategy_id`` NULL, making every
+    per-strategy question unanswerable.
+    """
+
+    async def test_a_fill_returned_under_the_venue_id_is_still_attributed(self) -> None:
+        book = portfolio()
+        gateway = FakeGateway()
+        order = local_order(BTC, order_id="1")  # venue id becomes "venue-1"
+        gateway.orders["venue-1"] = order
+        # The venue reports the execution against its own order id, not ours.
+        gateway.executions[BTC] = [
+            execution(BTC, fill_id="e1", order_id="venue-1", at=NOW + timedelta(seconds=5))
+        ]
+        # The venue agrees the position exists, so the repair pass leaves it alone.
+        gateway.positions = [venue_position(BTC, quantity="1", entry="100")]
+
+        await reconciler(gateway, book).reconcile([order])
+
+        position = book.position_for(BTC)
+        assert position is not None
+        assert position.strategy_id == "ema_cross", "the venue id must resolve to the strategy"
+
+    async def test_the_local_id_still_resolves(self) -> None:
+        # Some paths report the local id; both must work.
+        book = portfolio()
+        gateway = FakeGateway()
+        order = local_order(BTC, order_id="2")
+        gateway.orders["venue-2"] = order
+        gateway.executions[BTC] = [
+            execution(BTC, fill_id="e2", order_id="2", at=NOW + timedelta(seconds=5))
+        ]
+        gateway.positions = [venue_position(BTC, quantity="1", entry="100")]
+
+        await reconciler(gateway, book).reconcile([order])
+
+        position = book.position_for(BTC)
+        assert position is not None
+        assert position.strategy_id == "ema_cross"
+
+
+class TestReconciliationPreservesLocalAttribution:
+    """Re-reading an order from the venue must not erase what only we know.
+
+    The venue knows an order's price, size and status. It has never heard of the strategy
+    that produced it, or the sizing method behind it. When reconciliation rebuilds an
+    ``Order`` from a venue payload and persists it under the same id, every locally-known
+    field is overwritten with nothing.
+
+    Measured on the live session: 81 orders, **zero** with a strategy, and ``meta`` empty on
+    every row — even though the risk engine always sets both. The engine wrote them
+    correctly and reconciliation blanked them moments later, which is why every closed trade
+    reports NOT RECORDED and no per-strategy question can be answered.
+    """
+
+    async def test_the_strategy_survives_a_venue_read(self) -> None:
+        book = portfolio()
+        gateway = FakeGateway()
+        local = local_order(BTC, order_id="1")  # strategy_id="ema_cross"
+        # The venue returns the same order, filled, knowing nothing about strategies.
+        gateway.orders["1"] = Order(
+            order_id="1",
+            client_order_id="qf-1",
+            symbol=BTC,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            quantity=Decimal("1"),
+            filled_quantity=Decimal("1"),
+            status=OrderStatus.FILLED,
+            created_at=NOW,
+            updated_at=NOW,
+            venue_order_id="venue-1",
+        )
+
+        outcome = await reconciler(gateway, book).reconcile([local])
+
+        rebuilt = next((o for o in outcome.orders if o.order_id == "1"), None)
+        assert rebuilt is not None
+        assert (
+            rebuilt.strategy_id == "ema_cross"
+        ), "a venue read must not blank the strategy the engine recorded"

@@ -23,6 +23,7 @@ from quantflow.api.routers import (
     account,
     analytics,
     backtest,
+    dashboard,
     marketdata,
     portfolio,
     risk,
@@ -40,6 +41,19 @@ from quantflow.strategy.registry import load_builtin_strategies
 logger = get_logger(__name__)
 
 
+#: Hard limit on the exchange handshake during startup.
+#:
+#: Uvicorn runs the lifespan to completion *before* it binds the listening socket, so a
+#: slow handshake here is not a degraded account panel — it is an API that never answers
+#: anything at all, including its own health probe. That happened: a contended venue call
+#: left the process unreachable for twenty minutes while the container reported "starting".
+#: Bounded, so a slow venue costs the account panel and nothing else.
+EXCHANGE_CONNECT_TIMEOUT_SECONDS = 20.0
+
+#: Minimum gap between attempts to re-establish a gateway that failed at startup.
+EXCHANGE_RECONNECT_COOLDOWN_SECONDS = 60.0
+
+
 async def _connect_exchange(settings: Settings) -> ExchangeGateway | None:
     """Open an authenticated exchange gateway, or return None.
 
@@ -55,8 +69,11 @@ async def _connect_exchange(settings: Settings) -> ExchangeGateway | None:
         from quantflow.exchange.bybit import BybitGateway
 
         gateway = BybitGateway(settings.exchange)
-        await gateway.connect()
+        await asyncio.wait_for(gateway.connect(), timeout=EXCHANGE_CONNECT_TIMEOUT_SECONDS)
         logger.info("startup.exchange_connected", venue=gateway.name, testnet=gateway.is_testnet)
+    except TimeoutError:
+        logger.warning("startup.exchange_timeout", timeout_seconds=EXCHANGE_CONNECT_TIMEOUT_SECONDS)
+        return None
     except Exception as exc:
         logger.warning("startup.exchange_failed", error=str(exc))
         return None
@@ -186,9 +203,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(backtest.router, prefix=prefix)
     app.include_router(analytics.router, prefix=prefix)
     app.include_router(account.router, prefix=prefix)
+    app.include_router(dashboard.router, prefix=prefix)
 
     _install_websocket(app, prefix)
     return app
+
+
+#: How often the live snapshot is pushed. Two seconds is the operator-visible latency
+#: target for account, position and order changes; below that the venue read itself becomes
+#: the bottleneck and adds request load without adding information.
+SNAPSHOT_INTERVAL_SECONDS = 2.0
+
+
+async def _push_venue_snapshots(websocket: WebSocket, state: AppState) -> None:
+    """Broadcast the venue's account and position state on a fixed interval.
+
+    Reads through the same cache the REST endpoints use, so this adds no venue load beyond
+    what the dashboard already generates — it changes who initiates the update, not how
+    often the venue is asked.
+
+    A failed read is sent as an explicit error frame rather than skipped. A client that
+    stops receiving snapshots must be able to tell "nothing changed" from "the venue went
+    away", and silence cannot distinguish them.
+    """
+    from quantflow.api.routers.dashboard import venue_snapshot
+
+    while True:
+        try:
+            payload = await venue_snapshot(state)
+        except Exception as exc:  # pragma: no cover - a read fault must not kill the socket
+            payload = {"available": False, "error": str(exc)[:200]}
+        await websocket.send_json({"channel": "venue", "data": payload})
+        await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
 
 def _install_websocket(app: FastAPI, prefix: str) -> None:
@@ -220,8 +266,36 @@ def _install_websocket(app: FastAPI, prefix: str) -> None:
         try:
             async with state.cache.subscribe(*channels) as events:
                 await websocket.send_json({"type": "connected", "channels": list(channels)})
-                async for channel, message in events:
-                    await websocket.send_json({"channel": channel, "data": message})
+
+                # The engine publishes only on signals and fills — at most once per 15m
+                # bar. A socket carrying just those is genuinely connected and genuinely
+                # useless: prices move, unrealised PnL moves, positions open and close, and
+                # none of it produces an event. Measured before this existed: connect,
+                # handshake, then twenty-five seconds of silence.
+                #
+                # So the API pushes what it already reads. A ticker task broadcasts the
+                # venue snapshot on a short interval, which is what makes account, position
+                # and order changes appear without the client polling for them. Engine
+                # events still arrive the instant they happen; this fills the gaps between.
+                async def relay_engine_events() -> None:
+                    async for channel, message in events:
+                        await websocket.send_json({"channel": channel, "data": message})
+
+                ticker = asyncio.create_task(_push_venue_snapshots(websocket, state))
+                relay = asyncio.create_task(relay_engine_events())
+                try:
+                    done, pending = await asyncio.wait(
+                        {ticker, relay}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                    for task in done:
+                        task.result()
+                finally:
+                    for task in (ticker, relay):
+                        task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await task
         except WebSocketDisconnect:
             logger.debug("ws.disconnected")
         except asyncio.CancelledError:

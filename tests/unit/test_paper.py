@@ -10,19 +10,28 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta
 from decimal import Decimal
+from typing import Any, cast
 
 import pytest
 
 from quantflow.backtest.engine import BacktestConfig, BacktestEngine
 from quantflow.core.clock import FrozenClock
 from quantflow.core.config import TradingMode
-from quantflow.core.errors import MarketDataError, ValidationError
+from quantflow.core.errors import (
+    MarketDataError,
+    OrderRejectedError,
+    ProductAgreementRequiredError,
+    ValidationError,
+)
 from quantflow.core.precision import ZERO
 from quantflow.domain.enums import RunStatus, SignalDirection, Timeframe
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle, OrderBook, Ticker, Trade
+from quantflow.domain.orders import Order
 from quantflow.exchange.simulator import FeeModel, FixedSlippage
+from quantflow.execution.router import OrderRouter
 from quantflow.paper.engine import PaperConfig, PaperTradingEngine
+from quantflow.risk.smallaccount import MIN_LOT_TOO_LARGE, lot_eligibility
 from tests.conftest import REFERENCE_TIME
 from tests.unit.test_backtest import (
     ScriptedStrategy,
@@ -72,6 +81,85 @@ class HistoryGateway:
 
     async def server_time(self) -> datetime:  # pragma: no cover
         return REFERENCE_TIME
+
+
+class _RestingRouter:
+    """A venue that accepts a passive entry which then simply never fills."""
+
+    is_simulated = False
+
+    def __init__(self) -> None:
+        self.cancelled: list[str] = []
+        self._order: Order | None = None
+
+    async def submit(self, request: Any, **kwargs: object) -> Order:
+        del kwargs
+        self._order = Order.from_request(request, now=REFERENCE_TIME)
+        return self._order
+
+    def process_candle(self, candle: Candle) -> Sequence[object]:
+        del candle
+        return ()
+
+    def open_orders(self, symbol: object | None = None) -> Sequence[Order]:
+        del symbol
+        return () if self._order is None else (self._order,)
+
+    async def cancel(self, order_id: str, symbol: object | None = None) -> None:
+        del symbol
+        self.cancelled.append(order_id)
+        self._order = None
+
+
+class _RejectingRouter:
+    """A venue that rejects this particular order and would accept the next one."""
+
+    is_simulated = False
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    async def submit(self, request: object, **kwargs: object) -> object:
+        del request, kwargs
+        self.attempts += 1
+        raise OrderRejectedError(
+            'bybit {"retCode":10001,"retMsg":"StopLoss:100460000 set for Sell position '
+            'should greater base_price:100540000"}',
+            venue_error="10001",
+        )
+
+    def process_candle(self, candle: Candle) -> Sequence[object]:
+        del candle
+        return ()
+
+    def open_orders(self, symbol: object | None = None) -> Sequence[object]:
+        del symbol
+        return ()
+
+
+class _RefusingRouter:
+    """A router standing in for a venue that has not been granted this product.
+
+    Mirrors Bybit's behaviour exactly: the order is well-formed and correctly sized, and
+    the venue still refuses it — for a reason no retry or resize can satisfy.
+    """
+
+    is_simulated = False
+
+    async def submit(self, request: object, **kwargs: object) -> object:
+        del request, kwargs
+        raise ProductAgreementRequiredError(
+            "venue requires the commodity trading terms (metals) to be signed",
+            venue_error="110123",
+        )
+
+    def process_candle(self, candle: Candle) -> Sequence[object]:
+        del candle
+        return ()
+
+    def open_orders(self, symbol: object | None = None) -> Sequence[object]:
+        del symbol
+        return ()
 
 
 async def feed_from(candles: Sequence[Candle]) -> AsyncIterator[Candle]:
@@ -194,6 +282,97 @@ class TestLiveLoop:
         trade = engine.portfolio.closed_trades[0]
         assert trade.entry_price == Decimal("100")
         assert trade.exit_price == Decimal("110")
+
+    async def test_an_unsigned_product_agreement_does_not_kill_the_session(
+        self, btc: Symbol, clock: FrozenClock
+    ) -> None:
+        """One class the venue will not trade must not take the whole book down with it.
+
+        Bybit refuses metals, energy, equities and index perps until per-product terms
+        are signed, and refuses them at order placement — after the strategy has run and
+        the risk engine has sized the trade. Left unhandled that exception unwinds the bar
+        loop and fails the session, so a single metal signal would end a crypto session
+        that was working perfectly, several times a day.
+        """
+        history = flat_candles(btc, ["100"] * 10)
+        live = flat_candles(btc, ["100", "100"])
+        for index, candle in enumerate(live):
+            object.__setattr__(candle, "open_time", REFERENCE_TIME + timedelta(hours=10 + index))
+        strategy = ScriptedStrategy({10: SignalDirection.LONG}, warmup=1)
+        engine = await self._prepared(btc, clock, strategy, history)
+        # A deliberate partial double: it implements only the slice of OrderRouter this
+        # test exercises, so the assignment is cast rather than structurally checked.
+        engine._broker = cast(OrderRouter, _RefusingRouter())
+
+        state = await engine.run(feed_from(live))
+
+        # The session survives, and says why it is not trading rather than dying.
+        assert state.status is RunStatus.COMPLETED
+        assert state.error is None
+        assert engine.blocked_asset_classes
+        reason = next(iter(engine.blocked_asset_classes.values()))
+        assert "110123" in reason
+        # And it stops re-submitting into a refusal it already knows about.
+        assert state.orders == 0
+
+    async def test_a_rejected_order_does_not_kill_the_session(
+        self, btc: Symbol, clock: FrozenClock
+    ) -> None:
+        """One refused order must cost one order, not the whole run.
+
+        A stop is checked against the bar close and submitted seconds later against the
+        venue's live price. A market that moves in between can leave a perfectly valid stop
+        on the wrong side of the market by the time it arrives, and the venue refuses the
+        order. That refusal reaching `run` marks the session FAILED and stops the bar loop.
+
+        Observed live on 2026-08-14: a short XRP entry was refused with retCode 10001
+        because the stop sat 0.08% below a base price the market had risen to. The session
+        died at 19:00 and the process sat on ticker traffic for the next nine hours without
+        evaluating a single bar.
+        """
+        history = flat_candles(btc, ["100"] * 10)
+        live = flat_candles(btc, ["100", "100", "100"])
+        for index, candle in enumerate(live):
+            object.__setattr__(candle, "open_time", REFERENCE_TIME + timedelta(hours=10 + index))
+        strategy = ScriptedStrategy({10: SignalDirection.LONG, 11: SignalDirection.LONG}, warmup=1)
+        engine = await self._prepared(btc, clock, strategy, history)
+        router = _RejectingRouter()
+        # A deliberate partial double: it implements only the slice of OrderRouter this
+        # test exercises, so the assignment is cast rather than structurally checked.
+        engine._broker = cast(OrderRouter, router)
+
+        state = await engine.run(feed_from(live))
+
+        assert state.status is RunStatus.COMPLETED
+        assert state.error is None
+        # It kept evaluating after the refusal rather than stopping at the first one.
+        assert router.attempts >= 2
+        assert state.rejections >= 2
+        assert state.orders == 0
+
+    async def test_a_resting_entry_is_cancelled_once_it_outlives_its_limit(
+        self, btc: Symbol, clock: FrozenClock
+    ) -> None:
+        """Maker-first entries must not rest forever waiting to fill.
+
+        With maker-first on, an entry that the market never comes back to sits at the venue
+        indefinitely. Bars later it can still fill — on a stop and target computed for
+        conditions that have since changed. The limit exists to abandon the setup instead.
+        """
+        history = flat_candles(btc, ["100"] * 10)
+        live = flat_candles(btc, ["100"] * 6)
+        for index, candle in enumerate(live):
+            object.__setattr__(candle, "open_time", REFERENCE_TIME + timedelta(hours=10 + index))
+        strategy = ScriptedStrategy({10: SignalDirection.LONG}, warmup=1)
+        engine = await self._prepared(btc, clock, strategy, history)
+        router = _RestingRouter()
+        # A deliberate partial double: it implements only the slice of OrderRouter this
+        # test exercises, so the assignment is cast rather than structurally checked.
+        engine._broker = cast(OrderRouter, router)
+
+        await engine.run(feed_from(live))
+
+        assert router.cancelled, "an entry resting past the limit must be cancelled"
 
     async def test_out_of_order_bars_are_dropped(self, btc: Symbol, clock: FrozenClock) -> None:
         # A reconnect can replay a bar already processed; applying it twice would
@@ -382,3 +561,136 @@ class TestPaperMatchesBacktest:
             assert live_trade.gross_pnl == historical.gross_pnl
 
         assert paper.portfolio.equity() == backtest.final_equity
+
+
+class TestEntrySymbolUniverse:
+    """Restricting which symbols may OPEN, without unsubscribing what must be managed."""
+
+    async def _run(
+        self,
+        symbol: Symbol,
+        clock: FrozenClock,
+        entry_symbols: tuple[Symbol, ...] | None,
+        script: dict[int, SignalDirection] | None = None,
+    ) -> PaperTradingEngine:
+        history = flat_candles(symbol, ["100"] * 10)
+        live = [
+            Candle(
+                symbol=symbol,
+                timeframe=Timeframe.H1,
+                open_time=REFERENCE_TIME + timedelta(hours=10 + index),
+                open=Decimal(price),
+                high=Decimal(price),
+                low=Decimal(price),
+                close=Decimal(price),
+                volume=Decimal("1000"),
+                quote_volume=Decimal("100000"),
+            )
+            for index, price in enumerate(["100", "100", "110", "110", "110"])
+        ]
+        clock.set(history[-1].close_time)
+        # History supplies 10 bars, so live bar 0 lands at index 10.
+        engine = PaperTradingEngine(
+            ScriptedStrategy(script or {10: SignalDirection.LONG}, warmup=1),
+            paper_config(symbol, symbols=(symbol,), entry_symbols=entry_symbols),
+            instruments={symbol: instrument(symbol)},
+            clock=clock,
+        )
+        await engine.prepare(HistoryGateway(history))
+        await engine.run(feed_from(live))
+        return engine
+
+    async def test_a_disabled_symbol_never_opens(self, btc: Symbol, clock: FrozenClock) -> None:
+        # Still subscribed and still marked, so an open position here would keep being
+        # managed. It simply may not be entered.
+        engine = await self._run(btc, clock, entry_symbols=())
+        assert engine.state.signals == 0
+        assert engine.state.orders == 0
+        assert engine.portfolio.position_for(btc) is None
+
+    async def test_an_enabled_symbol_still_opens(self, btc: Symbol, clock: FrozenClock) -> None:
+        engine = await self._run(btc, clock, entry_symbols=(btc,))
+        assert engine.state.signals == 1
+        assert engine.state.orders == 1
+
+    async def test_none_leaves_every_symbol_enabled(self, btc: Symbol, clock: FrozenClock) -> None:
+        engine = await self._run(btc, clock, entry_symbols=None)
+        assert engine.state.signals == 1
+
+    async def test_a_close_is_never_gated(self, btc: Symbol, clock: FrozenClock) -> None:
+        # The whole point: a symbol dropped from the entry universe must still be able to
+        # EXIT. Gating a close would strand a live position with no way out but its stop.
+        engine = await self._run(
+            btc,
+            clock,
+            entry_symbols=(btc,),
+            script={10: SignalDirection.LONG, 12: SignalDirection.CLOSE},
+        )
+        assert engine.state.signals == 2
+        opened = engine.portfolio.position_for(btc)
+        assert opened is None or opened.is_flat
+
+
+class TestSmallAccountLotEligibility:
+    """An exchange lot that dominates the account is a market-access problem, not a signal."""
+
+    def test_a_lot_over_the_fraction_is_refused(self) -> None:
+        # The live case: one BTC lot at 76.25 USDT against a 100 USDT allocation is 76% of
+        # the account in a single indivisible position.
+        v = lot_eligibility(
+            symbol="BTC/USDT",
+            min_quantity=Decimal("0.001"),
+            price=Decimal("76252.6"),
+            allocation=Decimal("100"),
+        )
+        assert v.symbol_tradeable is False
+        assert v.reason_if_disabled == MIN_LOT_TOO_LARGE
+        assert v.symbol_min_lot_fraction > Decimal("0.35")
+
+    def test_a_lot_inside_the_fraction_is_allowed(self) -> None:
+        v = lot_eligibility(
+            symbol="ETH/USDT",
+            min_quantity=Decimal("0.01"),
+            price=Decimal("2369.58"),
+            allocation=Decimal("100"),
+        )
+        assert v.symbol_tradeable is True
+        assert v.reason_if_disabled is None
+
+    def test_it_reports_the_allocation_that_would_activate_the_symbol(self) -> None:
+        # Nothing is hardcoded off: the rule states what it would take to turn a symbol on.
+        v = lot_eligibility(
+            symbol="BTC/USDT",
+            min_quantity=Decimal("0.001"),
+            price=Decimal("76252.6"),
+            allocation=Decimal("100"),
+        )
+        assert v.allocation_required == Decimal("76.2526") / Decimal("0.35")
+        again = lot_eligibility(
+            symbol="BTC/USDT",
+            min_quantity=Decimal("0.001"),
+            price=Decimal("76252.6"),
+            allocation=v.allocation_required,
+        )
+        assert again.symbol_tradeable is True
+
+    def test_an_unscoped_account_is_never_gated(self) -> None:
+        # The rule exists for small accounts. With no allocation there is nothing to be
+        # large relative to, so it must not fire.
+        v = lot_eligibility(
+            symbol="BTC/USDT",
+            min_quantity=Decimal("0.001"),
+            price=Decimal("76252.6"),
+            allocation=None,
+        )
+        assert v.symbol_tradeable is True
+
+    def test_a_falling_price_re_enables_a_symbol(self) -> None:
+        # Recalculated from live price every bar, so eligibility tracks the market.
+        cheap = lot_eligibility(
+            symbol="BTC/USDT",
+            min_quantity=Decimal("0.001"),
+            price=Decimal("30000"),
+            allocation=Decimal("100"),
+        )
+        assert cheap.symbol_tradeable is True

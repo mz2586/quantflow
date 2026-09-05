@@ -55,3 +55,51 @@ dashboard/.vite/
 # Run logs, venue snapshots and one-off probe scripts for the demo session. Local
 # operational state, not source: it also holds the supervisor lock and stop file.
 scratchpad/
+
+# --- Additional secret shapes -----------------------------------------------
+# `.env` and `.env.*` are covered above; these catch the rest.
+*.p12
+*.pfx
+*.p8
+*.jks
+*.keystore
+*.crt
+*.cer
+id_rsa*
+id_ed25519*
+credentials.json
+service-account*.json
+*.credentials
+.netrc
+.pgpass
+.aws/
+.gcloud/
+.azure/
+
+# --- Databases and dumps ----------------------------------------------------
+*.db
+*.db-journal
+*.sqlite
+*.sql.gz
+*.dump
+
+# --- Screenshots and captures -----------------------------------------------
+# Screenshots of a running session show balances, positions and sometimes keys.
+screenshots/
+*.mov
+*.mp4
+
+# --- Local release staging --------------------------------------------------
+# Internal pre-release artefacts. The audit records the repository's security state
+# *before* it was cleaned up; publishing it would ship that history as documentation.
+release-drafts/
+PUBLIC_RELEASE_AUDIT.md
+
+# --- OS / editor ------------------------------------------------------------
+Thumbs.db
+desktop.ini
+._*
+.DS_Store?
+*.swo
+*~
+.claude/

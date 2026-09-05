@@ -16,6 +16,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
 
+from quantflow.api.dashboard.valuation import value_balances
 from quantflow.api.deps import StateDep
 from quantflow.core.errors import ConfigurationError, ExchangeError
 from quantflow.core.logging import get_logger
@@ -54,8 +55,13 @@ async def get_account(state: StateDep) -> dict[str, Any]:
     gateway = _gateway(state)
 
     balances = await gateway.fetch_balances()
-    total = sum((item.free + item.locked for item in balances.values()), ZERO)
-    available = sum((item.free for item in balances.values()), ZERO)
+    # Previously this computed `total = sum(free + locked for every asset)` and published
+    # it as "total_balance". On the live account that added USDT, USDC, one bitcoin and one
+    # ether into a single figure with no unit — roughly double the capital the engine can
+    # actually deploy, and plausible enough to be believed. The valuation helper keeps the
+    # quote asset separate from everything else and offers a cross-asset total only when
+    # every holding could be priced.
+    account = await value_balances(gateway, balances)
 
     positions: list[dict[str, Any]] = []
     unrealized = ZERO
@@ -86,8 +92,9 @@ async def get_account(state: StateDep) -> dict[str, Any]:
         # Ask the gateway, rather than inferring from a testnet flag that predates demo.
         "network": getattr(gateway, "network", "testnet" if gateway.is_testnet else "mainnet"),
         "authenticated": bool(getattr(gateway, "supports_trading", False)),
-        "total_balance": str(total),
-        "available_balance": str(available),
+        # The figures the engine actually sizes against, in the unit it sizes in. There is
+        # deliberately no field summing across assets without conversion.
+        **account,
         "balances": [
             {
                 "asset": asset,

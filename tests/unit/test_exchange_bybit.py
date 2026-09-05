@@ -5,9 +5,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import ExchangeSettings, MarketType
 from quantflow.core.errors import (
@@ -18,6 +19,7 @@ from quantflow.core.errors import (
     InsufficientFundsError,
     InvalidSymbolError,
     OrderRejectedError,
+    ProductAgreementRequiredError,
     RateLimitError,
 )
 from quantflow.domain.enums import (
@@ -45,6 +47,7 @@ from quantflow.exchange.bybit.mapping import (
 from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.exchange.bybit.ws import (
     CandleGapDetector,
+    TickerBook,
     _parse_kline,
     _parse_ticker,
     _parse_trade,
@@ -195,8 +198,8 @@ class TestInstrumentSymbolCollisions:
         gateway = BybitGateway(
             ExchangeSettings(
                 name="bybit",
-                api_key="k" * 18,
-                api_secret="s" * 36,
+                api_key=SecretStr("k" * 18),
+                api_secret=SecretStr("s" * 36),
                 testnet=True,
                 market_type=MarketType.SPOT,
             )
@@ -205,7 +208,7 @@ class TestInstrumentSymbolCollisions:
         async def load_markets(reload: bool = False) -> dict[str, Any]:
             return markets
 
-        gateway._data_client = SimpleNamespace(load_markets=load_markets)  # type: ignore[assignment]
+        gateway._data_client = SimpleNamespace(load_markets=load_markets)
         return gateway
 
     async def test_the_first_market_wins(self) -> None:
@@ -366,6 +369,113 @@ class TestErrorTranslation:
         translated = translate_exception(fake)
         assert type(translated) is ExchangeError
         assert "SomeBrandNewCcxtError" in str(translated)
+
+    @pytest.mark.parametrize(
+        ("ret_code", "ret_msg"),
+        [
+            # Verified live against api-demo.bybit.com on 2026-08-14. Three separate
+            # agreements, three separate codes - signing one does not clear the others.
+            (110123, "You must agree to the Trading Terms before trading this contract."),
+            (110125, "You must agree to the Crude Oil Trading Terms before trading this contract."),
+            (110126, "You must sign the required agreement before trading this contract."),
+        ],
+    )
+    def test_unsigned_product_agreement_is_its_own_error(self, ret_code: int, ret_msg: str) -> None:
+        """An unsigned agreement is an account state, not a bad order.
+
+        It must be distinguishable from every other rejection, because the correct
+        response is unique: stop trading that asset class and tell the operator to sign,
+        rather than retrying, resizing, or failing the session.
+        """
+        fake = type("ExchangeError", (Exception,), {})(
+            f'bybit {{"retCode":{ret_code},"retMsg":"{ret_msg}","result":{{}}}}'
+        )
+        translated = translate_exception(fake)
+        assert isinstance(translated, ProductAgreementRequiredError)
+        # Still an order rejection, so existing handlers keep working.
+        assert isinstance(translated, OrderRejectedError)
+        assert translated.venue_error == str(ret_code)
+
+    def test_ordinary_rejection_is_not_mistaken_for_an_agreement(self) -> None:
+        fake = type("InvalidOrder", (Exception,), {})(
+            'bybit {"retCode":110007,"retMsg":"ab not enough for new order"}'
+        )
+        translated = translate_exception(fake)
+        assert isinstance(translated, OrderRejectedError)
+        assert not isinstance(translated, ProductAgreementRequiredError)
+
+
+class TestClockDriftRecovery:
+    """Drift that appears *after* startup must be corrected without intervention.
+
+    The gateway measures drift once when it connects and CCXT caches the offset. That is
+    fine until the host suspends: the container clock wakes several seconds ahead, the
+    cached offset is now wrong, and every signed request is rejected with
+
+        retCode 10002 — invalid request, please check your server timestamp
+
+    Observed live on 2026-08-15: the API container ran 11 hours, drifted ~4.3s ahead, and
+    every Bybit read failed for 2h40m. Nothing retried the offset, so it never recovered.
+    A startup-only check cannot catch this by construction — the clock was correct at
+    startup.
+    """
+
+    @staticmethod
+    def _gateway() -> BybitGateway:
+        return BybitGateway(
+            ExchangeSettings(
+                name="bybit",
+                api_key=SecretStr("k" * 18),
+                api_secret=SecretStr("s" * 36),
+                testnet=True,
+                market_type=MarketType.SPOT,
+                max_retries=0,
+            )
+        )
+
+    async def test_an_invalid_nonce_reloads_the_offset_and_retries(self) -> None:
+        gateway = self._gateway()
+        reloads: list[bool] = []
+        attempts: list[int] = []
+
+        async def load_time_difference() -> int:
+            reloads.append(True)
+            return 0
+
+        async def operation() -> str:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise type("InvalidNonce", (Exception,), {})(
+                    'bybit {"retCode":10002,"retMsg":"invalid request, please check your '
+                    'server timestamp or recv_window param"}'
+                )
+            return "ok"
+
+        gateway._client.load_time_difference = load_time_difference
+
+        result = await gateway._call("test", operation)
+
+        assert result == "ok"
+        assert reloads, "the cached time offset must be reloaded before retrying"
+        assert len(attempts) == 2, "the call must be retried once the offset is corrected"
+
+    async def test_a_persistent_nonce_failure_still_surfaces(self) -> None:
+        # Recovery must not become an infinite retry that hides a genuinely wrong clock.
+        gateway = self._gateway()
+
+        async def load_time_difference() -> int:
+            return 0
+
+        async def operation() -> str:
+            raise type("InvalidNonce", (Exception,), {})(
+                'bybit {"retCode":10002,"retMsg":"invalid request, please check your '
+                'server timestamp"}'
+            )
+
+        gateway._client.load_time_difference = load_time_difference
+
+        with pytest.raises(ExchangeError):
+            await gateway._call("test", operation)
 
 
 class TestOrderNormalisation:
@@ -544,13 +654,127 @@ class TestStreamPayloadParsing:
         assert ticker.mid == Decimal("50000.00")
         assert ticker.last == Decimal("50000.50")
 
-    def test_a_ticker_without_prices_is_rejected(self, btc: Symbol) -> None:
-        # Linear tickers are delta frames that may omit a side entirely, so a missing
-        # quote must be an error rather than a silent zero.
+    def test_a_ticker_without_prices_and_no_prior_state_is_rejected(self, btc: Symbol) -> None:
+        # A frame carrying no quote, with nothing before it to merge into, really has no
+        # usable price. Inventing a zero here would put a zero mark into the risk engine.
         from quantflow.core.errors import MarketDataError
 
         with pytest.raises(MarketDataError, match="usable prices"):
             _parse_ticker(btc, {"bid1Price": "0", "ask1Price": "0"}, {}, REFERENCE_TIME)
+
+
+class TestLinearTickerDeltas:
+    """Bybit V5 ``tickers`` on the linear category is a snapshot-plus-delta stream.
+
+    Captured live on 2026-08-14: every symbol sends exactly ONE ``snapshot`` frame with
+    the full field set, then hundreds of ``delta`` frames carrying only what changed. Of
+    ~215 XRP frames in 30 seconds only 90 held both sides; of ~134 XAU frames only 15 did.
+
+    Treating each frame as standalone therefore discarded 58% of XRP ticks and 89% of XAU
+    ticks as "no usable prices" — which is what left the intrabar manager blind while the
+    socket was in fact perfectly healthy.
+    """
+
+    #: A real frame, trimmed. Note `bid1Price` present, `ask1Price` absent.
+    BID_ONLY_DELTA: ClassVar[dict[str, str]] = {
+        "symbol": "BTCUSDT",
+        "tickDirection": "ZeroPlusTick",
+        "bid1Price": "62985.50",
+        "bid1Size": "4.553",
+    }
+
+    SNAPSHOT: ClassVar[dict[str, str]] = {
+        "symbol": "BTCUSDT",
+        "lastPrice": "62975.90",
+        "markPrice": "62975.80",
+        "indexPrice": "63002.96",
+        "bid1Price": "62975.80",
+        "bid1Size": "0.822",
+        "ask1Price": "62975.90",
+        "ask1Size": "1.5",
+    }
+
+    #: The real frame that preceded it, carrying both sides.
+    BOTH_SIDES_DELTA: ClassVar[dict[str, str]] = {
+        "symbol": "BTCUSDT",
+        "bid1Price": "62985.50",
+        "bid1Size": "5.128",
+        "ask1Price": "62985.60",
+        "ask1Size": "9.575",
+    }
+
+    def test_a_delta_merges_into_the_snapshot_instead_of_being_discarded(self, btc: Symbol) -> None:
+        # The exact three-frame sequence captured from the venue.
+        book = TickerBook()
+        book.merge(btc, self.SNAPSHOT, "snapshot")
+        book.merge(btc, self.BOTH_SIDES_DELTA, "delta")
+
+        merged = book.merge(btc, self.BID_ONLY_DELTA, "delta")
+        ticker = _parse_ticker(btc, merged, {"ts": 1767225600000}, REFERENCE_TIME)
+
+        # The bid-only frame is usable because the ask is carried forward. Before this it
+        # was discarded outright as "no usable prices".
+        assert ticker.bid == Decimal("62985.50")
+        assert ticker.ask == Decimal("62985.60")
+
+    def test_a_merge_that_would_cross_the_book_is_refused_not_published(self, btc: Symbol) -> None:
+        """A one-sided delta can momentarily cross a stale opposite side.
+
+        The venue corrects it on the next frame, so the right response is to skip this
+        reading — never to publish a crossed quote, and never to let the exception escape
+        and tear down the stream.
+        """
+        from quantflow.core.errors import ValidationError
+
+        book = TickerBook()
+        book.merge(btc, self.SNAPSHOT, "snapshot")
+        merged = book.merge(btc, self.BID_ONLY_DELTA, "delta")
+
+        with pytest.raises(ValidationError, match="crossed ticker"):
+            _parse_ticker(btc, merged, {}, REFERENCE_TIME)
+
+    def test_a_delta_with_no_price_fields_still_yields_the_last_known_quote(
+        self, btc: Symbol
+    ) -> None:
+        # Frames carrying only funding or open-interest updates arrive constantly. They
+        # are not an error and they must not blank the book.
+        book = TickerBook()
+        book.merge(btc, self.SNAPSHOT, "snapshot")
+
+        merged = book.merge(btc, {"symbol": "BTCUSDT", "openInterest": "66642.128"}, "delta")
+        ticker = _parse_ticker(btc, merged, {}, REFERENCE_TIME)
+
+        assert ticker.bid == Decimal("62975.80")
+        assert ticker.ask == Decimal("62975.90")
+
+    def test_a_snapshot_replaces_rather_than_merges(self, btc: Symbol) -> None:
+        # A reconnect re-snapshots. Merging into stale state would keep a dead quote alive.
+        book = TickerBook()
+        book.merge(btc, self.SNAPSHOT, "snapshot")
+        replacement = {"symbol": "BTCUSDT", "bid1Price": "100.0", "ask1Price": "101.0"}
+
+        merged = book.merge(btc, replacement, "snapshot")
+
+        assert merged.get("lastPrice") is None
+        assert merged["bid1Price"] == "100.0"
+
+    def test_symbols_do_not_bleed_into_one_another(self, btc: Symbol, eth: Symbol) -> None:
+        book = TickerBook()
+        book.merge(btc, self.SNAPSHOT, "snapshot")
+
+        merged = book.merge(eth, {"symbol": "ETHUSDT", "bid1Price": "1876.0"}, "delta")
+
+        # ETH has never snapshotted, so BTC's ask must not be borrowed for it.
+        assert merged.get("ask1Price") is None
+
+    def test_a_delta_before_any_snapshot_is_not_invented(self, btc: Symbol) -> None:
+        book = TickerBook()
+        merged = book.merge(btc, self.BID_ONLY_DELTA, "delta")
+
+        from quantflow.core.errors import MarketDataError
+
+        with pytest.raises(MarketDataError, match="usable prices"):
+            _parse_ticker(btc, merged, {}, REFERENCE_TIME)
 
     def test_trade_side_is_the_aggressor_directly(self, btc: Symbol) -> None:
         # Bybit reports the aggressor's side in `S`, the OPPOSITE convention to Binance's
@@ -603,3 +827,52 @@ class TestCandleGapDetector:
         detector.observe(self._candle(btc, 0))
         detector.reset()
         assert detector.observe(self._candle(btc, 10)) == 0
+
+
+class TestVenueReadsPreserveLocalAttribution:
+    """Re-reading an order from the venue must not erase what only we know.
+
+    The venue knows an order's price, size and status. It has never heard of the strategy
+    that produced it. ``submit_order`` parses the acknowledgement *with* the strategy, then
+    ``_enrich_from_venue`` immediately re-fetches the order for authoritative fill data —
+    and that second parse passed no ``strategy_id`` at all. The enriched order replaced the
+    attributed one and was persisted with nothing.
+
+    The effect on the live session: 81 orders, **zero** with a strategy, and therefore 25
+    closed trades that cannot be attributed to anything. Every per-strategy question — which
+    of the 43 carry edge, which bleed — was unanswerable, and the loss could only be
+    localised as far as "XRP and BNB".
+
+    The gateway already tracks the mapping needed to restore it, so the fix is to consult
+    what we recorded at submission rather than expecting the venue to tell us.
+    """
+
+    @staticmethod
+    def _gateway() -> BybitGateway:
+        return BybitGateway(
+            ExchangeSettings(
+                name="bybit",
+                api_key=SecretStr("k" * 18),
+                api_secret=SecretStr("s" * 36),
+                testnet=True,
+                market_type=MarketType.SPOT,
+            )
+        )
+
+    def test_a_remembered_strategy_is_reattached_to_a_venue_read(self) -> None:
+        gateway = self._gateway()
+        gateway.remember_strategy("local-1", "macd_trend")
+
+        assert gateway.strategy_for("local-1") == "macd_trend"
+
+    def test_an_unknown_order_yields_none_rather_than_a_guess(self) -> None:
+        gateway = self._gateway()
+
+        assert gateway.strategy_for("never-seen") is None
+
+    def test_the_venue_order_id_also_resolves(self) -> None:
+        # Executions come back under the venue's id, so both identities must resolve.
+        gateway = self._gateway()
+        gateway.remember_strategy("local-2", "rsi_reversion", venue_order_id="venue-2")
+
+        assert gateway.strategy_for("venue-2") == "rsi_reversion"

@@ -292,6 +292,11 @@ class RiskStatusResponse(ApiModel):
     headroom: dict[str, str]
     sizer: str
     rules: tuple[str, ...]
+    #: Where the reported limits came from: the running engine, or this API process's own
+    #: configuration when the engine has published nothing. Stated rather than implied,
+    #: because the two have differed by a factor of ten and the panel gave no hint which
+    #: it was showing.
+    limits_source: str = "this API process"
 
 
 class KillSwitchRequest(ApiModel):

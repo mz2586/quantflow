@@ -53,6 +53,7 @@ from quantflow.exchange.simulator import (
 from quantflow.portfolio.funding import FundingSchedule
 from quantflow.portfolio.manager import PortfolioManager
 from quantflow.risk.engine import RiskEngine, assert_protected
+from quantflow.risk.exposure import resting_entry_notional
 from quantflow.strategy.base import Strategy, StrategyContext
 from quantflow.strategy.indicators import atr
 
@@ -373,6 +374,9 @@ class BacktestEngine:
             instrument=self._instruments[symbol],
             reference_price=candle.close,
             volatility=volatility,
+            resting_entry_notional=resting_entry_notional(
+                self._broker.open_orders, self._portfolio
+            ),
         )
         if not decision.approved or decision.request is None:
             self._rejected.append((signal, decision.reason))
@@ -400,7 +404,11 @@ class BacktestEngine:
         """
         for trade in trades:
             self._risk.record_trade_result(
-                trade.net_pnl, closed_at=trade.exit_time, symbol=trade.symbol
+                trade.net_pnl,
+                closed_at=trade.exit_time,
+                symbol=trade.symbol,
+                side=OrderSide.BUY if trade.side is PositionSide.LONG else OrderSide.SELL,
+                gross_pnl=trade.gross_pnl,
             )
 
     def _attach_protection(self, order: Order) -> None:

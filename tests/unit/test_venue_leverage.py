@@ -56,7 +56,7 @@ class TestVenueLeverageIsRead:
         assert position.leverage == Decimal("1")
         assert position.margin_required == Decimal("5000")
 
-    def test_unexpected_leverage_is_warned_but_still_honoured(self, caplog) -> None:  # type: ignore[no-untyped-def]
+    def test_unexpected_leverage_is_warned_but_still_honoured(self, caplog) -> None:
         """Reconcile to the venue, never to the assumption — and say so."""
         positions = parse_venue_positions(
             [raw_position(leverage="25")], expected_leverage=Decimal("1")

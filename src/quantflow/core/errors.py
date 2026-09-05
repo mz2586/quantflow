@@ -158,6 +158,33 @@ class OrderRejectedError(ExchangeError):
     http_status = 400
 
 
+class ProductAgreementRequiredError(OrderRejectedError):
+    """The venue will not trade this product until an agreement is signed.
+
+    Bybit gates its non-crypto perpetuals behind per-product terms that have to be
+    accepted in the account UI. Until they are, market data, instrument metadata and
+    streams all work normally and only order placement is refused — which makes this look
+    like an order problem when it is an account problem.
+
+    Separated from a plain :class:`OrderRejectedError` because the correct response is
+    different in kind: there is no order that would succeed, so retrying, resizing or
+    failing the session are all wrong. The asset class is set aside and the operator is
+    told what to sign.
+    """
+
+    code = "product_agreement_required"
+    http_status = 403
+
+    @property
+    def venue_error(self) -> str:
+        """The venue's own code for the missing agreement, or ``""``.
+
+        Surfaced as an attribute rather than left in ``details`` because callers branch on
+        it — one code per agreement, and the operator has to be told which one to sign.
+        """
+        return str(self.details.get("venue_error", ""))
+
+
 class InvalidSymbolError(ExchangeError):
     """The symbol is unknown to the exchange or not tradable."""
 

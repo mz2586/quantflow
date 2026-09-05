@@ -945,3 +945,71 @@ class TestHeadroom:
     def test_summarise(self) -> None:
         summary = summarise_headroom(portfolio(), settings())
         assert set(summary) >= {"daily_loss", "drawdown_pct", "exposure", "positions"}
+
+
+class TestCooldownArmsOnGrossLossOnly:
+    """A mechanical failure is not a failed market thesis."""
+
+    def _engine(self, clock) -> RiskEngine:
+        return RiskEngine(settings(), clock=clock)
+
+    def test_a_zero_gross_scratch_does_not_arm_the_cooldown(self, btc: Symbol, clock) -> None:
+        # The live regression: a BTC entry filled and was emergency-flattened 0.4s later
+        # because its stop would not attach. Gross was exactly 0.00 and the only loss was
+        # the fees, yet it armed the cooldown and locked BTC out for an hour.
+        engine = self._engine(clock)
+        engine.record_trade_result(
+            Decimal("-6.51"),
+            closed_at=REFERENCE_TIME,
+            symbol=btc,
+            side=OrderSide.BUY,
+            gross_pnl=ZERO,
+        )
+        assert engine.export_cooldown_state()["failures"] == []
+
+    def test_a_real_gross_loss_does_arm_it(self, btc: Symbol, clock) -> None:
+        engine = self._engine(clock)
+        engine.record_trade_result(
+            Decimal("-40"),
+            closed_at=REFERENCE_TIME,
+            symbol=btc,
+            side=OrderSide.BUY,
+            gross_pnl=Decimal("-33.5"),
+        )
+        assert len(engine.export_cooldown_state()["failures"]) == 1
+
+    def test_a_fee_only_loss_on_positive_gross_does_not_arm_it(self, btc: Symbol, clock) -> None:
+        engine = self._engine(clock)
+        engine.record_trade_result(
+            Decimal("-2"),
+            closed_at=REFERENCE_TIME,
+            symbol=btc,
+            side=OrderSide.BUY,
+            gross_pnl=Decimal("4.5"),
+        )
+        assert engine.export_cooldown_state()["failures"] == []
+
+
+class TestCooldownStateSurvivesRestart:
+    """The early-clear path must not be lost when the process dies."""
+
+    def test_state_round_trips(self, btc: Symbol, clock) -> None:
+        engine = RiskEngine(settings(), clock=clock)
+        engine.record_trade_result(
+            Decimal("-40"),
+            closed_at=REFERENCE_TIME,
+            symbol=btc,
+            side=OrderSide.BUY,
+            gross_pnl=Decimal("-33.5"),
+        )
+        exported = engine.export_cooldown_state()
+
+        revived = RiskEngine(settings(), clock=clock)
+        assert revived.restore_cooldown_state(exported) == 1
+        assert revived.export_cooldown_state()["failures"] == exported["failures"]
+
+    def test_a_malformed_payload_is_ignored_rather_than_raising(self, clock) -> None:
+        engine = RiskEngine(settings(), clock=clock)
+        assert engine.restore_cooldown_state(None) == 0
+        assert engine.restore_cooldown_state({"failures": [{"symbol": "??"}]}) == 0
+        assert engine.restore_cooldown_state("nonsense") == 0

@@ -40,7 +40,9 @@ from quantflow.strategy.registry import load_builtin_strategies
 TF = Timeframe.parse("15m")
 EQUITY = Decimal("10000")
 OOS_FRACTION = 0.30
-OUT = "/Users/muhammadzohaib/quantflow/reports/edge-validation.json"
+#: Repo root, derived from this file's location so the script works from any checkout.
+REPO = Path(__file__).resolve().parent.parent
+OUT = str(REPO / "reports" / "edge-validation.json")
 
 #: Bars per year at 15m, for annualising.
 BARS_PER_YEAR = 365 * 24 * 4

@@ -1,0 +1,10 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/mz2586/quantflow/security/advisories/new
+    about: >-
+      Do NOT open a public issue for a security problem. Report it privately here.
+      See SECURITY.md.
+  - name: Question or idea
+    url: https://github.com/mz2586/quantflow/discussions
+    about: Ask a question or propose something before writing code.

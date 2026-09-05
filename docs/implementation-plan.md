@@ -1,7 +1,7 @@
 # QuantFlow — Implementation Plan
 
 Authoritative milestone plan. Each milestone is independently testable and ends in a
-local commit. Status is tracked in [`PROJECT_STATUS.md`](../PROJECT_STATUS.md).
+local commit. Released state is tracked in [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## Guiding constraints
 

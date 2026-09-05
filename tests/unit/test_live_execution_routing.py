@@ -196,3 +196,55 @@ class TestPaperEngineRouterSeam:
             router=LiveOrderRouter(RecordingGateway()),
         )
         assert engine.router.is_simulated is False
+
+
+class TestOrderSyncAgainstTheVenue:
+    """A resting order the venue no longer holds must stop counting as exposure."""
+
+    class _Gateway(RecordingGateway):
+        def __init__(self, live: list[Order] | None = None) -> None:
+            super().__init__()
+            self._live = live or []
+
+        async def fetch_open_orders(self) -> list[Order]:
+            return list(self._live)
+
+    async def test_a_vanished_order_is_dropped(self) -> None:
+        # The live regression, 2026-08-18 03:00: the venue held zero open orders while the
+        # router still remembered ~8,670 of ETH as resting, so every candidate for four
+        # hours was refused "would reach 35.35% of equity, above the 20.00% limit
+        # (open 0, resting 8670.62, ...)". Thirty-two selections, zero orders placed.
+        gateway = self._Gateway(live=[])
+        router = LiveOrderRouter(gateway)
+        await router.submit(a_request(), now=REFERENCE_TIME, reference_price=Decimal("50000"))
+        assert len(router.open_orders()) == 1
+
+        await router.sync_open_orders()
+        assert router.open_orders() == []
+
+    async def test_an_order_the_venue_still_holds_is_kept(self) -> None:
+        gateway = self._Gateway()
+        router = LiveOrderRouter(gateway)
+        order = await router.submit(
+            a_request(), now=REFERENCE_TIME, reference_price=Decimal("50000")
+        )
+        gateway._live = [order]
+
+        await router.sync_open_orders()
+        assert len(router.open_orders()) == 1
+
+    async def test_a_gateway_without_the_endpoint_is_a_no_op(self) -> None:
+        router = LiveOrderRouter(RecordingGateway())
+        await router.submit(a_request(), now=REFERENCE_TIME, reference_price=Decimal("50000"))
+        await router.sync_open_orders()
+        assert len(router.open_orders()) == 1
+
+    async def test_a_failing_read_leaves_state_untouched(self) -> None:
+        class Broken(RecordingGateway):
+            async def fetch_open_orders(self) -> list[Order]:
+                raise RuntimeError("venue down")
+
+        router = LiveOrderRouter(Broken())
+        await router.submit(a_request(), now=REFERENCE_TIME, reference_price=Decimal("50000"))
+        await router.sync_open_orders()
+        assert len(router.open_orders()) == 1

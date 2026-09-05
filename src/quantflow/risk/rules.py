@@ -12,6 +12,7 @@ place and makes every rule trivial to unit test.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -96,6 +97,32 @@ class RiskContext:
     #: Open positions that move with the candidate beyond the correlation threshold.
     #: Supplied by the engine, which owns the correlation estimate.
     correlated_open_symbols: tuple[str, ...] = ()
+    #: Notional of *unfilled* entry orders already resting at the venue, per symbol.
+    #:
+    #: Counted as exposure because it becomes exposure without any further decision. A
+    #: maker entry can rest for hours and fill on top of a position opened after it, and
+    #: no rule ever re-examines it: on 2026-08-17 a WLD order placed at 01:00 while the
+    #: symbol was flat passed the 20% check at 17.7%, rested 5.4 hours, and filled at
+    #: 06:25 on top of a position opened at 01:30 — leaving one symbol at 35.4% of equity
+    #: against a 20% cap, with every individual check having passed honestly.
+    #:
+    #: Reduce-only orders are excluded by the caller: a stop or target *removes* exposure.
+    resting_entry_notional: Mapping[str, Decimal] = field(default_factory=dict)
+    #: When this symbol/side was last stopped out, and what it scored going in.
+    last_thesis_failure_at: datetime | None = None
+    last_thesis_failure_score: Decimal | None = None
+    #: The candidate's own score, so a re-entry can be judged against what just failed.
+    candidate_score: Decimal | None = None
+
+    @property
+    def resting_for_symbol(self) -> Decimal:
+        """Resting entry notional on the candidate's own symbol."""
+        return self.resting_entry_notional.get(str(self.request.symbol), ZERO)
+
+    @property
+    def resting_total(self) -> Decimal:
+        """Resting entry notional across every symbol."""
+        return sum(self.resting_entry_notional.values(), ZERO)
 
     @property
     def notional(self) -> Decimal:
@@ -250,13 +277,17 @@ class MaxPositionSizeRule(RiskRule):
         if position is not None:
             existing = position.notional(context.reference_price)
 
-        projected = safe_divide(existing + context.notional, equity)
+        # Resting entries count. Without them this rule measured only what had already
+        # filled, and a symbol could pass twice on its way to double the cap.
+        resting = context.resting_for_symbol
+        projected = safe_divide(existing + resting + context.notional, equity)
         limit = context.settings.max_position_pct
         if projected > limit:
             return RiskVerdict.deny(
                 self.name,
                 f"{context.request.symbol} would reach {projected:.2%} of equity, "
-                f"above the {limit:.2%} limit",
+                f"above the {limit:.2%} limit "
+                f"(open {existing}, resting {resting}, this order {context.notional})",
                 observed=projected,
                 limit=limit,
                 symbol=str(context.request.symbol),
@@ -274,13 +305,16 @@ class MaxTotalExposureRule(RiskRule):
         equity = context.portfolio.equity
         if equity <= ZERO:
             return RiskVerdict.deny(self.name, "equity is not positive", severity=Severity.CRITICAL)
-        projected = safe_divide(context.portfolio.gross_exposure + context.notional, equity)
+        open_notional = context.portfolio.gross_exposure
+        resting = context.resting_total
+        projected = safe_divide(open_notional + resting + context.notional, equity)
         limit = context.settings.max_total_exposure_pct
         if projected > limit:
             return RiskVerdict.deny(
                 self.name,
                 f"gross exposure would reach {projected:.2%} of equity, "
-                f"above the {limit:.2%} limit",
+                f"above the {limit:.2%} limit "
+                f"(open {open_notional}, resting {resting}, this order {context.notional})",
                 observed=projected,
                 limit=limit,
             )
@@ -573,6 +607,72 @@ class CorrelationLimitRule(RiskRule):
         )
 
 
+class ThesisCooldownRule(RiskRule):
+    """Refuses to re-enter a symbol and side straight after being stopped out of it.
+
+    A stop-out is the market answering the question the entry asked. Re-entering the same
+    symbol, the same direction, on evidence no stronger than the evidence that just failed
+    is not a second opportunity — it is the same opinion paid for twice.
+
+    Measured on 2026-08-17: ``momentum_roc`` was stopped out of WLD long for -235, then
+    placed seven further WLD buys within four hours. Two filled, and WLD finished as the
+    largest single loss of the session.
+
+    Deliberately not a ban, and deliberately escapable two ways. Time alone clears it, so
+    a genuine setup later in the session is not lost; and a materially better score clears
+    it early, because sometimes the market really does turn immediately after taking
+    someone out. What it refuses is the *unchanged* case, which is the one that has already
+    been tested.
+    """
+
+    name = "thesis_cooldown"
+
+    def check(self, context: RiskContext) -> RiskVerdict:
+        """Deny a same-side re-entry inside the cooldown unless the case has improved."""
+        failed_at = context.last_thesis_failure_at
+        if failed_at is None:
+            return RiskVerdict.allow(self.name)
+
+        elapsed = context.now - failed_at
+        cooldown = timedelta(minutes=context.settings.thesis_cooldown_minutes)
+        if elapsed >= cooldown:
+            return RiskVerdict.allow(self.name, "the cooldown has expired")
+        if elapsed < timedelta(0):
+            # The failure is stamped after "now", so the two are not on one clock and the
+            # elapsed time is not a real measurement. Enforcing a window computed from it
+            # would hold a symbol for as long as the skew happened to be — seen as a
+            # -960 minute elapsed producing a 1,020 minute block. A cooldown that cannot
+            # be measured is not applied.
+            return RiskVerdict.allow(
+                self.name, "the recorded failure time is not comparable to the current time"
+            )
+
+        previous = context.last_thesis_failure_score
+        current = context.candidate_score
+        required = context.settings.thesis_score_improvement
+        if previous is not None and current is not None and current - previous >= required:
+            return RiskVerdict.allow(
+                self.name,
+                f"score improved from {previous} to {current}, clearing the cooldown early",
+            )
+
+        remaining = cooldown - elapsed
+        minutes = Decimal(str(round(remaining.total_seconds() / 60, 1)))
+        detail = (
+            f"score {current} is not {required} better than the {previous} that failed"
+            if previous is not None and current is not None
+            else "no score was recorded to compare against"
+        )
+        return RiskVerdict.deny(
+            self.name,
+            f"{context.request.symbol} {context.request.side.value} was stopped out "
+            f"{Decimal(str(round(elapsed.total_seconds() / 60, 1)))} minute(s) ago; "
+            f"{detail}, so this re-enters a thesis that has already failed. "
+            f"Clears in {minutes} minute(s) or on a better score",
+            severity=Severity.WARNING,
+        )
+
+
 class ConsecutiveLossCooldownRule(RiskRule):
     """Pauses new entries after a run of losing trades.
 
@@ -616,6 +716,7 @@ DEFAULT_RULES: tuple[type[RiskRule], ...] = (
     MaxWeeklyLossRule,
     MaxDailyLossRule,
     ConsecutiveLossCooldownRule,
+    ThesisCooldownRule,
     OrderRateRule,
     StopLossRequiredRule,
     InstrumentRule,

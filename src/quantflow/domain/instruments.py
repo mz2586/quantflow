@@ -106,6 +106,27 @@ class Instrument:
     max_leverage: Decimal = Decimal("1")
     active: bool = True
     contract_size: Decimal = Decimal("1")
+    venue_symbol_type: str = ""
+    """The venue's own category label for this market, verbatim.
+
+    Bybit's ``/v5/market/instruments-info`` returns a ``symbolType`` per instrument, which
+    partitions the linear category into ``""`` and ``innovation`` (crypto), ``stock`` and
+    ``commodity``. It is carried here rather than re-derived from the ticker because the
+    venue is the authority on what it has listed, and a ticker-shaped guess would classify
+    a market by its name — which is how ``XAU`` ends up mistaken for a token.
+
+    Empty when the venue says nothing, which is both Bybit's own value for crypto and the
+    correct default for any venue that has no such concept.
+    """
+    funding_interval_minutes: int | None = None
+    """Minutes between funding settlements, as the venue reports them.
+
+    Not the 8 hours that is conventionally assumed: Bybit settles metals every 240 minutes
+    and energy, equities and indices every 480. A position's funding cost is proportional
+    to the number of settlements it is held across, so an assumed interval misprices that
+    cost by whatever factor the assumption was wrong by. ``None`` for instruments that do
+    not fund at all, such as spot.
+    """
 
     def __post_init__(self) -> None:
         """Validate the rule set for internal consistency."""

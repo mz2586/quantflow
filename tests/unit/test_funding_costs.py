@@ -80,8 +80,8 @@ class TestFundingSign:
     def test_long_and_short_are_exact_mirrors(self) -> None:
         """The two sides settle against each other; they cannot both pay."""
         kwargs = {"quantity": Decimal("2"), "price": Decimal("30000"), "rate": Decimal("0.0002")}
-        long = funding_amount(side=PositionSide.LONG, **kwargs)  # type: ignore[arg-type]
-        short = funding_amount(side=PositionSide.SHORT, **kwargs)  # type: ignore[arg-type]
+        long = funding_amount(side=PositionSide.LONG, **kwargs)
+        short = funding_amount(side=PositionSide.SHORT, **kwargs)
         assert long == -short
 
     def test_a_zero_rate_costs_nothing(self) -> None:

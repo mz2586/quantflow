@@ -25,9 +25,9 @@ statement below about timeframe is a *hypothesis*, not a result. This is the sin
 largest gap in the evidence, and section 12 explains why it is also the most promising
 place to look next.
 
-Run B is smaller because the full-scale laboratory run is not feasible on the current
-machine: it needs two full sweeps, and with ~112 MB free and 7.8 GB of swap in use the
-worker pool could not be given the whole dataset. That is a hardware constraint, recorded
+Run B is smaller because the full-scale laboratory run needs two full sweeps and did not
+fit in the memory available on the machine it was run on: the worker pool could not be
+given the whole dataset. That is a hardware constraint, recorded
 rather than worked around.
 
 ---

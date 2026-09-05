@@ -28,8 +28,15 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Final
 
+from quantflow.api.dashboard.decisions import (
+    DECISION_FEED_TTL_SECONDS,
+    DecisionLog,
+    build_feed,
+    decision_feed_key,
+)
 from quantflow.cache.redis import Cache, EventBus
 from quantflow.core.clock import Clock, SystemClock
 from quantflow.core.config import ExchangeEnv, Settings, TradingMode
@@ -45,6 +52,14 @@ from quantflow.domain.market import Candle
 from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.exchange.bybit.ws import BybitStream
 from quantflow.execution.router import LiveOrderRouter, OrderRouter
+from quantflow.live.heartbeat import (
+    COOLDOWN_STATE_KEY,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_TTL_SECONDS,
+    RISK_LIMITS_CURRENT_KEY,
+    heartbeat_key,
+    risk_limits_key,
+)
 from quantflow.live.intrabar_manager import (
     IntrabarManager,
     intrabar_config_from_env,
@@ -63,6 +78,10 @@ logger = get_logger(__name__)
 #: even considered. Deliberately NOT prefixed with QF_ and NOT part of the Settings model:
 #: it must be impossible to set it by editing a config file that something else copies.
 LIVE_TRADING_ENV_VAR: Final = "ENABLE_LIVE_TRADING"
+
+#: How long published cooldown state survives. Comfortably longer than the cooldown window
+#: so a restart inside it always recovers the score it needs.
+COOLDOWN_STATE_TTL_SECONDS: Final = 21_600.0
 
 #: How long the runner waits for in-flight work during a graceful shutdown.
 SHUTDOWN_GRACE_SECONDS: Final = 10.0
@@ -159,6 +178,12 @@ class RunnerConfig:
     #: entitles the engine to correct a restored session's cash: a configured fallback says
     #: nothing about the account and must never override the session's own history.
     equity_is_authoritative: bool = False
+    #: Symbols permitted to OPEN new positions. ``None`` means every traded symbol may.
+    #: Kept separate from ``symbols`` so a symbol holding a position stays subscribed and
+    #: managed even when it may no longer be entered.
+    entry_symbols: tuple[Symbol, ...] | None = None
+    #: Capital ceiling for this session; ``None`` means the whole wallet.
+    allocation: Decimal | None = None
     strategy_params: dict[str, Any] = field(default_factory=dict)
     history_bars: int = 500
     persist: bool = True
@@ -185,10 +210,12 @@ class TradingRunner:
         "_clock",
         "_config",
         "_database",
+        "_decision_log",
         "_dispatcher",
         "_engine",
         "_gateway",
         "_intrabar",
+        "_log_path",
         "_settings",
         "_stopping",
         "_strategy",
@@ -211,6 +238,9 @@ class TradingRunner:
         )
         self._database: Database | None = None
         self._cache: Cache | None = None
+        # Resolved from the same variable the dashboard uses, so both name one file.
+        self._log_path: Path = Path(os.environ.get("QF_DASHBOARD_BOT_LOG", "scratchpad/bot.log"))
+        self._decision_log: DecisionLog | None = None
         self._dispatcher: NotificationDispatcher | None = None
         self._gateway: BybitGateway | None = None
         #: Ticker-driven profit protection. Runs beside the candle loop, never inside
@@ -303,15 +333,100 @@ class TradingRunner:
 
             await self._announce(started=True)
             await self._start_intrabar()
+            heartbeat = asyncio.create_task(self._publish_heartbeat())
             try:
                 state = await self._engine.run(self._feed())
             except asyncio.CancelledError:
                 logger.info("runner.cancelled")
                 raise
             finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
                 await self._announce(started=False)
                 await self.aclose()
             return state
+
+    async def _publish_heartbeat(self) -> None:
+        """Publish the engine's runtime state to Redis on a fixed interval.
+
+        A separate task rather than a write inside the loops: ticks arrive several times a
+        second, and putting Redis on that path would make a cache hiccup a trading problem.
+        Here a failed write costs one heartbeat and the next one recovers.
+
+        Redis rather than the log file, because this is the value a dashboard uses to
+        decide whether the engine is alive, and it has to be readable from another process
+        with no ambiguity. The log is read through a bind mount that goes stale; a Redis
+        read is either current or it raises.
+        """
+        if self._cache is None or self._engine is None:
+            logger.warning(
+                "runner.heartbeat_unavailable",
+                reason="no cache is connected; the dashboard cannot verify engine liveness",
+            )
+            return
+
+        pid = os.getpid()
+        while True:
+            try:
+                beat = self._engine.heartbeat(pid=pid)
+                await self._cache.set(
+                    heartbeat_key(beat.session_id),
+                    beat.to_dict(),
+                    ttl_seconds=HEARTBEAT_TTL_SECONDS,
+                )
+                await self._publish_decisions(beat.session_id)
+                # Published from the engine so the dashboard reports the limits actually
+                # being enforced rather than whatever the API process loaded at startup.
+                risk = getattr(self._engine, "_risk", None)
+                if risk is not None:
+                    described = risk.describe()
+                    described["session_id"] = beat.session_id
+                    described["published_at"] = beat.written_at.isoformat()
+                    for key in (risk_limits_key(beat.session_id), RISK_LIMITS_CURRENT_KEY):
+                        await self._cache.set(key, described, ttl_seconds=HEARTBEAT_TTL_SECONDS)
+                    # Cooldown state outlives the process, so a restart cannot silently
+                    # turn a conditional cooldown into an absolute one by losing the score
+                    # it compares against. TTL is generous: the window itself is an hour.
+                    await self._cache.set(
+                        COOLDOWN_STATE_KEY,
+                        risk.export_cooldown_state(),
+                        ttl_seconds=COOLDOWN_STATE_TTL_SECONDS,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - a cache fault must not stop trading
+                logger.warning("runner.heartbeat_write_failed", error=str(exc)[:160])
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    async def _publish_decisions(self, session_id: str) -> None:
+        """Parse this engine's own log and publish the decisions to Redis.
+
+        The dashboard used to parse the same file itself, from inside a container, through a
+        macOS bind mount. That view goes stale on a large continuously-appended file: with
+        the log at 576 MB the container sat fifteen minutes behind the host and reported "no
+        decisions found" while the engine was selecting, sizing and submitting. Reading here
+        removes the mount from the path entirely — this process wrote the file, so its view
+        of it is current by construction.
+
+        A parse or cache fault is logged and swallowed. Publishing is an observability
+        concern, and it must never be able to interrupt trading.
+        """
+        if self._cache is None or self._log_path is None:
+            return
+        try:
+            if self._decision_log is None:
+                self._decision_log = DecisionLog(self._log_path)
+            decisions = await asyncio.to_thread(self._decision_log.refresh)
+            await self._cache.set(
+                decision_feed_key(session_id),
+                build_feed(decisions, self._decision_log.facts()),
+                ttl_seconds=DECISION_FEED_TTL_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - observability must not stop trading
+            logger.warning("runner.decision_publish_failed", error=str(exc)[:160])
 
     async def _build(self) -> None:
         """Construct every dependency for the session."""
@@ -362,6 +477,8 @@ class TradingRunner:
             self._strategy,
             PaperConfig(
                 symbols=self._config.symbols,
+                entry_symbols=self._config.entry_symbols,
+                allocation=self._config.allocation,
                 timeframe=self._config.timeframe,
                 starting_equity=self._config.starting_equity,
                 equity_is_authoritative=self._config.equity_is_authoritative,
@@ -389,6 +506,19 @@ class TradingRunner:
         # The engine builds its own risk engine; replace it with the one already started
         # and wired to notifications, so alerts and the loaded kill-switch state apply.
         self._engine._risk = risk
+
+        # Rebuild the thesis cooldown from the last published state. Without this a restart
+        # silently upgrades every live cooldown from "clears on a better score" to
+        # "absolute", because the score it compares against is gone.
+        if self._cache is not None:
+            try:
+                stored = await self._cache.get(COOLDOWN_STATE_KEY)
+            except Exception as exc:
+                logger.warning("runner.cooldown_restore_failed", error=str(exc)[:160])
+            else:
+                restored = risk.restore_cooldown_state(stored)
+                if restored:
+                    logger.critical("runner.cooldown_restored", failures=restored)
 
         # Only now can "armed" be asserted honestly: the engine exists and its router is
         # known. Raises rather than trading if a LIVE session would have been simulated.

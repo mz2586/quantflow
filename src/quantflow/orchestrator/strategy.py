@@ -22,8 +22,8 @@ Two properties are load-bearing:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections.abc import Collection, Sequence
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any
 
@@ -43,11 +43,14 @@ from quantflow.orchestrator.performance import (
     evidence_score,
     has_negative_expectancy,
 )
+from quantflow.orchestrator.pyramid import EntryThesis, pyramid_verdict
 from quantflow.orchestrator.scoring import (
+    MAX_LEGS_PER_SYMBOL,
     MIN_SCORE_TO_TRADE,
     Candidate,
     StrategyRecord,
     gate_candidate,
+    net_edge_of,
     rank,
     score_candidate,
 )
@@ -62,6 +65,11 @@ from quantflow.strategy.registry import (
     load_builtin_strategies,
     register_strategy,
 )
+from quantflow.universe.assets import (
+    asset_class_from_metadata,
+    gating_reason,
+    strategy_supports_class,
+)
 
 logger = get_logger(__name__)
 
@@ -72,7 +80,19 @@ logger = get_logger(__name__)
 DEFAULT_EXCLUDED = frozenset({"buy_and_hold", "orchestrator"})
 
 #: Round-trip cost assumption used by the cost component, as a fraction of notional.
-DEFAULT_COST_RATE = Decimal("0.002")
+#:
+#: Measured, not assumed. Across 18 live trades on this account the real round trip was
+#: **0.0920%** — 2.29 in fees against 2,487 of notional. The previous 0.2000% was more than
+#: double that, and the gate subtracted the difference from every candidate's edge before
+#: judging it. Three candidates were refused in a single hour at 0.3929%, 0.3814% and
+#: 0.3774% against a 0.4000% floor; each clears it once the over-charge is removed.
+#:
+#: Set to 0.0011 rather than the measured 0.00092: that is taker on both sides, the worst
+#: case the account can actually pay. Erring high by a hair keeps the gate honest, while
+#: erring low would admit trades that cannot cover their own execution.
+#:
+#: The floor itself is untouched. This is the same bar applied to a true number.
+DEFAULT_COST_RATE = Decimal("0.0011")
 
 
 class OrchestratorParams(StrategyParams):
@@ -149,6 +169,12 @@ class StrategyOrchestrator(Strategy):
             raise ValidationError("orchestrator needs at least one member", field="members")
         #: symbol -> strategy id that opened the live position, so exits stay with the owner.
         self._owners: dict[Symbol, str] = {}
+        #: The case that opened each symbol's position, so a later candidate can be judged
+        #: against it rather than merely counted.
+        self._thesis: dict[Symbol, EntryThesis] = {}
+        #: Entry legs currently open per symbol. The venue nets them into one position;
+        #: this is what bounds how many times the engine may add.
+        self._legs: dict[Symbol, int] = {}
         self._records: dict[str, StrategyRecord] = {}
         self._last_decision: Decision | None = None
         #: Realised results, bucketed per strategy / symbol / regime.
@@ -203,6 +229,9 @@ class StrategyOrchestrator(Strategy):
                     max_correlation=duplicate,
                     volume_share=ZERO,
                     available_families=available,
+                    # Lets a strong lone family stand in for the missing second opinion.
+                    # Same arithmetic the economic gate used, so the two cannot disagree.
+                    net_edge=net_edge_of(candidate, cost_rate=self.params.cost_rate),
                 )
             )
             if verdict.accepted:
@@ -318,10 +347,54 @@ class StrategyOrchestrator(Strategy):
         )
         return context.hold(decision.reason, self.strategy_id)
 
-    def generate(self, context: StrategyContext) -> Signal:
-        """Poll every member, score the actionable ones, return the winner."""
+    def _admit_for_asset_class(
+        self, context: StrategyContext
+    ) -> tuple[list[Strategy], list[tuple[str, str]]]:
+        """Split the roster into members this instrument admits and members it does not.
+
+        A strategy whose information source is meaningless on this instrument is refused
+        *before* it is evaluated, not after. Running it and discarding the signal would
+        still let a volume strategy reading a synthetic equity perpetual's thin,
+        venue-local tape count toward the confluence requirement in the selection layer —
+        the orchestrator would refuse to act on it while treating it as corroboration,
+        which is exactly what the family taxonomy exists to prevent.
+
+        The class is resolved once per bar rather than once per member, and is only ever
+        used to refuse: a member that clears the gate is judged on precisely the same
+        evidence it always was. Refusals are returned rather than logged away so they land
+        in ``Decision.gated``, because a member that vanished without explanation is
+        indistinguishable from a broken one.
+        """
+        asset_class = asset_class_from_metadata(context.metadata)
+        admitted: list[Strategy] = []
+        refused: list[tuple[str, str]] = []
+        for member in self._members:
+            family = strategy_family(member.strategy_id)
+            if strategy_supports_class(
+                family, asset_class, declared=member.supported_asset_classes
+            ):
+                admitted.append(member)
+            else:
+                refused.append(
+                    (member.strategy_id, gating_reason(member.strategy_id, family, asset_class))
+                )
+        return admitted, refused
+
+    def generate(  # noqa: PLR0911, PLR0912 - each return is a distinct refusal reason
+        self, context: StrategyContext
+    ) -> Signal:
+        """Poll every member, score the actionable ones, return the winner.
+
+        The branch count is high because each exit is a *different* answer to "why not" —
+        no candidates, all gated, all deselected, below the score floor, pyramid refused.
+        Collapsing them would trade a legible decision log for a tidier function, and the
+        decision log is what makes "the bot is not trading" answerable.
+        """
+        pyramiding = False
         if context.has_position:
-            return self._manage_open_position(context)
+            managed, pyramiding = self._open_position_route(context)
+            if managed is not None:
+                return managed
 
         # The engine hands every strategy `MarketRegime.UNKNOWN`, so the orchestrator
         # classifies for itself from the same closed bars the members see. Nothing here
@@ -329,8 +402,8 @@ class StrategyOrchestrator(Strategy):
         regime = self._classify(context)
 
         candidates: list[Candidate] = []
-        rejected: list[tuple[str, str]] = []
-        for member in self._members:
+        admitted, rejected = self._admit_for_asset_class(context)
+        for member in admitted:
             signal = member.evaluate(context)
             if not signal.is_actionable:
                 rejected.append((member.strategy_id, signal.reason))
@@ -434,10 +507,25 @@ class StrategyOrchestrator(Strategy):
             )
             return context.hold(decision.reason, self.strategy_id)
 
+        if pyramiding:
+            refusal = self._pyramid_admits(context, best, regime)
+            if refusal is not None:
+                return refusal
+
         decision.selected = best
         decision.reason = f"highest score {best.score:.3f} of {len(ordered)} candidates"
         self._last_decision = decision
         self._owners[context.symbol] = best.strategy_id
+        if pyramiding:
+            self._legs[context.symbol] = self._legs.get(context.symbol, 1) + 1
+        else:
+            self._legs[context.symbol] = 1
+            self._thesis[context.symbol] = EntryThesis(
+                strategy_id=best.strategy_id,
+                direction=best.direction,
+                regime=regime,
+                score=best.score,
+            )
 
         logger.info(
             "orchestrator.selected",
@@ -450,9 +538,95 @@ class StrategyOrchestrator(Strategy):
             runner_up=ordered[1].describe() if len(ordered) > 1 else None,
             components={name: f"{value:.2f}" for name, value in best.components.items()},
         )
-        # The member's own signal, unchanged: attribution downstream must name the strategy
-        # that actually decided.
-        return best.signal
+        # The member's own signal, with the orchestrator's ranking attached. Attribution
+        # downstream must still name the strategy that actually decided, so only metadata
+        # is added — direction, prices and conviction are untouched.
+        #
+        # The score has to travel because the risk engine sizes on it and cannot recompute
+        # it: ranking a candidate needs the whole field, which only exists here.
+        return replace(
+            best.signal,
+            metadata={**best.signal.metadata, "orchestrator_score": str(best.score)},
+        )
+
+    def _pyramid_slot(self, context: StrategyContext) -> tuple[bool, str]:
+        """Whether this symbol may take another entry leg.
+
+        Only counts legs and the pyramiding switch. Whether a *particular* candidate earns
+        the slot is :func:`~quantflow.orchestrator.pyramid.pyramid_verdict`, and every risk
+        and exposure rule still runs after that — a slot is permission to be considered,
+        never permission to trade.
+        """
+        if MAX_LEGS_PER_SYMBOL <= 1:
+            return False, "pyramiding is disabled (MAX_LEGS_PER_SYMBOL <= 1)"
+        legs = self._legs.get(context.symbol, 1)
+        if legs >= MAX_LEGS_PER_SYMBOL:
+            return False, f"{legs} leg(s) already open, limit {MAX_LEGS_PER_SYMBOL}"
+        return True, f"{legs} of {MAX_LEGS_PER_SYMBOL} legs used"
+
+    def _open_position_route(self, context: StrategyContext) -> tuple[Signal | None, bool]:
+        """Decide what a symbol that already holds a position should do this bar.
+
+        Returns ``(signal, pyramiding)``. A signal means the answer is settled — the owner
+        wants out, or no second leg is available. ``(None, True)`` means the symbol earns a
+        full evaluation for an additional leg, which then runs every gate an empty symbol
+        would face plus the materially-different test.
+        """
+        managed = self._manage_open_position(context)
+        if managed.direction is SignalDirection.CLOSE:
+            return managed, False
+        allowed, why = self._pyramid_slot(context)
+        if not allowed:
+            logger.info("orchestrator.pyramid_declined", symbol=str(context.symbol), reason=why)
+            return managed, False
+        return None, True
+
+    def _pyramid_admits(
+        self, context: StrategyContext, best: Any, regime: MarketRegime
+    ) -> Signal | None:
+        """Judge a second leg against the thesis already running.
+
+        Returns ``None`` when the leg may proceed, or the hold signal to return when it may
+        not. Every decision is logged either way — a refusal is as worth reading as an
+        admission, because "why did it not pyramid" is the question this will be asked.
+        """
+        existing = self._thesis.get(context.symbol)
+        position = context.position
+        unrealized = position.unrealized_pnl(context.price) if position is not None else ZERO
+
+        if existing is None:
+            logger.info(
+                "orchestrator.pyramid_declined",
+                symbol=str(context.symbol),
+                reason="no recorded thesis for the open position to compare against",
+            )
+            return context.hold("pyramid: no thesis on record", self.strategy_id)
+
+        allowed, why = pyramid_verdict(
+            existing,
+            strategy_id=best.strategy_id,
+            direction=best.direction,
+            regime=regime,
+            score=best.score,
+            unrealized_pnl=unrealized,
+        )
+        logger.critical(
+            "orchestrator.pyramid_decision",
+            symbol=str(context.symbol),
+            decision="ALLOW" if allowed else "REFUSE",
+            reason=why,
+            existing_strategy=existing.strategy_id,
+            new_strategy=best.strategy_id,
+            existing_score=str(existing.score),
+            new_score=str(best.score),
+            existing_regime=existing.regime.value,
+            new_regime=regime.value,
+            existing_legs=self._legs.get(context.symbol, 1),
+            unrealized_pnl=str(unrealized),
+        )
+        if not allowed:
+            return context.hold(f"pyramid refused: {why}", self.strategy_id)
+        return None
 
     def _manage_open_position(self, context: StrategyContext) -> Signal:
         """Consult only the strategy that opened this position."""
@@ -468,6 +642,8 @@ class StrategyOrchestrator(Strategy):
         signal = owner.evaluate(context)
         if signal.direction is SignalDirection.CLOSE:
             self._owners.pop(context.symbol, None)
+            self._thesis.pop(context.symbol, None)
+            self._legs.pop(context.symbol, None)
         return signal
 
     # ------------------------------------------------------------------ #
@@ -476,6 +652,46 @@ class StrategyOrchestrator(Strategy):
     def adopt(self, symbol: Symbol, strategy_id: str) -> None:
         """Record an existing position's owner, used when restoring after a restart."""
         self._owners[symbol] = strategy_id
+
+    def sync_owners(self, open_symbols: Collection[Symbol]) -> tuple[Symbol, ...]:
+        """Drop ownership of every symbol the venue no longer holds a position in.
+
+        The venue is authoritative about what is open; this map is only a record of which
+        member is responsible for each of those positions. Before this existed, ownership
+        was released in exactly one place — the owning member returning ``CLOSE`` on a bar
+        where the engine still saw the position — so every other way a position can end
+        left the symbol owned forever: a venue stop, a take-profit, an intrabar exit, a
+        manual close, a liquidation.
+
+        Because an owned symbol counts as an open position in the duplicate guard, the
+        effect compounded until nothing could be entered at all. Observed live on
+        2026-08-14: 52 of 52 candidates declined for correlation with open positions, with
+        zero positions open at the venue.
+
+        Deliberately one-directional. A venue position with no owner is **not** adopted
+        here, because this function cannot know which member should manage it, and guessing
+        would hand a live position to a strategy that did not open it — the restore path
+        (:meth:`on_restore`) has the persisted ``strategy_id`` and is the right place.
+
+        Args:
+            open_symbols: Symbols the venue currently holds a position in.
+
+        Returns:
+            The symbols whose ownership was released, for logging.
+
+        """
+        held = frozenset(open_symbols)
+        released = tuple(symbol for symbol in self._owners if symbol not in held)
+        for symbol in released:
+            del self._owners[symbol]
+        if released:
+            logger.info(
+                "orchestrator.owners_released",
+                symbols=[str(symbol) for symbol in released],
+                remaining=len(self._owners),
+                reason="venue no longer holds a position in these symbols",
+            )
+        return released
 
     # ------------------------------------------------------------------ #
     # Regime and evidence
@@ -538,7 +754,14 @@ class StrategyOrchestrator(Strategy):
                 self._owners[position.symbol] = position.strategy_id
 
     def on_trade_closed(self, trade: ClosedTrade) -> None:
-        """Engine hook: fold a completed round-trip into its strategy's record."""
+        """Engine hook: fold a completed round-trip into its strategy's record.
+
+        Also releases the symbol. A completed round-trip is proof the position is gone, and
+        acting on it here frees the symbol immediately rather than leaving it blocked until
+        the next venue sync — which matters on a 15m timeframe, where that wait is a whole
+        bar of missed entries.
+        """
+        self._owners.pop(trade.symbol, None)
         self.record_trade(trade)
 
     def record_trade(self, trade: ClosedTrade) -> None:

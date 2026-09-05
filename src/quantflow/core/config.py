@@ -215,7 +215,10 @@ class ExchangeSettings(BaseModel):
     demo_api_key: OptionalSecret = None
     demo_api_secret: OptionalSecret = None
     #: Takes precedence over ``testnet``. Left unset, it is derived from that boolean so
-    #: existing configurations keep working unchanged.
+    #: existing configurations keep working unchanged - and because ``testnet`` itself
+    #: defaults to True, an unconfigured install resolves to testnet, never to mainnet.
+    #: The shipped `.env.example` sets this to ``demo`` explicitly; defaulting it here
+    #: instead would make an explicit ``testnet=false`` silently inert.
     env: ExchangeEnv | None = None
     testnet: bool = True
     #: Read public market data from production even when trading on testnet. Bybit's
@@ -350,6 +353,11 @@ class RiskSettings(BaseModel):
     max_weekly_loss_pct: Fraction = Decimal("0.08")
     max_drawdown_pct: Fraction = Decimal("0.15")
     default_stop_loss_pct: Fraction = Decimal("0.02")
+    #: Round-trip execution cost as a fraction of notional, used to judge whether a target
+    #: is worth reaching. 0.0011 is Bybit taker both ways (0.055% x 2), the rate actually
+    #: charged on this account. Deliberately the pessimistic figure: a maker entry makes
+    #: the real cost lower, and a target sized against the worse number is never too tight.
+    round_trip_cost_rate: Fraction = Decimal("0.0011")
     max_stop_loss_pct: Fraction = Decimal("0.20")
     max_leverage: Annotated[Decimal, Field(ge=Decimal("1"), le=Decimal("20"))] = Decimal("1")
     require_stop_loss: bool = True
@@ -364,6 +372,28 @@ class RiskSettings(BaseModel):
     #: Bars a passive entry may rest before it is abandoned. A setup that never filled is
     #: missed, not pending; an unbounded resting order can fill on an expired signal.
     entry_limit_max_bars: int = 3
+
+    #: How long a losing symbol/side is held back from being re-entered on the same case.
+    #:
+    #: Not a ban. After a stop-out the thesis has been tested and failed, and the same
+    #: strategy re-firing on unchanged evidence is paying twice for one opinion. Measured
+    #: on 2026-08-17: momentum_roc was stopped out of WLD for -235, then placed seven
+    #: further WLD buys inside four hours, two of which filled, and WLD became the single
+    #: largest loss in the session.
+    #:
+    #: Four bars at 15m. Long enough that the structure which produced the stop has to
+    #: actually change, short enough that a genuine new setup later in the session is not
+    #: lost.
+    thesis_cooldown_minutes: int = 60
+
+    #: How much better a candidate must score to re-enter inside the cooldown.
+    #:
+    #: The cooldown is not absolute, because sometimes the market really does turn straight
+    #: after taking someone out. What it refuses is re-entry on evidence no stronger than
+    #: the evidence that just failed. Expressed against the orchestrator's score, whose
+    #: selected candidates span roughly 0.53-0.74, so 0.03 is a material move in that
+    #: distribution rather than noise.
+    thesis_score_improvement: Decimal = Decimal("0.03")
     max_order_notional: PositiveDecimal = Decimal("5000")
     min_order_notional: PositiveDecimal = Decimal("10")
     max_orders_per_minute: int = Field(default=10, ge=1, le=600)
@@ -521,7 +551,11 @@ class Settings(BaseSettings):
     log_format: Literal["console", "json"] = "console"
 
     # --- api ---
-    api_host: str = "0.0.0.0"  # noqa: S104 — bound inside a container network
+    #: Loopback by default. Several routers return account data - balance, positions,
+    #: orders, PnL - with no authentication outside production-like environments, so a
+    #: public bind would publish the account. The container overrides this on its command
+    #: line, where the port is the boundary; a bare `make api` should not.
+    api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=1, le=65535)
     api_workers: int = Field(default=1, ge=1, le=32)
     api_prefix: str = "/api/v1"

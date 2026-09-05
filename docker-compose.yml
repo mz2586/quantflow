@@ -101,6 +101,14 @@ services:
 
   api:
     <<: *app-base
+    # The dashboard's decision-engine panel reads the orchestrator's structured log, which
+    # the engine writes on the host. Read-only, and additive: a service-level `volumes:`
+    # replaces the anchor's list rather than extending it, so the two named volumes from
+    # x-app-base are repeated here deliberately.
+    volumes:
+      - qf-data:/app/data
+      - qf-reports:/app/reports
+      - ./scratchpad:/app/scratchpad:ro
     command:
       - uvicorn
       - quantflow.api.app:create_app

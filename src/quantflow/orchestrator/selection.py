@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from quantflow.core.precision import ZERO
+from quantflow.orchestrator.scoring import SOLO_FAMILY_MIN_NET_EDGE
 
 #: Independent information sources that must agree before an entry is allowed.
 #:
@@ -155,6 +156,12 @@ class SelectionInputs:
     #: ever offer one opinion, and the honest response is to judge that opinion on its own
     #: merits, not to refuse every trade forever.
     available_families: int = MIN_INDEPENDENT_FAMILIES
+    #: Expected edge after round-trip costs, when it could be measured.
+    #:
+    #: Lets a strong lone opinion stand in for the missing second family — see
+    #: :data:`~quantflow.orchestrator.scoring.SOLO_FAMILY_MIN_NET_EDGE`. ``None`` means the
+    #: edge is unknown, and an unknown edge never buys a waiver.
+    net_edge: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +170,9 @@ class SelectionVerdict:
 
     accepted: bool
     score: Decimal
+    #: When refused, every objection. When accepted, any waiver that let it through — so a
+    #: trade taken on one family's opinion says so in the decision log rather than being
+    #: indistinguishable from a corroborated one.
     reasons: tuple[str, ...] = field(default_factory=tuple)
 
 
@@ -174,13 +184,30 @@ def assess_candidate(inputs: SelectionInputs) -> SelectionVerdict:
     the next on the following bar.
     """
     reasons: list[str] = []
+    waivers: list[str] = []
 
     required = min(MIN_INDEPENDENT_FAMILIES, max(1, inputs.available_families))
     if inputs.agreeing_families < required:
-        reasons.append(
-            f"confluence {inputs.agreeing_families} below the "
-            f"{required} independent families required"
-        )
+        # A lone family may still carry the trade, but only by paying for the corroboration
+        # it lacks: twice the ordinary edge floor. Everything else about the candidate has
+        # already been established upstream — reward:risk, a valid stop and target,
+        # liquidity, and an edge past the floor — so what is missing here is a second
+        # opinion, not soundness. An unmeasurable edge buys nothing.
+        edge = inputs.net_edge
+        if edge is not None and edge >= SOLO_FAMILY_MIN_NET_EDGE:
+            # Recorded as a waiver, NOT as a reason: `reasons` is what refuses a candidate,
+            # and appending here would reject the very trade being allowed through.
+            waivers.append(
+                f"confluence waived on {inputs.agreeing_families} family: net edge "
+                f"{edge:.4%} clears the {SOLO_FAMILY_MIN_NET_EDGE:.4%} solo bar"
+            )
+        else:
+            observed = f"{edge:.4%}" if edge is not None else "unmeasured"
+            reasons.append(
+                f"confluence {inputs.agreeing_families} below the "
+                f"{required} independent families required, and net edge {observed} "
+                f"does not reach the {SOLO_FAMILY_MIN_NET_EDGE:.4%} solo bar"
+            )
 
     # Expectancy vetoes only on a sample large enough to mean something.
     expectancy = ZERO
@@ -210,9 +237,11 @@ def assess_candidate(inputs: SelectionInputs) -> SelectionVerdict:
     # Score the survivors. Confluence beyond the minimum and demonstrated expectancy in
     # this regime both raise it; correlation with the book lowers it, so that between two
     # otherwise equal candidates the more diversifying one wins.
+    # A waived candidate scores BELOW a corroborated one: the bonus is negative when only
+    # one family agreed. It is allowed to compete, not promoted to the front of the queue.
     confluence_bonus = Decimal(inputs.agreeing_families - MIN_INDEPENDENT_FAMILIES)
     score = Decimal("1") + confluence_bonus + expectancy - inputs.max_correlation
-    return SelectionVerdict(accepted=True, score=score)
+    return SelectionVerdict(accepted=True, score=score, reasons=tuple(waivers))
 
 
 __all__ = [

@@ -23,9 +23,24 @@ class Balance:
     locked: Decimal = ZERO
 
     def __post_init__(self) -> None:
-        """Validate the balance."""
-        if self.free < ZERO or self.locked < ZERO:
-            raise ValidationError(f"negative balance for {self.asset}")
+        """Validate the balance.
+
+        ``free`` may legitimately be negative and is not validated. On a cross-margin
+        Unified account the venue allocates margin across every collateral asset, so one
+        asset's margin can exceed its own equity while the account as a whole is healthy:
+        measured 2026-08-17, USDT equity 49,182 against 52,134 of initial margin, giving a
+        free balance of -2,951 with USDC, BTC and ETH covering the difference.
+
+        Rejecting that took out the whole venue read, and the dashboard served a seven-hour-
+        old snapshot of the wallet and positions — showing a closed position as open and
+        omitting two live ones. A negative free balance is information about margin usage,
+        not a malformed payload.
+
+        ``locked`` is still validated: it is a quantity held against open orders, and a
+        negative one has no meaning in any margin mode.
+        """
+        if self.locked < ZERO:
+            raise ValidationError(f"negative locked balance for {self.asset}")
 
     @property
     def total(self) -> Decimal:

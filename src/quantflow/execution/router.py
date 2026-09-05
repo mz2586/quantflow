@@ -151,6 +151,49 @@ class LiveOrderRouter:
         """Nothing. A real venue reports its own fills; bars do not create them here."""
         return ()
 
+    async def sync_open_orders(self) -> None:
+        """Make local order state equal the venue's, dropping what it no longer holds.
+
+        :meth:`submit` records an order once, at submission, and nothing updates it
+        afterwards. A post-only entry that rests and *later* fills is therefore still
+        remembered here as NEW forever — the venue told the fill to the reconciliation
+        loop, not to this map.
+
+        That stale entry is not cosmetic: :func:`~quantflow.risk.exposure.resting_entry_notional`
+        reads this map, so a phantom order is charged against the position and exposure
+        caps for the rest of the session. Measured 2026-08-18 at 03:00 — the venue held
+        zero open orders while this map still carried ~8,670 of ETH, and every candidate
+        for four hours was refused with "would reach 35.35% of equity, above the 20.00%
+        limit (open 0, resting 8670.62, this order 8667.19)". The engine had selected
+        thirty-two candidates and placed none.
+
+        Never raises: a failed read leaves the map as it was, which is the pre-existing
+        behaviour rather than a new failure mode.
+        """
+        fetch = getattr(self._gateway, "fetch_open_orders", None)
+        if fetch is None:
+            return
+        try:
+            live = {order.order_id: order for order in await fetch()}
+        except Exception as exc:
+            logger.warning("router.order_sync_failed", error=str(exc)[:160])
+            return
+        dropped = [
+            order_id
+            for order_id, order in self._orders.items()
+            if not order.status.is_terminal and order_id not in live
+        ]
+        for order_id in dropped:
+            self._orders.pop(order_id, None)
+        self._orders.update(live)
+        if dropped:
+            logger.info(
+                "router.orders_synced",
+                dropped=len(dropped),
+                live=len(live),
+                reason="the venue no longer holds these orders",
+            )
+
     def open_orders(self, symbol: object | None = None) -> Sequence[Order]:
         """Orders submitted through this router that are not yet terminal."""
         return [

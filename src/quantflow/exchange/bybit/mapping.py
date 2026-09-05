@@ -18,6 +18,8 @@ Bybit V5 differs from other venues in ways that matter here:
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -32,6 +34,7 @@ from quantflow.core.errors import (
     InsufficientFundsError,
     InvalidSymbolError,
     OrderRejectedError,
+    ProductAgreementRequiredError,
     RateLimitError,
 )
 from quantflow.core.precision import ZERO, step_from_precision, to_decimal
@@ -269,7 +272,49 @@ def parse_instrument(market: dict[str, Any]) -> Instrument | None:
         max_leverage=_decimal_or((limits.get("leverage") or {}).get("max"), Decimal("1")),
         contract_size=_decimal_or(market.get("contractSize"), Decimal("1")),
         active=bool(market.get("active", True)),
+        venue_symbol_type=_venue_symbol_type(market),
+        funding_interval_minutes=_funding_interval_minutes(market),
     )
+
+
+def _venue_symbol_type(market: dict[str, Any]) -> str:
+    """Read Bybit's ``symbolType`` out of the raw payload.
+
+    This is what separates gold from a token and an equity from a coin. CCXT does not
+    normalise it into any of its own fields, so it is read from ``info`` verbatim and
+    passed through without interpretation - deciding what the label *means* belongs to
+    :mod:`quantflow.universe.assets`, not to the venue boundary.
+
+    Absent or malformed becomes the empty string, which is also Bybit's own value for
+    crypto markets and the correct answer for a venue with no such concept.
+    """
+    info = market.get("info")
+    if not isinstance(info, dict):
+        return ""
+    value = info.get("symbolType")
+    return str(value).strip() if value is not None else ""
+
+
+def _funding_interval_minutes(market: dict[str, Any]) -> int | None:
+    """Read the venue's funding settlement interval, in minutes.
+
+    Bybit states ``fundingInterval`` per instrument and the value genuinely varies - 240 on
+    metals against 480 on energy and equities - so the conventional 8-hour assumption is
+    wrong by a factor of two on half the non-crypto universe. ``None`` when the venue does
+    not report one, which is the honest answer for spot and for anything that does not
+    fund; a caller that assumed 8 hours there would invent a cost that is never charged.
+    """
+    info = market.get("info")
+    if not isinstance(info, dict):
+        return None
+    raw = info.get("fundingInterval")
+    if raw is None or raw == "":
+        return None
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError):  # a malformed venue field must not fail the load
+        return None
+    return interval if interval > 0 else None
 
 
 def _venue_filters(market: dict[str, Any]) -> dict[str, Decimal]:
@@ -463,6 +508,36 @@ def _conditional_metadata(raw: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Error translation
 # --------------------------------------------------------------------------- #
+#: Venue codes meaning "this account has not accepted the terms for this product".
+#:
+#: Verified live against ``api-demo.bybit.com`` on 2026-08-14 by placing an unfillable
+#: post-only limit on one symbol per class. They are separate agreements, not one:
+#: metals answer 110123, crude oil 110125, equities and index products 110126, and
+#: accepting any one of them leaves the other two refusing.
+#:
+#: Matched on the code rather than the message because the message is prose the venue is
+#: free to reword, and is localised.
+PRODUCT_AGREEMENT_RET_CODES: Mapping[str, str] = {
+    "110123": "commodity trading terms (metals)",
+    "110125": "crude oil trading terms (energy)",
+    "110126": "equity and index product agreement",
+}
+
+
+def _agreement_code(message: str) -> str | None:
+    """The unsigned-agreement code in a venue message, if it carries one.
+
+    CCXT embeds the raw V5 body in the exception text, so the code is read out of the
+    string. Narrow by construction: it matches the ``retCode`` field specifically, not a
+    bare number occurring anywhere in the message.
+    """
+    match = re.search(r'"retCode"\s*:\s*(\d+)', message)
+    if match is None:
+        return None
+    code = match.group(1)
+    return code if code in PRODUCT_AGREEMENT_RET_CODES else None
+
+
 def translate_exception(exc: BaseException) -> ExchangeError:  # noqa: PLR0911
     """Convert a CCXT exception into a QuantFlow error.
 
@@ -472,6 +547,17 @@ def translate_exception(exc: BaseException) -> ExchangeError:  # noqa: PLR0911
     """
     name = type(exc).__name__
     message = str(exc)
+
+    # Checked ahead of the class-name table: the venue sends this as a generic
+    # ``ExchangeError``, which would otherwise be indistinguishable from a transport
+    # failure and get retried forever against an account that can never accept the order.
+    agreement = _agreement_code(message)
+    if agreement is not None:
+        return ProductAgreementRequiredError(
+            f"venue requires the {PRODUCT_AGREEMENT_RET_CODES[agreement]} to be signed "
+            f"before this contract can be traded: {message}",
+            venue_error=agreement,
+        )
 
     if name in {"AuthenticationError", "PermissionDenied", "AccountSuspended"}:
         return ExchangeAuthenticationError(f"exchange rejected our credentials: {message}")

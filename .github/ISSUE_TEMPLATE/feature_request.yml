@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a change or addition
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you unable to do today? Describe the problem, not the solution.
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+    validations: { required: true }
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Compatibility with the project's rules
+      description: See CONTRIBUTING.md. These will be checked in review.
+      options:
+        - label: This does not add a bypass around the risk engine.
+          required: true
+        - label: This does not make live trading easier to reach by accident.
+          required: true
+        - label: This does not introduce `float` into the money path.
+          required: true

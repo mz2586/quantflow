@@ -1,148 +1,134 @@
 /**
- * QuantFlow dashboard.
+ * QuantFlow trading operations console.
  *
- * Two things drive the layout. First, **risk state is always visible** — the kill switch
- * and the halt indicator sit in the header, not behind a tab, because the moment you need
- * them is the moment you should not be navigating. Second, every number that could mislead
- * carries its caveat next to it: a win rate over eight trades is labelled as such.
+ * Four commitments shape this file.
+ *
+ * **The first screen answers the money questions.** Wallet, available, in-trades, profit,
+ * loss, fees, drawdown, open positions and whether the engine is trading — above the fold,
+ * in two rows, before anything else competes for attention. Everything analytical moved to
+ * its own tab, because a screen with twenty equally-weighted metrics answers nothing in
+ * five seconds.
+ *
+ * **It updates itself.** The API's websocket announces fills, risk events and equity
+ * updates; every announcement triggers a refresh, and short polling continues underneath
+ * regardless so a dropped socket degrades rather than blinding the operator. Nothing here
+ * requires a manual reload, and nothing renders a stale value as though it were live.
+ *
+ * **Sources are never blended.** The venue's account and QuantFlow's session accounting
+ * produce similar-looking numbers about different things. Each panel names its source, and
+ * where the two disagree the disagreement is shown rather than resolved silently.
+ *
+ * **One broken panel costs one panel.** Every panel is wrapped in an error boundary, every
+ * nullable field is typed optional, and every collection goes through `list()` before it
+ * is mapped. A throw during render unmounts React's whole tree, and a blank page during an
+ * incident is indistinguishable from a dead machine.
  */
 
-import { useCallback, useEffect, useState } from "react";
-import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from "recharts";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ApiError,
   api,
+  list,
   subscribe,
-  type CandlesResponse,
-  type PerformanceReview,
-  type Portfolio,
+  type AnalyticsResponse,
+  type AssetClassesResponse,
+  type DecisionsResponse,
+  type EquityResponse,
+  type FreshnessResponse,
+  type LedgerResponse,
+  type PnlResponse,
   type ReadinessResponse,
-  type RiskEvent,
-  type RiskStatus,
-  type LiveAccount,
-  type LiveFills,
-  type SeriesSummary,
-  type Session,
-  type StrategyDescription,
-  type Trade,
+  type Summary,
+  type VenuePosition,
 } from "./lib/api";
-import { ago, chartValue, money, percent, quantity, signed, time, tone } from "./lib/format";
+import { NOT_RECORDED, ago, clock, count, money, percent, signed, time, tone } from "./lib/format";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { Caution, Panel, Stat, Unavailable, Value } from "./components/ui";
+import {
+  CumulativePnlChart,
+  DrawdownChart,
+  EquityChart,
+  LongShortChart,
+  PnlChart,
+  type PnlMode,
+} from "./components/charts";
+import {
+  AnalyticsPanels,
+  AssetClassesPanel,
+  DecisionsPanel,
+  FeesPanel,
+  FreshnessPanel,
+  OrdersPanel,
+  PositionsPanel,
+  TradeLedgerPanel,
+  VenueAccountPanel,
+} from "./components/panels";
+import {
+  ExecutiveSummary,
+  HealthStrip,
+  PnlSection,
+  TradingStatusPanel,
+  UniverseStrip,
+} from "./components/executive";
 
-const POLL_INTERVAL_MS = 5_000;
+/** Fast poll: venue account, positions, orders, status, decision counters. */
+const FAST_POLL_MS = 5_000;
 
-/**
- * Coerce an API collection to an array before rendering.
- *
- * The difference between one empty panel and a blank page: `.map` and `.length` on
- * `undefined` throw, and a throw during render unmounts the entire tree. An API that
- * omits a field, or returns an object where a list was expected, must cost one panel.
- */
-function list<T>(value: readonly T[] | null | undefined): readonly T[] {
-  return Array.isArray(value) ? (value as readonly T[]) : [];
-}
+/** Slow poll: the ledger, analytics and charts, which move at trade frequency. */
+const SLOW_POLL_MS = 20_000;
 
-function Panel({
-  title,
-  subtitle,
-  children,
-  action,
-}: {
-  title: string;
-  subtitle?: string;
-  children: React.ReactNode;
-  action?: React.ReactNode;
-}) {
-  return (
-    <section className="rounded-lg border border-zinc-800 bg-zinc-900/60">
-      <header className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5">
-        <div>
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-400">{title}</h2>
-          {subtitle ? <p className="mt-0.5 text-[11px] text-zinc-500">{subtitle}</p> : null}
-        </div>
-        {action}
-      </header>
-      {/* Per-panel containment: a malformed payload costs this panel, not the page. */}
-      <div className="p-4">
-        <ErrorBoundary label={title}>{children}</ErrorBoundary>
-      </div>
-    </section>
-  );
-}
+const EQUITY_RANGES = ["1H", "6H", "24H", "7D", "30D", "ALL"] as const;
 
-function Stat({
-  label,
-  value,
-  valueClass = "",
-  hint,
-}: {
-  label: string;
-  value: string;
-  valueClass?: string;
-  hint?: string;
-}) {
-  return (
-    <div>
-      <div className="text-[11px] uppercase tracking-wider text-zinc-500">{label}</div>
-      <div className={`mt-0.5 font-mono text-lg tabular-nums ${valueClass}`}>{value}</div>
-      {hint ? <div className="text-[11px] text-zinc-600">{hint}</div> : null}
-    </div>
-  );
-}
+type Tab = "overview" | "trades" | "analytics" | "diagnostics";
 
-function Empty({ message }: { message: string }) {
-  return <p className="py-6 text-center text-sm text-zinc-500">{message}</p>;
-}
+const TABS: { key: Tab; label: string }[] = [
+  { key: "overview", label: "Overview" },
+  { key: "trades", label: "Trades" },
+  { key: "analytics", label: "Analytics" },
+  { key: "diagnostics", label: "Diagnostics" },
+];
 
-/** The header. Risk state is deliberately the most prominent thing on the page. */
 function Header({
+  summary,
   readiness,
-  risk,
-  session,
-  account,
   connected,
+  lastUpdate,
+  tab,
+  onTab,
   onToggleKillSwitch,
   busy,
 }: {
+  summary: Summary | null;
   readiness: ReadinessResponse | null;
-  risk: RiskStatus | null;
-  session: Session | null;
-  account: LiveAccount | null;
   connected: boolean;
+  lastUpdate: string | null;
+  tab: Tab;
+  onTab: (next: Tab) => void;
   onToggleKillSwitch: () => void;
   busy: boolean;
 }) {
-  const engaged = risk?.kill_switch?.engaged ?? false;
-  const halted = risk?.trading_halted ?? false;
-  // The venue the orders actually reach, not the API process's own configured mode.
-  // Those disagree — the API can be configured `paper` while a live session trades a
-  // demo venue — and the badge that says whether the money is real must follow the venue.
-  const venueEnv = account?.network ?? null;
-  const isDemo = venueEnv === "demo";
-  const isMainnet = venueEnv === "mainnet";
+  const engaged = summary?.risk?.kill_switch_engaged ?? false;
+  const halted = summary?.risk?.trading_halted ?? false;
+  const session = summary?.session;
+  // The venue the orders actually reach, not the API process's configured mode: those
+  // disagree here — the API is configured `paper` while a live session trades a demo
+  // venue — and the badge that says whether the money is real must follow the venue.
+  const network = summary?.venue?.network ?? null;
+  const isDemo = network === "demo";
+  const isMainnet = network === "mainnet";
 
   return (
-    <header className="sticky top-0 z-10 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur">
-      <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3">
+    <header className="sticky top-0 z-20 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur">
+      <div className="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-5 gap-y-2 px-4 py-2.5">
         <h1 className="text-sm font-semibold tracking-tight">QuantFlow</h1>
 
         <span
-          className={`rounded px-2 py-0.5 text-[11px] uppercase tracking-wider ${
+          className={`rounded px-2 py-0.5 text-[10px] uppercase tracking-wider ring-1 ${
             isMainnet
-              ? "bg-rose-500/20 text-rose-300 ring-1 ring-rose-500/40"
+              ? "bg-[#d03b3b]/20 text-[#d03b3b] ring-[#d03b3b]/40"
               : isDemo
-                ? "bg-amber-500/15 text-amber-300 ring-1 ring-amber-500/30"
-                : "bg-zinc-800 text-zinc-300"
+                ? "bg-[#fab219]/15 text-[#fab219] ring-[#fab219]/30"
+                : "bg-zinc-800 text-zinc-300 ring-zinc-700"
           }`}
           title={
             isDemo
@@ -152,57 +138,63 @@ function Header({
                 : undefined
           }
         >
-          {isDemo
-            ? "Demo · virtual funds"
-            : isMainnet
-              ? "Mainnet · real money"
-              : (venueEnv ?? readiness?.trading_mode ?? "…")}
+          {isDemo ? "Demo · virtual funds" : isMainnet ? "Mainnet · REAL MONEY" : (network ?? "venue …")}
         </span>
 
-        <span className="flex items-center gap-1.5 text-[11px] text-zinc-400">
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${
-              readiness?.ready ? "bg-emerald-400" : "bg-rose-400"
-            }`}
-          />
-          {readiness?.ready ? "systems ready" : "not ready"}
+        <nav className="flex gap-1">
+          {TABS.map((entry) => (
+            <button
+              key={entry.key}
+              type="button"
+              onClick={() => {
+                onTab(entry.key);
+              }}
+              className={`rounded px-2.5 py-1 text-xs transition ${
+                tab === entry.key
+                  ? "bg-zinc-700 text-zinc-100"
+                  : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              }`}
+            >
+              {entry.label}
+            </button>
+          ))}
+        </nav>
+
+        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-zinc-400">
+          <span className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-[#0ca30c]" : "bg-zinc-600"}`} />
+          {connected ? "live stream" : "polling"}
         </span>
 
-        <span className="flex items-center gap-1.5 text-[11px] text-zinc-500">
-          <span
-            className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-emerald-400" : "bg-zinc-600"}`}
-          />
-          {connected ? "live" : "polling"}
+        <span className="text-[10px] text-zinc-500">
+          updated <span className="font-mono text-zinc-300">{clock(lastUpdate)}</span>
         </span>
 
-        {/* Named explicitly: trades and attribution below are scoped to this run, and an
-            operator must never have to guess which numbers they are reading. */}
         {session ? (
           <span
-            className="truncate text-[11px] text-zinc-500"
-            title={`${session.strategy_id} · ${list(session.symbols).join(", ")} · ${session.timeframe}`}
+            className="truncate text-[10px] text-zinc-500"
+            title={`${session.strategy_id ?? ""} · ${list(session.symbols).join(", ")} · chosen because: ${session.selection_basis ?? "—"}`}
           >
             session <span className="text-zinc-300">{session.session_id}</span>
-            <span className="text-zinc-600"> · {session.status}</span>
+            <span className="text-zinc-600"> · {session.status} · {session.timeframe}</span>
           </span>
         ) : null}
 
         <div className="ml-auto flex items-center gap-3">
+          {!(readiness?.ready ?? true) ? (
+            <span className="rounded bg-[#fab219]/15 px-2 py-1 text-[10px] font-medium text-[#fab219]">
+              API not ready
+            </span>
+          ) : null}
           {halted && !engaged ? (
-            <span className="rounded bg-amber-500/15 px-2 py-1 text-[11px] font-medium text-amber-300">
+            <span className="rounded bg-[#fab219]/15 px-2 py-1 text-[10px] font-medium text-[#fab219]">
               trading halted for the day
             </span>
           ) : null}
-
           {engaged ? (
-            <span
-              className="rounded bg-rose-500/15 px-2 py-1 text-[11px] font-medium text-rose-300"
-              title={risk?.kill_switch?.reason ?? undefined}
-            >
+            <span className="rounded bg-[#d03b3b]/15 px-2 py-1 text-[10px] font-medium text-[#d03b3b]">
               KILL SWITCH ENGAGED
             </span>
           ) : null}
-
           <button
             type="button"
             onClick={onToggleKillSwitch}
@@ -210,7 +202,7 @@ function Header({
             className={`rounded px-3 py-1.5 text-xs font-medium transition disabled:opacity-40 ${
               engaged
                 ? "bg-zinc-700 text-zinc-100 hover:bg-zinc-600"
-                : "bg-rose-600 text-white hover:bg-rose-500"
+                : "bg-[#d03b3b] text-white hover:bg-[#e04b4b]"
             }`}
           >
             {engaged ? "Clear kill switch" : "Halt trading"}
@@ -221,131 +213,202 @@ function Header({
   );
 }
 
+/** Full detail for one open position, opened by clicking its row. */
+function PositionDrawer({
+  position,
+  asset,
+  onClose,
+}: {
+  position: VenuePosition;
+  asset: string;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-30 flex justify-end bg-black/50" onClick={onClose}>
+      <aside
+        className="h-full w-full max-w-md overflow-y-auto border-l border-zinc-800 bg-zinc-950 p-5"
+        onClick={(event) => {
+          event.stopPropagation();
+        }}
+      >
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="font-mono text-lg text-zinc-100">{position.symbol}</h2>
+            <p className="mt-0.5 text-[10px] uppercase tracking-wider text-zinc-500">
+              {asset} · {position.side} · opened {time(position.opened_at)}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded bg-zinc-800 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-700"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-4">
+          <Stat label="Quantity" value={position.quantity ?? NOT_RECORDED} />
+          <Stat label="Leverage" value={position.leverage ?? NOT_RECORDED} />
+          <Stat label="Entry price" value={money(position.entry_price)} />
+          <Stat label="Mark price" value={money(position.mark_price)} />
+          <Stat label="Position value" value={money(position.notional_usdt)} />
+          <Stat
+            label="Unrealised PnL"
+            value={signed(position.unrealized_pnl)}
+            valueClass={tone(position.unrealized_pnl)}
+            emphasis
+          />
+        </div>
+
+        <h3 className="mt-6 text-[10px] uppercase tracking-wider text-zinc-500">Protection</h3>
+        <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-4">
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-zinc-500">Stop</div>
+            <div className="mt-0.5 font-mono text-lg">
+              {position.venue_stop_loss ? (
+                money(position.venue_stop_loss)
+              ) : (
+                <span className="text-sm uppercase text-[#d03b3b]">none at venue</span>
+              )}
+            </div>
+          </div>
+          <div>
+            <div className="text-[10px] uppercase tracking-wider text-zinc-500">Target</div>
+            <div className="mt-0.5 font-mono text-lg">
+              <Value value={position.venue_take_profit} why="no target attached at the venue" />
+            </div>
+          </div>
+          <Stat label="Liquidation" value={money(position.liquidation_price)} />
+          <Stat label="Margin mode" value={position.margin_mode ?? NOT_RECORDED} />
+        </div>
+
+        <h3 className="mt-6 text-[10px] uppercase tracking-wider text-zinc-500">Profit stage</h3>
+        <p className="mt-1 text-xs text-zinc-500">
+          <span className="uppercase text-zinc-600">{NOT_RECORDED}</span> — the intrabar
+          manager holds the stage, the net-profit-exit eligibility and the loser-exit state in
+          the engine process. No column persists them, so this drawer will not guess at one.
+        </p>
+
+        <p className="mt-6 text-[10px] text-zinc-600">
+          Every field above is read from the venue on each refresh. The venue is authoritative
+          for what is open; QuantFlow's own record is shown separately and reconciled.
+        </p>
+      </aside>
+    </div>
+  );
+}
+
 export default function App() {
+  const [tab, setTab] = useState<Tab>("overview");
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [lastSummaryAt, setLastSummaryAt] = useState<string | null>(null);
   const [readiness, setReadiness] = useState<ReadinessResponse | null>(null);
-  const [risk, setRisk] = useState<RiskStatus | null>(null);
-  const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
-  const [portfolioError, setPortfolioError] = useState<string | null>(null);
-  const [events, setEvents] = useState<RiskEvent[]>([]);
-  const [trades, setTrades] = useState<Trade[]>([]);
-  const [strategies, setStrategies] = useState<StrategyDescription[]>([]);
-  const [series, setSeries] = useState<SeriesSummary[]>([]);
-  const [candles, setCandles] = useState<CandlesResponse | null>(null);
-  const [selected, setSelected] = useState<string | null>(null);
-  const [review, setReview] = useState<PerformanceReview | null>(null);
-  const [session, setSession] = useState<Session | null>(null);
-  const [account, setAccount] = useState<LiveAccount | null>(null);
-  const [accountError, setAccountError] = useState<string | null>(null);
-  const [fills, setFills] = useState<LiveFills | null>(null);
+  const [equity, setEquity] = useState<EquityResponse | null>(null);
+  const [range, setRange] = useState<string>("24H");
+  const [pnl, setPnl] = useState<PnlResponse | null>(null);
+  const [period, setPeriod] = useState<string>("SESSION");
+  const [ledger, setLedger] = useState<LedgerResponse | null>(null);
+  const [analytics, setAnalytics] = useState<AnalyticsResponse | null>(null);
+  const [decisions, setDecisions] = useState<DecisionsResponse | null>(null);
+  const [freshness, setFreshness] = useState<FreshnessResponse | null>(null);
+  const [assetClasses, setAssetClasses] = useState<AssetClassesResponse | null>(null);
+  const [pnlMode, setPnlMode] = useState<PnlMode>("net");
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [banner, setBanner] = useState<string | null>(null);
+  const [selected, setSelected] = useState<VenuePosition | null>(null);
 
-  const refresh = useCallback(async () => {
-    const settle = async <T,>(promise: Promise<T>, apply: (value: T) => void) => {
-      try {
-        apply(await promise);
-      } catch {
-        // One failing panel must not blank the others; each keeps its last good data.
-      }
-    };
+  // Held in a ref so the websocket handler can coalesce bursts without being re-created
+  // on every render, which would tear down and rebuild the socket continuously.
+  const pending = useRef<number | undefined>(undefined);
 
-    // Resolved first, not in the fan-out: trades and the performance review are scoped to
-    // it, and an unscoped call falls back to a trailing window that hides older trades.
-    let current: Session | null = null;
+  const settle = useCallback(async <T,>(promise: Promise<T>, apply: (value: T) => void) => {
     try {
-      current = (await api.sessions())[0] ?? null;
-      setSession(current);
+      apply(await promise);
     } catch {
-      // Fall through unscoped rather than blanking the dashboard.
+      // One failing panel keeps its last good data rather than blanking the others.
     }
-    const sessionId = current?.session_id ?? null;
-
-    await Promise.all([
-      settle(api.readiness(), setReadiness),
-      settle(api.riskStatus(), setRisk),
-      settle(api.riskEvents(25, sessionId), setEvents),
-      settle(api.trades(200, sessionId), setTrades),
-      settle(api.strategies(), setStrategies),
-      settle(api.series(), setSeries),
-      settle(api.review(365, sessionId), setReview),
-      settle(api.accountFills("BTC/USDT", 25), setFills),
-      (async () => {
-        try {
-          setAccount(await api.account());
-          setAccountError(null);
-        } catch (error) {
-          // Never fall back to stored paper state: a live balance that is silently a
-          // backtest number is worse than an error.
-          setAccount(null);
-          setAccountError(
-            error instanceof ApiError ? error.message : "live account unavailable",
-          );
-        }
-      })(),
-      (async () => {
-        try {
-          setPortfolio(await api.portfolio());
-          setPortfolioError(null);
-        } catch (error) {
-          // Expected when no session is running: say so plainly rather than showing
-          // a portfolio of zeros that reads as a flat account.
-          setPortfolio(null);
-          setPortfolioError(
-            error instanceof ApiError ? error.message : "portfolio unavailable",
-          );
-        }
-      })(),
-    ]);
   }, []);
 
+  const refreshFast = useCallback(async () => {
+    await Promise.all([
+      (async () => {
+        try {
+          const next = await api.summary();
+          setSummary(next);
+          setSummaryError(null);
+          setLastSummaryAt(next.generated_at ?? new Date().toISOString());
+        } catch (error) {
+          // The previous summary is deliberately kept on screen, marked stale by its own
+          // timestamp, rather than replaced with nothing.
+          setSummaryError(error instanceof ApiError ? error.message : "summary unavailable");
+        }
+      })(),
+      settle(api.decisions(80), setDecisions),
+      settle(api.freshness(), setFreshness),
+      settle(api.readiness(), setReadiness),
+    ]);
+  }, [settle]);
+
+  const refreshSlow = useCallback(async () => {
+    await Promise.all([
+      settle(api.trades(200), setLedger),
+      settle(api.analytics(), setAnalytics),
+      settle(api.assetClasses(), setAssetClasses),
+    ]);
+  }, [settle]);
+
   useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => { window.clearInterval(timer); };
-  }, [refresh]);
+    void refreshFast();
+    const timer = window.setInterval(() => void refreshFast(), FAST_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [refreshFast]);
+
+  useEffect(() => {
+    void refreshSlow();
+    const timer = window.setInterval(() => void refreshSlow(), SLOW_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [refreshSlow]);
+
+  useEffect(() => {
+    void settle(api.equity(range), setEquity);
+    const timer = window.setInterval(() => void settle(api.equity(range), setEquity), SLOW_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [range, settle]);
+
+  useEffect(() => {
+    void settle(api.pnl(range), setPnl);
+    const timer = window.setInterval(() => void settle(api.pnl(range), setPnl), SLOW_POLL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [range, settle]);
 
   useEffect(() => {
     // The websocket is a latency improvement, not the source of truth: polling continues
-    // regardless, so a dropped socket degrades rather than blinding the operator.
-    return subscribe(
-      (channel) => {
-        if (channel === "fills" || channel === "risk" || channel === "equity") {
-          void refresh();
-        }
-      },
-      setConnected,
-    );
-  }, [refresh]);
-
-  useEffect(() => {
-    if (selected) return;
-    // Prefer a symbol the running session actually trades. `series[0]` is whatever sorts
-    // first, which in practice is a daily series from an unrelated backfill - it cannot
-    // move intraday, so the chart reads as frozen while the session is running fine.
-    const sessionSymbol = list(session?.symbols).find((symbol) =>
-      list(series).some((item) => item.symbol === symbol),
-    );
-    const first = sessionSymbol ?? list(series)[0]?.symbol;
-    if (first) setSelected(first);
-  }, [series, selected, session]);
-
-  useEffect(() => {
-    if (!selected) return;
-    // Match the session's timeframe when that series exists, so the chart and the engine
-    // are looking at the same bars. Falls back to whatever is stored for the symbol.
-    const entry =
-      list(series).find(
-        (item) => item.symbol === selected && item.timeframe === session?.timeframe,
-      ) ?? list(series).find((item) => item.symbol === selected);
-    void api
-      .candles(selected, entry?.timeframe ?? "1h", 300)
-      .then(setCandles)
-      .catch(() => { setCandles(null); });
-  }, [selected, series, session]);
+    // regardless, so a dropped socket degrades rather than blinding the operator. Bursts
+    // are coalesced — a flurry of fills should cost one refresh, not twenty.
+    return subscribe((channel) => {
+      if (!["fills", "risk", "equity", "signals", "system"].includes(channel)) return;
+      if (pending.current !== undefined) return;
+      pending.current = window.setTimeout(() => {
+        pending.current = undefined;
+        void refreshFast();
+        void refreshSlow();
+      }, 400);
+    }, setConnected);
+  }, [refreshFast, refreshSlow]);
 
   const toggleKillSwitch = useCallback(async () => {
-    const engaged = risk?.kill_switch?.engaged ?? false;
+    const engaged = summary?.risk?.kill_switch_engaged ?? false;
     let reason = "";
     if (!engaged) {
       // A halt with no recorded cause is close to useless in the post-mortem, so the
@@ -358,536 +421,304 @@ export default function App() {
     try {
       await api.setKillSwitch(!engaged, reason);
       setBanner(engaged ? "Kill switch cleared." : "Kill switch engaged.");
-      await refresh();
+      await refreshFast();
     } catch (error) {
       setBanner(error instanceof ApiError ? error.message : "request failed");
     } finally {
       setBusy(false);
-      window.setTimeout(() => { setBanner(null); }, 6000);
+      window.setTimeout(() => {
+        setBanner(null);
+      }, 6000);
     }
-  }, [risk, refresh]);
+  }, [summary, refreshFast]);
 
-  const equityCurve = list(trades)
-    .slice()
-    .sort((a, b) => (a.exit_time ?? "").localeCompare(b.exit_time ?? ""))
-    .reduce<{ time: string; pnl: number }[]>((accumulated, trade) => {
-      const previous = accumulated.at(-1)?.pnl ?? 0;
-      accumulated.push({
-        time: time(trade.exit_time),
-        pnl: previous + chartValue(trade.net_pnl),
-      });
-      return accumulated;
-    }, []);
+  const trades = list(ledger?.trades);
+  const points = list(equity?.points);
+  const openPositions = summary?.venue?.position_count ?? null;
 
-  const priceSeries = list(candles?.candles).map((candle) => ({
-    time: time(candle.open_time),
-    close: chartValue(candle.close),
-  }));
+  // The engine's own classification, so a position row is labelled with the class the
+  // engine actually assigned rather than one the browser guessed from the ticker.
+  const assetFor = useMemo(() => {
+    const index = new Map<string, string>();
+    for (const row of list(assetClasses?.asset_classes)) {
+      for (const symbol of list(row.symbols)) {
+          index.set(symbol, row.asset_class ?? "—");
+      }
+    }
+    return (symbol: string) => index.get(symbol.split(":")[0] ?? symbol) ?? "—";
+  }, [assetClasses]);
+
+  const rangeButtons = (
+    <div className="flex gap-1">
+      {EQUITY_RANGES.map((entry) => (
+        <button
+          key={entry}
+          type="button"
+          onClick={() => {
+            setRange(entry);
+          }}
+          className={`rounded px-1.5 py-0.5 text-[10px] ${
+            range === entry
+              ? "bg-zinc-700 text-zinc-100"
+              : "bg-zinc-800/60 text-zinc-400 hover:bg-zinc-700"
+          }`}
+        >
+          {entry}
+        </button>
+      ))}
+    </div>
+  );
 
   return (
     <div className="min-h-full bg-zinc-950 text-zinc-100">
       <ErrorBoundary label="Header">
         <Header
+          summary={summary}
           readiness={readiness}
-          risk={risk}
-          session={session}
-          account={account}
           connected={connected}
+          lastUpdate={lastSummaryAt}
+          tab={tab}
+          onTab={setTab}
           onToggleKillSwitch={() => void toggleKillSwitch()}
           busy={busy}
         />
       </ErrorBoundary>
 
-      <main className="mx-auto max-w-7xl space-y-4 px-4 py-5">
-        <Panel
-          title={
-            account
-              ? account.network === "demo"
-                ? `${(account.venue ?? "venue").toUpperCase()} demo account — virtual funds`
-                : account.network === "mainnet"
-                  ? `${(account.venue ?? "venue").toUpperCase()} MAINNET account — REAL MONEY`
-                  : `${(account.venue ?? "venue").toUpperCase()} ${account.network ?? ""} account`
-              : "Exchange account"
-          }
-          {...(account?.network === "demo"
-            ? {
-                subtitle:
-                  "Authoritative balance. Orders are real and fill on the venue; the funds are not.",
-              }
-            : {})}
-        >
-          {accountError ? (
-            <Empty message={`Not connected: ${accountError}`} />
-          ) : !account ? (
-            <Empty message="Loading live account…" />
-          ) : (
-            <>
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
-                <Stat label="Total balance" value={money(account.total_balance)} />
-                <Stat label="Available" value={money(account.available_balance)} />
+      <main className="mx-auto max-w-[1600px] space-y-4 px-4 py-4">
+        {banner ? (
+          <div className="rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm">{banner}</div>
+        ) : null}
+
+        {summaryError ? (
+          <Unavailable what="Live summary" error={summaryError} lastSuccessAt={lastSummaryAt} />
+        ) : null}
+
+        <ErrorBoundary label="Health">
+          <HealthStrip
+            summary={summary}
+            freshness={freshness}
+            connected={connected}
+            onOpen={() => {
+              setTab("diagnostics");
+            }}
+          />
+        </ErrorBoundary>
+
+        {tab === "overview" ? (
+          <>
+            <ErrorBoundary label="Executive summary">
+              <ExecutiveSummary summary={summary} />
+            </ErrorBoundary>
+
+            <ErrorBoundary label="Trading status">
+              <TradingStatusPanel summary={summary} decisions={decisions} />
+            </ErrorBoundary>
+
+            <ErrorBoundary label="Profit and loss">
+              <PnlSection
+                pnl={pnl}
+                period={period}
+                onPeriod={setPeriod}
+                chart={<CumulativePnlChart points={list(pnl?.cumulative?.points)} />}
+              />
+            </ErrorBoundary>
+
+            <Panel
+              title="Equity curve"
+              subtitle={equity?.history_note}
+              source="quantflow database — persisted equity snapshots"
+              action={rangeButtons}
+            >
+              <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-4">
+                <Stat label="Starting equity" value={money(summary?.session_equity?.starting_equity)} />
+                <Stat label="Current equity" value={money(summary?.session_equity?.latest_equity)} emphasis />
+                <Stat label="Peak" value={money(summary?.session_equity?.peak_equity)} />
                 <Stat
-                  label="Unrealised PnL"
-                  value={signed(account.unrealized_pnl)}
-                  valueClass={tone(account.unrealized_pnl)}
-                />
-                <Stat
-                  label="Realised PnL"
-                  value={fills ? signed(fills.realized_pnl) : "—"}
-                  valueClass={fills ? tone(fills.realized_pnl) : ""}
-                  {...(fills ? { hint: `fees ${money(fills.total_fees)}` } : {})}
-                />
-                <Stat
-                  label="Open orders"
-                  value={String(account.open_order_count ?? list(account.open_orders).length)}
+                  label="Current drawdown"
+                  value={percent(summary?.session_equity?.current_drawdown_pct, 3)}
+                  valueClass={tone(
+                    summary?.session_equity?.current_drawdown_pct
+                      ? `-${summary.session_equity.current_drawdown_pct}`
+                      : null,
+                  )}
                 />
               </div>
-
-              <div className="mt-4 grid gap-4 lg:grid-cols-2">
-                <div>
-                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Positions ({account.position_count ?? list(account.positions).length})
-                  </div>
-                  {list(account.positions).length === 0 ? (
-                    <p className="text-sm text-zinc-500">No open positions.</p>
-                  ) : (
-                    <table className="w-full text-sm">
-                      <tbody className="font-mono tabular-nums">
-                        {list(account.positions).map((position) => (
-                          <tr key={position.symbol} className="border-t border-zinc-800">
-                            <td className="py-1.5 font-sans">{position.symbol}</td>
-                            <td className="py-1.5">{position.side}</td>
-                            <td className="py-1.5 text-right">{quantity(position.quantity)}</td>
-                            <td className="py-1.5 text-right">{money(position.entry_price)}</td>
-                            <td
-                              className={`py-1.5 text-right ${tone(position.unrealized_pnl)}`}
-                            >
-                              {signed(position.unrealized_pnl)}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-
-                <div>
-                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Recent fills{fills ? ` (${fills.symbol}, ${fills.count})` : ""}
-                  </div>
-                  {list(fills?.fills).length === 0 ? (
-                    <p className="text-sm text-zinc-500">No fills on the venue.</p>
-                  ) : (
-                    <table className="w-full text-sm">
-                      <tbody className="font-mono tabular-nums">
-                        {list(fills?.fills).slice(0, 6).map((fill) => (
-                          <tr key={fill.fill_id} className="border-t border-zinc-800">
-                            <td className="py-1.5 font-sans">{time(fill.timestamp)}</td>
-                            <td className="py-1.5">{fill.side}</td>
-                            <td className="py-1.5 text-right">{quantity(fill.quantity)}</td>
-                            <td className="py-1.5 text-right">{money(fill.price)}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-
-              {list(account.open_orders).length > 0 ? (
-                <div className="mt-4">
-                  <div className="mb-1 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Working orders
-                    <span className="ml-2 normal-case tracking-normal text-zinc-600">
-                      a bracketed position has two: a stop and a target
-                    </span>
-                  </div>
-                  <table className="w-full text-sm">
-                    <tbody className="font-mono tabular-nums">
-                      {list(account.open_orders).map((order) => (
-                        <tr key={order.order_id} className="border-t border-zinc-800">
-                          <td className="py-1.5 font-sans">{order.symbol}</td>
-                          <td className="py-1.5 font-sans">
-                            {order.purpose === "stop_loss" ? (
-                              <span className="text-rose-300">stop</span>
-                            ) : order.purpose === "take_profit" ? (
-                              <span className="text-emerald-300">target</span>
-                            ) : (
-                              <span className="text-zinc-400">
-                                {order.side} {order.type}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-1.5 text-right">{quantity(order.quantity)}</td>
-                          <td className="py-1.5 text-right">
-                            {order.trigger_price
-                              ? `@ ${money(order.trigger_price)}`
-                              : order.price
-                                ? money(order.price)
-                                : "market"}
-                          </td>
-                          <td className="py-1.5 text-right text-zinc-500">
-                            {order.reduce_only ? "reduce-only" : ""}
-                          </td>
-                          <td className="py-1.5 text-right">{order.status}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+              {list(equity?.discontinuities).length > 0 ? (
+                <div className="mb-3">
+                  <Caution>
+                    This curve is not one continuous account.{" "}
+                    {list(equity?.discontinuities).map((entry) => (
+                      <span key={entry.at}>
+                        Equity stepped from {money(entry.from_equity)} to {money(entry.to_equity)} at{" "}
+                        {time(entry.at)} — {entry.likely_cause}
+                      </span>
+                    ))}{" "}
+                    A return measured across that break is meaningless.
+                  </Caution>
                 </div>
               ) : null}
-            </>
-          )}
-        </Panel>
-
-        {banner ? (
-          <div className="rounded border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm">
-            {banner}
-          </div>
-        ) : null}
-
-        {list(review?.warnings).length > 0 ? (
-          <div className="rounded border border-amber-500/30 bg-amber-500/10 px-4 py-3">
-            <h3 className="text-xs font-semibold uppercase tracking-wider text-amber-300">
-              Read before acting on these numbers
-            </h3>
-            <ul className="mt-2 space-y-1 text-sm text-amber-100/90">
-              {list(review?.warnings).map((warning) => (
-                <li key={warning}>• {warning}</li>
-              ))}
-            </ul>
-          </div>
-        ) : null}
-
-        <div className="grid gap-4 lg:grid-cols-3">
-          <div className="lg:col-span-2">
-            <Panel
-              title="Session book"
-              subtitle="This bot session's own accounting, starting from its configured equity — not the venue balance above."
-            >
-              {portfolio ? (
-                <>
-                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                    <Stat label="Equity" value={money(portfolio.equity, portfolio.base_currency)} />
-                    <Stat
-                      label="Return"
-                      value={percent(portfolio.total_return_pct)}
-                      valueClass={tone(portfolio.total_return_pct)}
-                    />
-                    <Stat
-                      label="Daily PnL"
-                      value={signed(portfolio.daily_pnl)}
-                      valueClass={tone(portfolio.daily_pnl)}
-                    />
-                    <Stat
-                      label="Drawdown"
-                      value={percent(portfolio.drawdown_pct)}
-                      valueClass={
-                        chartValue(portfolio.drawdown_pct) > 0.1 ? "text-rose-400" : ""
-                      }
-                    />
-                    <Stat label="Cash" value={money(portfolio.cash)} />
-                    <Stat label="Exposure" value={money(portfolio.gross_exposure)} />
-                    <Stat label="Leverage" value={`${chartValue(portfolio.leverage).toFixed(2)}x`} />
-                    <Stat label="Fees paid" value={money(portfolio.fees_paid)} />
-                  </div>
-
-                  <h3 className="mt-6 mb-2 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Open positions ({portfolio.position_count ?? list(portfolio.positions).length})
-                  </h3>
-                  {list(portfolio.positions).length === 0 ? (
-                    <Empty message="No open positions." />
-                  ) : (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="text-left text-[11px] uppercase tracking-wider text-zinc-500">
-                            <th className="pb-2">Symbol</th>
-                            <th className="pb-2">Side</th>
-                            <th className="pb-2 text-right">Qty</th>
-                            <th className="pb-2 text-right">Entry</th>
-                            <th className="pb-2 text-right">Mark</th>
-                            <th className="pb-2 text-right">Unrealised</th>
-                            <th className="pb-2 text-right">Stop</th>
-                          </tr>
-                        </thead>
-                        <tbody className="font-mono tabular-nums">
-                          {list(portfolio.positions).map((position) => (
-                            <tr key={position.symbol} className="border-t border-zinc-800">
-                              <td className="py-1.5 font-sans">{position.symbol}</td>
-                              <td className="py-1.5 font-sans uppercase">{position.side}</td>
-                              <td className="py-1.5 text-right">{quantity(position.quantity)}</td>
-                              <td className="py-1.5 text-right">
-                                {money(position.average_entry_price)}
-                              </td>
-                              <td className="py-1.5 text-right">{money(position.mark_price)}</td>
-                              <td
-                                className={`py-1.5 text-right ${tone(position.unrealized_pnl)}`}
-                              >
-                                {signed(position.unrealized_pnl)}
-                              </td>
-                              <td className="py-1.5 text-right">
-                                {position.stop_loss_price ? (
-                                  money(position.stop_loss_price)
-                                ) : (
-                                  <span className="text-rose-400">none</span>
-                                )}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </>
-              ) : (
-                <Empty message={portfolioError ?? "Loading…"} />
-              )}
+              <EquityChart points={points} historyNote={equity?.history_note} />
             </Panel>
-          </div>
 
-          <Panel title="Risk">
-            {risk ? (
-              <div className="space-y-3 text-sm">
-                <div className="flex items-center justify-between">
-                  <span className="text-zinc-400">Kill switch</span>
-                  <span
-                    className={risk.kill_switch?.engaged ? "text-rose-400" : "text-emerald-400"}
-                  >
-                    {risk.kill_switch?.engaged ? "ENGAGED" : "clear"}
-                  </span>
-                </div>
-                {risk.kill_switch?.reason ? (
-                  <p className="rounded bg-zinc-800/60 px-2 py-1.5 text-xs text-zinc-300">
-                    {risk.kill_switch.reason}
-                    {risk.kill_switch.engaged_by ? ` — ${risk.kill_switch.engaged_by}` : ""}
-                  </p>
-                ) : null}
-                <div className="flex items-center justify-between">
-                  <span className="text-zinc-400">Trading halted</span>
-                  <span className={risk.trading_halted ? "text-amber-400" : "text-zinc-300"}>
-                    {risk.trading_halted ? "yes" : "no"}
-                  </span>
-                </div>
+            <ErrorBoundary label="Positions">
+              <PositionsPanel summary={summary} assetFor={assetFor} onSelect={setSelected} />
+            </ErrorBoundary>
 
-                <div className="border-t border-zinc-800 pt-3">
-                  <div className="mb-2 text-[11px] uppercase tracking-wider text-zinc-500">
-                    Limits
-                  </div>
-                  <dl className="space-y-1 font-mono text-xs tabular-nums">
-                    <div className="flex justify-between">
-                      <dt className="font-sans text-zinc-400">Max position</dt>
-                      <dd>{percent(risk.limits?.max_position_pct, 0)}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt className="font-sans text-zinc-400">Max exposure</dt>
-                      <dd>{percent(risk.limits?.max_total_exposure_pct, 0)}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt className="font-sans text-zinc-400">Daily loss</dt>
-                      <dd>{percent(risk.limits?.max_daily_loss_pct, 0)}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt className="font-sans text-zinc-400">Max drawdown</dt>
-                      <dd>{percent(risk.limits?.max_drawdown_pct, 0)}</dd>
-                    </div>
-                    <div className="flex justify-between">
-                      <dt className="font-sans text-zinc-400">Stop required</dt>
-                      <dd className={risk.limits?.require_stop_loss ? "" : "text-rose-400"}>
-                        {risk.limits?.require_stop_loss ? "yes" : "NO"}
-                      </dd>
-                    </div>
-                  </dl>
-                </div>
+            <ErrorBoundary label="Universe">
+              <UniverseStrip classes={assetClasses} summary={summary} />
+            </ErrorBoundary>
+          </>
+        ) : null}
 
-                <div className="border-t border-zinc-800 pt-2 text-[11px] text-zinc-500">
-                  {risk.rules?.length ?? 0} rules active · sizer {risk.sizer ?? "—"}
-                </div>
+        {tab === "trades" ? (
+          <>
+            {ledger?.coverage?.has_gap ? <Caution>{ledger.coverage.note}</Caution> : null}
+            <TradeLedgerPanel ledger={ledger} />
+            <OrdersPanel summary={summary} />
+          </>
+        ) : null}
+
+        {tab === "analytics" ? (
+          <>
+            <ErrorBoundary label="Analytics">
+              <div className="grid gap-4 xl:grid-cols-2">
+                <AnalyticsPanels analytics={analytics} />
               </div>
-            ) : (
-              <Empty message="Loading…" />
-            )}
-          </Panel>
-        </div>
+            </ErrorBoundary>
 
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Panel
-            title="Price"
-            action={
-              <select
-                value={selected ?? ""}
-                onChange={(event) => { setSelected(event.target.value); }}
-                className="rounded border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs"
+            <div className="grid gap-4 xl:grid-cols-2">
+              <Panel
+                title="Drawdown"
+                subtitle="Derived from the session's own equity snapshots — never from a cross-asset balance."
+                source="quantflow database — persisted equity snapshots"
+                action={rangeButtons}
               >
-                {list(series).map((entry) => (
-                  <option key={`${entry.symbol}-${entry.timeframe}`} value={entry.symbol}>
-                    {entry.symbol} {entry.timeframe}
-                  </option>
-                ))}
-              </select>
-            }
-          >
-            {priceSeries.length === 0 ? (
-              <Empty message="No stored market data. Run a download first." />
-            ) : (
-              <>
-                {candles && candles.gaps > 0 ? (
-                  <p className="mb-2 text-xs text-amber-400">
-                    {candles.gaps} bars missing from this range — the chart has holes.
-                  </p>
-                ) : null}
-                <ResponsiveContainer width="100%" height={220}>
-                  <LineChart data={priceSeries}>
-                    <CartesianGrid stroke="#27272a" vertical={false} />
-                    <XAxis dataKey="time" hide />
-                    <YAxis
-                      domain={["auto", "auto"]}
-                      tick={{ fill: "#71717a", fontSize: 11 }}
-                      width={70}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        background: "#18181b",
-                        border: "1px solid #3f3f46",
-                        borderRadius: 6,
-                        fontSize: 12,
-                      }}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="close"
-                      stroke="#60a5fa"
-                      dot={false}
-                      strokeWidth={1.5}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </>
-            )}
-          </Panel>
+                <DrawdownChart points={points} />
+              </Panel>
 
-          <Panel title="Cumulative realised PnL">
-            {equityCurve.length === 0 ? (
-              <Empty message="No closed trades yet." />
-            ) : (
-              <ResponsiveContainer width="100%" height={220}>
-                <AreaChart data={equityCurve}>
-                  <CartesianGrid stroke="#27272a" vertical={false} />
-                  <XAxis dataKey="time" hide />
-                  <YAxis tick={{ fill: "#71717a", fontSize: 11 }} width={70} />
-                  <Tooltip
-                    contentStyle={{
-                      background: "#18181b",
-                      border: "1px solid #3f3f46",
-                      borderRadius: 6,
-                      fontSize: 12,
-                    }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="pnl"
-                    stroke="#34d399"
-                    fill="#34d39922"
-                    strokeWidth={1.5}
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            )}
-          </Panel>
-        </div>
-
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Panel title="Recent risk events">
-            {list(events).length === 0 ? (
-              <Empty message="No risk events recorded." />
-            ) : (
-              <ul className="space-y-2">
-                {list(events).slice(0, 8).map((event, index) => (
-                  <li
-                    key={`${event.created_at}-${index}`}
-                    className="border-l-2 border-zinc-700 pl-3 text-sm"
-                  >
-                    <div className="flex items-baseline justify-between gap-2">
-                      <span
-                        className={
-                          event.halted_trading
-                            ? "font-medium text-rose-400"
-                            : "font-medium text-amber-400"
-                        }
+              <Panel
+                title="Cumulative realised PnL (from the ledger)"
+                source="quantflow database — reconciled closed trades"
+                action={
+                  <div className="flex gap-1">
+                    {(["net", "gross", "fees"] as const).map((entry) => (
+                      <button
+                        key={entry}
+                        type="button"
+                        onClick={() => {
+                          setPnlMode(entry);
+                        }}
+                        className={`rounded px-1.5 py-0.5 text-[10px] uppercase ${
+                          pnlMode === entry
+                            ? "bg-zinc-700 text-zinc-100"
+                            : "bg-zinc-800/60 text-zinc-400 hover:bg-zinc-700"
+                        }`}
                       >
-                        {event.rule}
-                      </span>
-                      <span className="text-[11px] text-zinc-500">{ago(event.created_at)}</span>
-                    </div>
-                    <p className="text-xs text-zinc-400">{event.message}</p>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </Panel>
+                        {entry}
+                      </button>
+                    ))}
+                  </div>
+                }
+              >
+                <PnlChart trades={trades} mode={pnlMode} />
+              </Panel>
 
-          <Panel title="Strategy attribution">
-            {list(review?.by_strategy).length === 0 ? (
-              <Empty message="No closed trades to attribute." />
-            ) : (
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-[11px] uppercase tracking-wider text-zinc-500">
-                    <th className="pb-2">Strategy</th>
-                    <th className="pb-2 text-right">Trades</th>
-                    <th className="pb-2 text-right">Net PnL</th>
-                    <th className="pb-2 text-right">Win rate</th>
-                  </tr>
-                </thead>
-                <tbody className="font-mono tabular-nums">
-                  {list(review?.by_strategy).map((entry) => (
-                    <tr key={entry.key} className="border-t border-zinc-800">
-                      <td className="py-1.5 font-sans">
-                        {entry.key}
-                        {!entry.reliable ? (
-                          <span
-                            className="ml-1.5 text-[10px] text-amber-500"
-                            title="too few trades for this to be meaningful"
-                          >
-                            small sample
-                          </span>
-                        ) : null}
-                      </td>
-                      <td className="py-1.5 text-right">{entry.trade_count}</td>
-                      <td className={`py-1.5 text-right ${tone(entry.net_pnl)}`}>
-                        {signed(entry.net_pnl)}
-                      </td>
-                      <td className="py-1.5 text-right">{percent(entry.win_rate, 1)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </Panel>
-        </div>
+              <Panel
+                title="Long vs short"
+                subtitle="Cumulative net PnL by direction."
+                source="quantflow database — reconciled closed trades"
+              >
+                <LongShortChart trades={trades} />
+              </Panel>
 
-        <Panel title={`Registered strategies (${list(strategies).length})`}>
-          {list(strategies).length === 0 ? (
-            <Empty message="Loading…" />
-          ) : (
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-              {list(strategies).map((strategy) => (
-                <div key={strategy.strategy_id} className="rounded border border-zinc-800 p-3">
-                  <div className="font-mono text-sm text-blue-300">{strategy.strategy_id}</div>
-                  <p className="mt-1 text-xs text-zinc-400">{strategy.description}</p>
-                  <p className="mt-2 text-[11px] text-zinc-600">
-                    warm-up {strategy.warmup_bars} bars
-                  </p>
-                </div>
-              ))}
+              <FeesPanel fees={summary?.fees} />
             </div>
-          )}
-        </Panel>
 
-        <footer className="pb-6 text-center text-[11px] text-zinc-600">
-          QuantFlow {readiness ? `· ${readiness.trading_mode} mode` : ""} · values shown are
-          formatted from exact decimal strings
+            <DecisionsPanel decisions={decisions} openPositions={openPositions} />
+          </>
+        ) : null}
+
+        {tab === "diagnostics" ? (
+          <>
+            <VenueAccountPanel summary={summary} />
+            <div className="grid gap-4 xl:grid-cols-2">
+              <AssetClassesPanel classes={assetClasses} />
+              <FreshnessPanel freshness={freshness} />
+            </div>
+            <Panel title="Engine" source="the engine's own startup log and the supervisor's log">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4 lg:grid-cols-6">
+                <Stat label="Timeframe" value={summary?.engine?.timeframe ?? NOT_RECORDED} />
+                <Stat label="Session" value={summary?.session?.session_id ?? NOT_RECORDED} />
+                <Stat
+                  label="Strategy pool"
+                  value={summary?.engine?.strategy_pool ?? NOT_RECORDED}
+                  hint={summary?.engine?.strategy ?? undefined}
+                />
+                <Stat
+                  label="Engine PID"
+                  value={summary?.engine?.pid ? String(summary.engine.pid) : NOT_RECORDED}
+                  hint="no pid file; API cannot see host processes"
+                />
+                <Stat
+                  label="Engine started"
+                  value={summary?.engine?.started_at ? ago(summary.engine.started_at) : NOT_RECORDED}
+                />
+                <Stat
+                  label="Symbols"
+                  value={count(list(summary?.engine?.symbols).length || undefined)}
+                  hint={list(summary?.engine?.symbols).join(", ")}
+                />
+                <Stat label="Last decision" value={ago(freshness?.last_decision_at)} />
+                <Stat label="Last order" value={ago(freshness?.last_order_at)} />
+                <Stat label="Last venue sync" value={ago(freshness?.venue_sync?.fetched_at)} />
+                <Stat
+                  label="Last reconciliation"
+                  value={ago(freshness?.reconciliation?.last_venue_read_at)}
+                />
+                <Stat
+                  label="Restarts"
+                  value={count(summary?.engine?.supervisor?.restart_count)}
+                  hint={`${count(summary?.engine?.supervisor?.killed_count)} ended rc=137 (SIGKILL)`}
+                />
+                <Stat
+                  label="Last stored candle"
+                  value={ago(freshness?.last_candle_at)}
+                  hint="download archive, not the live stream"
+                />
+              </div>
+              {(summary?.engine?.supervisor?.killed_count ?? 0) > 0 ? (
+                <div className="mt-3">
+                  <Caution>
+                    The supervisor has restarted the engine{" "}
+                    {count(summary?.engine?.supervisor?.restart_count)} time(s),{" "}
+                    {count(summary?.engine?.supervisor?.killed_count)} of which ended in{" "}
+                    <span className="font-mono">rc=137</span> (SIGKILL — the operating system
+                    reclaiming memory, not a crash in the engine). A restart re-seeds equity from
+                    the venue, which is why the equity curve can contain a step change.
+                  </Caution>
+                </div>
+              ) : null}
+            </Panel>
+          </>
+        ) : null}
+
+        <footer className="pb-6 text-center text-[10px] text-zinc-600">
+          QuantFlow · every monetary value is formatted from an exact decimal string, never a
+          float · fields the engine does not record read {NOT_RECORDED}
         </footer>
       </main>
+
+      {selected ? (
+        <ErrorBoundary label="Position detail">
+          <PositionDrawer
+            position={selected}
+            asset={assetFor(selected.symbol)}
+            onClose={() => {
+              setSelected(null);
+            }}
+          />
+        </ErrorBoundary>
+      ) : null}
     </div>
   );
 }

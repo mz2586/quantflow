@@ -145,7 +145,7 @@ class TestMonitorHaltsAndFlattens:
             seen.append(risk.kill_switch.engaged)
             raise RuntimeError("venue unreachable")
 
-        loss_monitor._flatten = failing_flatten  # type: ignore[assignment]
+        loss_monitor._flatten = failing_flatten
         await loss_monitor.check(snapshot(equity=Decimal("8000"), peak=Decimal("10000")))
 
         assert seen == [True], "switch must already be latched when flatten runs"

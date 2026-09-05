@@ -32,6 +32,7 @@ class TestPoolRestriction:
         registry = load_builtin_strategies()
 
         orchestrator = registry.create("orchestrator", {"pool": WINNERS})
+        assert isinstance(orchestrator, StrategyOrchestrator)
 
         assert sorted(member.strategy_id for member in orchestrator.members) == sorted(WINNERS)
 

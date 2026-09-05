@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Write PAPER_TRADING_REPORT.md from the live paper session.
+"""Write a paper-session log from the live paper session.
+
+Output goes to `reports/` (gitignored), never to the repository root. This is a record
+of one simulated session, not a performance claim, and it is deliberately not written
+anywhere that would publish it as one.
 
 Reads the database rather than any in-memory engine state, so the report reflects what
 was actually persisted — the same source the dashboard serves. A report built from a
@@ -77,7 +81,7 @@ async def main() -> int:
     pf = Decimal(str(row.gross_win)) / gross_loss if gross_loss > ZERO else None
     maxdd = Decimal(str(eq.maxdd)) * 100
     hours = Decimal(str(row.avg_hours))
-    profitable = net > ZERO
+    ended_up = net > ZERO
 
     gross_win = Decimal(str(row.gross_win))
     fee_share = (Decimal(str(row.fees)) / gross_win * 100) if gross_win > ZERO else Decimal(0)
@@ -85,7 +89,14 @@ async def main() -> int:
     avg_loss = gross_loss / max(n - wins, 1)
     win_note = "most trades still lose" if win_rate < Decimal("0.5") else "a majority of trades win"
 
-    md = f"""# Paper Trading Report
+    md = f"""# Paper-session log — {SESSION}
+
+> **This is not a performance claim.** It is a log of one simulated session on one
+> strategy, with no repetition and no out-of-sample holdout. Execution was simulated
+> throughout and no real money was traded. Simulated and past results do not indicate,
+> predict or guarantee future performance. The systematic research found that **no
+> strategy tested beat simply holding the asset** — see
+> `docs/research/strategy-research-2026-08.md`, which is the primary research document.
 
 **Generated:** {datetime.now(UTC):%Y-%m-%d %H:%M} UTC · **Session:** `{SESSION}`
 **Strategy:** {meta.strategy_id if meta else "?"} · **Timeframe:** {meta.timeframe if meta else "?"}
@@ -96,7 +107,7 @@ async def main() -> int:
 |---|---:|
 | Starting equity | {OPENING_EQUITY:,.2f} USDT |
 | Current equity | **{current:,.2f} USDT** |
-| Net return | **{(net / OPENING_EQUITY) * 100:+.2f}%** |
+| Change over the session | {(net / OPENING_EQUITY) * 100:+.2f}% (simulated) |
 | Closed trades | {n} |
 | Win rate | **{win_rate:.1%}** ({wins} wins / {n - wins} losses) |
 | Profit factor | **{pf:.2f}** |
@@ -105,11 +116,14 @@ async def main() -> int:
 | Largest winning trade | +{Decimal(str(row.best)):,.2f} |
 | Largest losing trade | {Decimal(str(row.worst)):,.2f} |
 | Total fees | {Decimal(str(row.fees)):,.2f} |
-| **Profitable** | **{"YES" if profitable else "NO"}** |
+| Session ended up or down | {"up" if ended_up else "down"} |
 
-## Assessment
+## Reading this
 
-The strategy is **{"profitable" if profitable else "not profitable"}** over {n} closed trades.
+The simulated account ended **{"up" if ended_up else "down"}** over {n} closed trades. That
+is an observation about one sample, not a property of the strategy: a single unrepeated
+run cannot distinguish an edge from variance, and this configuration was chosen after the
+fact from a library of 44.
 
 Profit factor {pf:.2f} means {pf:.2f} USDT earned for every 1.00 lost. Win rate is
 {win_rate:.1%}, so {win_note} —
@@ -130,13 +144,19 @@ Fees consumed {fee_share:.1f}% of gross profit.
     # Written after the awaits complete: blocking file IO inside a coroutine stalls the
     # loop, and this is the last thing the coroutine does anyway.
     _write(md)
-    print(f"wrote PAPER_TRADING_REPORT.md at {n} closed trades (profitable={profitable})")
+    print(f"wrote {_OUTPUT} at {n} closed trades (session ended {'up' if ended_up else 'down'})")
     return n
 
 
+#: Under `reports/`, which is gitignored. A session log is operational output, not a
+#: repository artefact, and it must not land somewhere that publishes it as a claim.
+_OUTPUT = Path(__file__).resolve().parent.parent / "reports" / "paper-session.md"
+
+
 def _write(markdown: str) -> None:
-    """Write the report to disk."""
-    Path("PAPER_TRADING_REPORT.md").write_text(markdown)
+    """Write the session log to disk."""
+    _OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    _OUTPUT.write_text(markdown)
 
 
 if __name__ == "__main__":

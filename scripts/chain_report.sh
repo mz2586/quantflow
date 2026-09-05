@@ -9,7 +9,9 @@
 
 set -uo pipefail
 
-REPO="/Users/muhammadzohaib/quantflow"
+# Repo root, derived from this script's own location so the supervisor works from any
+# checkout. Override with QF_REPO if the scripts live outside the repository.
+REPO="${QF_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PY="${REPO}/.venv/bin/python"
 JSON="${REPO}/reports/edge-validation.json"
 LOCK="${REPO}/scratchpad/.validate.lock"

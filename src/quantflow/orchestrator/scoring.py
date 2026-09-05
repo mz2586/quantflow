@@ -7,6 +7,7 @@ a database or a market.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -58,10 +59,63 @@ MIN_RISK_REWARD = Decimal("1.5")
 
 #: Minimum expected edge, as a fraction of notional, that must survive round-trip costs.
 #: A target that clears the fee by a hair is not an opportunity.
-MIN_NET_EDGE_PCT = Decimal("0.004")
+#:
+#: Lowered from 0.40% to 0.35% on 2026-08-17, by explicit decision, and the reason it is
+#: defensible rather than arbitrary is that it still clears this module's own stated basis:
+#: :data:`MIN_REWARD_TO_COST` requires 3x the round-trip cost, and at the 0.11% measured on
+#: this account that is 0.33%. The old 0.40% was stricter than the rule it came from.
+#:
+#: Measured over 18 hours on a BTC/ETH-only universe: 16 of 58 blocked bars were candidates
+#: at 0.3512-0.3639% — clearing 3x cost, refused by the floor alone. This admits those and
+#: nothing weaker. The confluence requirement of two independent families is deliberately
+#: untouched, so corroboration is still required before capital is committed.
+#:
+#: Override with QF_MIN_NET_EDGE_PCT. It is read here rather than hard-coded so the floor
+#: can be put back without a code change if the admitted trades underperform.
+MIN_NET_EDGE_PCT = Decimal(os.environ.get("QF_MIN_NET_EDGE_PCT", "0.0035"))
 
 #: Multiple of round-trip cost the expected reward must exceed.
 MIN_REWARD_TO_COST = Decimal("3")
+
+#: Net edge a candidate must offer to be taken on ONE strategy family's opinion alone.
+#:
+#: Confluence normally requires two independent families, and the reason is sound: one
+#: strategy agreeing with itself is not corroboration. But by the time a candidate reaches
+#: the confluence check it has already cleared every economic gate above — reward:risk of at
+#: least 1.5, a valid stop and target, liquidity, and a net edge past the floor — so
+#: refusing it purely for want of a second opinion discards setups that are individually
+#: sound. Measured 2026-08-17 on a BTC/ETH universe: 14 of 15 blocked bars were confluence
+#: alone, with nothing else against them.
+#:
+#: So a lone family may carry a trade, but it has to pay for the missing corroboration:
+#: twice the ordinary edge floor. That keeps this a filter on *quality* rather than a
+#: relaxation into activity — the two live winners this session came in at 0.76% and 1.50%
+#: net edge, so the bar is demonstrably reachable by the setups worth having.
+#:
+#: Override with QF_SOLO_FAMILY_MIN_NET_EDGE. Set it absurdly high to restore strict
+#: two-family confluence without a code change.
+SOLO_FAMILY_MIN_NET_EDGE = Decimal(
+    os.environ.get("QF_SOLO_FAMILY_MIN_NET_EDGE", str(MIN_NET_EDGE_PCT * 2))
+)
+
+#: Concurrent entry legs allowed per symbol. 1 disables pyramiding entirely.
+#:
+#: A second leg is NOT a second position at the venue — Bybit nets in one-way mode, so it
+#: enlarges the existing position and moves its average entry. That is why adding is
+#: permitted only into a position that is not underwater: on a long, a leg added at a
+#: higher price raises the average, which is pyramiding into strength; a leg added at a
+#: lower price would be averaging down wearing a different name.
+MAX_LEGS_PER_SYMBOL = int(os.environ.get("QF_BOT_MAX_LEGS_PER_SYMBOL", "1"))
+
+#: How much better a second leg must score than the thesis already open, when it comes from
+#: the same strategy family and the same regime.
+#:
+#: Same strategy + same direction + same regime + near-identical score is the same opinion
+#: twice, and the whole session's evidence says that is what a naive pyramid would buy:
+#: 132 selections, 100% long, four correlated trend families, scores inside a 0.008 band.
+#: A different family or a changed regime counts as new on its own; an identical setup has
+#: to prove itself with a materially better score.
+PYRAMID_MIN_SCORE_IMPROVEMENT = Decimal(os.environ.get("QF_PYRAMID_MIN_SCORE_IMPROVEMENT", "0.02"))
 
 #: Positions in the same strategy allowed before further candidates from it are refused,
 #: so the book cannot fill with one idea expressed ten times.
@@ -188,6 +242,18 @@ def _evidence_component(record: StrategyRecord | None) -> Decimal:
     # Win rate is a bounded, directly comparable summary; PnL magnitude is not, since one
     # outsized winner would swamp the ranking.
     return min(max(record.win_rate, ZERO), ONE)
+
+
+def net_edge_of(candidate: Candidate, *, cost_rate: Decimal) -> Decimal | None:
+    """Expected edge after round-trip costs, or ``None`` when it cannot be measured.
+
+    Extracted so the selection layer can judge a candidate on the same arithmetic the
+    economic gate used, rather than recomputing it and risking the two disagreeing.
+    """
+    if candidate.entry <= ZERO or candidate.take_profit is None:
+        return None
+    reward_pct = abs(candidate.take_profit - candidate.entry) / candidate.entry
+    return reward_pct - cost_rate
 
 
 def gate_candidate(  # noqa: PLR0911 - one return per gate reads better than nesting

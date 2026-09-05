@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -27,10 +27,22 @@ from typing import TYPE_CHECKING, Any
 from quantflow.cache.redis import EventBus
 from quantflow.core.clock import Clock, SystemClock
 from quantflow.core.config import MarketType, RiskSettings, TradingMode
-from quantflow.core.errors import MarketDataError, ValidationError
+from quantflow.core.errors import (
+    MarketDataError,
+    OrderRejectedError,
+    ProductAgreementRequiredError,
+    ValidationError,
+)
 from quantflow.core.logging import get_logger, log_context
 from quantflow.core.precision import ZERO
-from quantflow.domain.enums import MarketRegime, OrderSide, PositionSide, RunStatus, Timeframe
+from quantflow.domain.enums import (
+    MarketRegime,
+    OrderSide,
+    PositionSide,
+    RunStatus,
+    SignalDirection,
+    Timeframe,
+)
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle, CandleSeries
 from quantflow.domain.orders import Fill, Order
@@ -47,12 +59,20 @@ from quantflow.execution.router import OrderRouter, SimulatedOrderRouter
 from quantflow.intelligence.snapshot import portfolio_correlations
 from quantflow.persistence.database import Database
 from quantflow.portfolio.manager import PortfolioManager
-from quantflow.risk.engine import RiskEngine, assert_protected
+from quantflow.risk.engine import RiskEngine, assert_protected, entry_has_expired
+from quantflow.risk.exposure import resting_entry_notional
 from quantflow.risk.monitor import LossMonitor
+from quantflow.risk.smallaccount import lot_eligibility
 from quantflow.strategy.base import Strategy, StrategyContext
 from quantflow.strategy.indicators import atr
+from quantflow.universe.assets import (
+    ASSET_CLASS_METADATA_KEY,
+    AssetClass,
+    classify_asset_class,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: `quantflow.live` imports this module.
+    from quantflow.live.heartbeat import Heartbeat
     from quantflow.live.reconcile import LiveReconciler
 
 logger = get_logger(__name__)
@@ -91,6 +111,20 @@ class PaperConfig:
     #: Drives the portfolio's accounting. Paper must use the SAME margin math as live, or
     #: paper results describe an account that does not exist on the venue.
     market_type: MarketType = MarketType.SPOT
+    #: Symbols permitted to OPEN new positions. ``None`` means every traded symbol may.
+    #:
+    #: Deliberately separate from ``symbols``, which is what the engine subscribes to and
+    #: manages. Narrowing the universe by unsubscribing would strand any open position in a
+    #: dropped symbol: no marks, no intrabar stop management, no reconciliation. So the
+    #: subscribed set stays wide enough to manage what is held, and this restricts only what
+    #: may be newly opened. Exits are never gated by it.
+    entry_symbols: tuple[Symbol, ...] | None = None
+    #: Capital this session may deploy, when it is scoped to less than the whole wallet.
+    #:
+    #: ``None`` means the wallet itself is the base. When set, it is a CEILING on the equity
+    #: every percentage limit is measured against — the wallet may be far larger, and must
+    #: not leak into sizing through any path.
+    allocation: Decimal | None = None
     leverage: Decimal = Decimal("1")
     #: Funding rate lookup, ``(symbol, settled_at) -> rate or None``. Left unset, no funding
     #: is charged - correct for spot, and honest for a perp session with no rate source
@@ -145,13 +179,19 @@ class PaperTradingEngine:
     """Runs a strategy against a live bar feed with simulated fills."""
 
     __slots__ = (
+        "_blocked_classes",
         "_broker",
         "_bus",
         "_clock",
         "_config",
         "_database",
+        "_entry_bar",
+        "_entry_symbols",
         "_history",
         "_instruments",
+        "_last_candle_at",
+        "_last_decision_at",
+        "_last_reconcile_at",
         "_loss_monitor",
         "_orders",
         "_pending_protection",
@@ -216,6 +256,28 @@ class PaperTradingEngine:
         #: hands them back through `process_candle`; a real venue does not, so on a live
         #: session this is the *only* thing that returns a fill to the portfolio.
         self._reconciler: LiveReconciler | None = None
+        #: Asset classes the venue has refused outright, mapped to the reason it gave.
+        #: Populated at the point of refusal rather than configured up front, because
+        #: whether an account may trade a product is the venue's answer, not ours — and
+        #: it changes the moment the operator signs, with no deploy on our side.
+        self._blocked_classes: dict[AssetClass, str] = {}
+        #: When each loop last made progress. Published as a heartbeat so the dashboard can
+        #: answer "is the engine running" from runtime evidence instead of inferring it
+        #: from the age of the newest decision — an inference that reported a healthy
+        #: engine as failed twice, because a fully-invested book decides nothing.
+        #:
+        #: Tracked per loop rather than as one flag: on 2026-08-14 the candle loop stopped
+        #: at 19:00 while the ticker loop ran for another nine hours, and any single
+        #: liveness flag would have called that healthy.
+        #: Entry order id -> the bar count when it was submitted, so a passive entry's
+        #: age is measured in bars rather than wall-clock time.
+        self._entry_bar: dict[str, int] = {}
+        self._entry_symbols: frozenset[Symbol] | None = (
+            frozenset(config.entry_symbols) if config.entry_symbols is not None else None
+        )
+        self._last_candle_at: datetime | None = None
+        self._last_reconcile_at: datetime | None = None
+        self._last_decision_at: datetime | None = None
 
     # ------------------------------------------------------------------ #
     # State
@@ -229,6 +291,37 @@ class PaperTradingEngine:
     def portfolio(self) -> PortfolioManager:
         """The simulated portfolio."""
         return self._portfolio
+
+    def heartbeat(self, *, pid: int) -> Heartbeat:
+        """The engine's current runtime state, for publication.
+
+        Built from the loops' own progress timestamps, so a reader can tell a running
+        engine from a stalled one without guessing from decision history.
+        """
+        from quantflow.live.heartbeat import Heartbeat
+
+        return Heartbeat(
+            session_id=self._config.session_id,
+            pid=pid,
+            written_at=self._clock.now(),
+            started_at=self._state.started_at,
+            last_candle_at=self._last_candle_at,
+            last_reconcile_at=self._last_reconcile_at,
+            last_decision_at=self._last_decision_at,
+            open_positions=len(self._portfolio.positions),
+            symbols=tuple(str(symbol) for symbol in self._config.symbols),
+            stopped_at=self._clock.now() if self._stopping else None,
+        )
+
+    @property
+    def blocked_asset_classes(self) -> Mapping[AssetClass, str]:
+        """Asset classes the venue refused, and what it said.
+
+        Empty on a healthy session. Non-empty means those markets are being evaluated
+        and deliberately not traded, which is a different thing from "no signal" and
+        has to reach the dashboard as such.
+        """
+        return dict(self._blocked_classes)
 
     @property
     def risk(self) -> RiskEngine:
@@ -346,12 +439,23 @@ class PaperTradingEngine:
         if self.is_live:
             from quantflow.live.reconcile import LiveReconciler
 
+            # Floored at the moment this session came into existence. The execution
+            # lookback reaches back a day so a fill missed during a disconnect is still
+            # recovered, but a session cannot have made a fill before it existed — without
+            # the floor it adopts every execution the venue reports from whatever ran
+            # before, books them as its own trades with no strategy attribution, and
+            # anchors the equity curve to another run's PnL.
+            #
+            # Creation time, not start time: `started_at` is re-stamped on every restart,
+            # so flooring at that would discard this session's own earlier fills each time
+            # it came back up.
             self._reconciler = LiveReconciler(
                 gateway,
                 self._portfolio,
                 symbols=self._config.symbols,
                 clock=self._clock.now,
                 quote=self._config.base_currency,
+                not_before=await self._session_created_at(),
             )
             self._reconciler.register_venue_ids(self._orders.values())
 
@@ -442,6 +546,14 @@ class PaperTradingEngine:
         symbol = candle.symbol
         if symbol not in self._history:
             return
+        self._last_candle_at = self._clock.now()
+        # Make the router's order map equal the venue's before anything reads it. Orders
+        # that rested and later filled are otherwise remembered as open forever, and the
+        # exposure caps charge the account for orders that no longer exist.
+        sync = getattr(self._broker, "sync_open_orders", None)
+        if sync is not None:
+            await sync()
+        await self._expire_resting_entries()
 
         # 1. Orders placed on the previous bar match against this one.
         for order, fill in self._broker.process_candle(candle):
@@ -469,7 +581,17 @@ class PaperTradingEngine:
         # fills, and this is where they are collected. Without it a live session's portfolio
         # stays permanently flat while the venue holds real positions, and every risk limit
         # is then measured against an empty book.
-        await self._reconcile_live()
+        venue_symbols = await self._reconcile_live()
+
+        # 1c. The book has just been reconciled against the venue, so this is the one
+        # moment in the bar when the portfolio is known to agree with it. A composite
+        # strategy tracks which member owns each open position, and that map has no other
+        # way of learning that a position ended — a venue stop, a take-profit, an intrabar
+        # exit and a liquidation all close a position without the owning member ever
+        # emitting CLOSE. Left unsynchronised the map only grows, and because an owned
+        # symbol counts as an open position in the duplicate guard, the engine eventually
+        # declines every candidate for correlation against positions that no longer exist.
+        self._sync_strategy_owners(venue_symbols)
 
         # 2. Protective exits, checked against the bar's range.
         await self._check_protective_exits(symbol, candle)
@@ -515,7 +637,110 @@ class PaperTradingEngine:
     # ------------------------------------------------------------------ #
     # Decisions
     # ------------------------------------------------------------------ #
-    async def _decide(self, symbol: Symbol, history: list[Candle], candle: Candle) -> None:
+    def _context_metadata(self, symbol: Symbol) -> dict[str, Any]:
+        """Per-symbol facts a strategy may need that the bar itself does not carry.
+
+        Currently just the asset class. It is resolved here because this is the layer that
+        holds the instrument, and therefore the venue's own ``symbolType`` label — a
+        strategy sees only a :class:`~quantflow.domain.instruments.Symbol`, and ``XAU`` is
+        gold rather than a token only because Bybit said so, not because of how it reads.
+
+        A symbol with no loaded instrument yields an empty dict rather than a guess, and
+        consumers fall back to the crypto defaults, which is how this behaved before the
+        classification existed.
+        """
+        instrument = self._instruments.get(symbol)
+        if instrument is None:
+            return {}
+        return {ASSET_CLASS_METADATA_KEY: self._asset_class_of(symbol)}
+
+    async def _expire_resting_entries(self) -> None:
+        """Cancel passive entries that have rested longer than the configured limit.
+
+        Only meaningful with maker-first on, where an entry can sit unfilled at the venue
+        indefinitely. The signal that produced it — its stop, its target, its size — was
+        computed from one bar; filling several bars later takes a position on analysis that
+        no longer holds, at a price the market has already left.
+
+        Entries only. A resting *exit* is protection, and cancelling it because it has
+        waited a while would remove the stop from a live position.
+
+        Never raises: a cancel that fails leaves the order where it was and the next bar
+        tries again. Losing the trading loop over a housekeeping call would be a far worse
+        outcome than an order resting one bar too long.
+        """
+        cancel = getattr(self._broker, "cancel", None)
+        if cancel is None:
+            return
+        limit = self._config.risk.entry_limit_max_bars
+        for order in list(self._broker.open_orders()):
+            if order.reduce_only or order.order_id not in self._entry_bar:
+                continue
+            resting = self._state.bars_seen - self._entry_bar[order.order_id]
+            if not entry_has_expired(bars_resting=resting, max_bars=limit):
+                continue
+            try:
+                await cancel(order.order_id, order.symbol)
+            except Exception as exc:
+                logger.warning(
+                    "paper.entry_cancel_failed", order_id=order.order_id, error=str(exc)[:160]
+                )
+                continue
+            self._entry_bar.pop(order.order_id, None)
+            self._pending_protection.pop(order.order_id, None)
+            logger.info(
+                "paper.entry_expired",
+                order_id=order.order_id,
+                symbol=str(order.symbol),
+                bars_resting=resting,
+                limit=limit,
+                reason="the setup that produced this entry is no longer current",
+            )
+
+    def _sync_strategy_owners(self, venue_symbols: set[Symbol] | None) -> None:
+        """Point the strategy's ownership map at what the venue actually holds.
+
+        Driven by the venue's own position read rather than the local book, because the two
+        disagree in exactly the window that matters. An order fills, the venue holds the
+        position, and the portfolio does not learn of it until the fill is reconciled — a
+        gap of seconds during which the local book says "flat". Syncing against that would
+        release the owner of a position opened moments earlier, leaving a live trade with
+        no strategy responsible for exiting it. Seen once on 2026-08-14: an ETH short
+        opened at 18:30:13 lost its owner at 18:30:27.
+
+        ``None`` means the venue could not be read, and nothing is released: a timeout is
+        not evidence that the account is flat.
+
+        A no-op for a plain strategy, which owns nothing. Guarded by ``getattr`` rather
+        than an isinstance check so the engine keeps working with any strategy — importing
+        the orchestrator here would invert the dependency between engine and strategy.
+        """
+        sync = getattr(self._strategy, "sync_owners", None)
+        if sync is None or venue_symbols is None:
+            return
+        released = sync(venue_symbols)
+        if released:
+            logger.info(
+                "paper.owners_released",
+                symbols=[str(symbol) for symbol in released],
+                venue_positions=len(venue_symbols),
+            )
+
+    def _asset_class_of(self, symbol: Symbol) -> AssetClass:
+        """The venue's asset class for a symbol, defaulting to crypto.
+
+        Crypto is the default rather than an "unknown" value because that is what every
+        symbol was before non-crypto classes existed, and it keeps a missing instrument
+        from quarantining an entire book under a placeholder class.
+        """
+        instrument = self._instruments.get(symbol)
+        if instrument is None:
+            return AssetClass.CRYPTO
+        return classify_asset_class(symbol, instrument.venue_symbol_type)
+
+    async def _decide(  # noqa: PLR0911 - each return is a distinct, logged refusal reason
+        self, symbol: Symbol, history: list[Candle], candle: Candle
+    ) -> None:
         context = StrategyContext(
             symbol=symbol,
             timeframe=self._config.timeframe,
@@ -524,9 +749,11 @@ class PaperTradingEngine:
             portfolio=self._portfolio.snapshot(candle.close_time),
             position=self._portfolio.position_for(symbol),
             regime=MarketRegime.UNKNOWN,
+            metadata=self._context_metadata(symbol),
         )
 
         signal = self._strategy.evaluate(context)
+        self._last_decision_at = self._clock.now()
         if not signal.is_actionable:
             # A held bar used to vanish here without trace, which made "the engine is not
             # trading" indistinguishable from "the engine is broken" - the strategy's own
@@ -539,6 +766,45 @@ class PaperTradingEngine:
                 bar=candle.close_time.isoformat(),
             )
             return
+        # New entries may be restricted to a subset of the traded symbols. The subscribed
+        # set stays wider on purpose: a symbol carrying an open position still needs its
+        # marks, its intrabar stop management and its reconciliation, so narrowing the
+        # universe by unsubscribing would leave live positions unmanaged. This gates
+        # OPENING only — a CLOSE is always allowed through, whatever the universe says.
+        if (
+            self._entry_symbols is not None
+            and symbol not in self._entry_symbols
+            and signal.direction is not SignalDirection.CLOSE
+        ):
+            logger.info(
+                "paper.entry_symbol_disabled",
+                symbol=str(symbol),
+                direction=signal.direction.value,
+                strategy=self._strategy.strategy_id,
+                bar=candle.close_time.isoformat(),
+                reason=(
+                    "this symbol is not in the new-entry universe; its existing position, "
+                    "stops and targets are still managed"
+                ),
+                entry_universe=sorted(str(item) for item in self._entry_symbols),
+            )
+            return
+
+        # Small-account market access. Checked here, beside the entry universe and for the
+        # same reason: it gates OPENING only. An exchange lot that is 76% of the account is
+        # not a position this account can hold, however good the signal — and a CLOSE must
+        # never be refused, or a position taken before the rule applied could not be exited.
+        if signal.direction is not SignalDirection.CLOSE:
+            verdict = lot_eligibility(
+                symbol=str(symbol),
+                min_quantity=self._instruments[symbol].min_quantity,
+                price=candle.close,
+                allocation=self._config.allocation,
+            )
+            if not verdict.symbol_tradeable:
+                logger.info("paper.small_account_ineligible", **verdict.to_dict())
+                return
+
         self._state.signals += 1
         await self._publish_signal(signal)
 
@@ -550,6 +816,9 @@ class PaperTradingEngine:
             instrument=self._instruments[symbol],
             reference_price=candle.close,
             volatility=volatility,
+            resting_entry_notional=resting_entry_notional(
+                self._broker.open_orders(), self._portfolio
+            ),
         )
         if not decision.approved or decision.request is None:
             self._state.rejections += 1
@@ -563,10 +832,76 @@ class PaperTradingEngine:
 
         request = decision.request
         assert_protected(request, self._config.risk)
-        order = await self._broker.submit(
-            request, now=self._clock.now(), reference_price=candle.close
-        )
+
+        # An asset class the venue has already refused is not retried. The refusal is an
+        # account state, not a property of this order, so every subsequent attempt would
+        # fail identically — and each one costs a round trip and a rate-limit slot.
+        asset_class = self._asset_class_of(symbol)
+        blocked = self._blocked_classes.get(asset_class)
+        if blocked is not None:
+            self._state.rejections += 1
+            logger.info(
+                "paper.class_blocked",
+                symbol=str(symbol),
+                asset_class=asset_class.value,
+                direction=signal.direction.value,
+                reason=blocked,
+            )
+            return
+
+        try:
+            order = await self._broker.submit(
+                request, now=self._clock.now(), reference_price=candle.close
+            )
+        # ProductAgreementRequiredError subclasses OrderRejectedError, so it must be
+        # matched first or the general clause below swallows it and the asset class is
+        # never quarantined.
+        except ProductAgreementRequiredError as exc:
+            # Caught here rather than left to unwind: this exception reaching `run` marks
+            # the session FAILED and ends it, so one unsigned agreement would take down a
+            # book that is trading everything else perfectly well.
+            self._blocked_classes[asset_class] = (
+                f"venue refused: {exc.message} (retCode {exc.venue_error})"
+                if exc.venue_error
+                else f"venue refused: {exc.message}"
+            )
+            self._state.rejections += 1
+            logger.critical(
+                "paper.class_quarantined",
+                symbol=str(symbol),
+                asset_class=asset_class.value,
+                venue_code=exc.venue_error,
+                reason=exc.message,
+            )
+            return
+        except OrderRejectedError as exc:
+            # The venue refused this specific order. Almost always because the market moved
+            # between the bar close the stop was validated against and the moment the order
+            # arrived: a stop that sat correctly beyond the entry is then on the wrong side
+            # of the live price, and Bybit answers retCode 10001.
+            #
+            # Caught here rather than left to unwind, because reaching `run` marks the
+            # session FAILED and ends the bar loop. On 2026-08-14 one refused XRP short did
+            # exactly that at 19:00 and the process spent the next nine hours alive on
+            # ticker traffic without evaluating a single bar.
+            #
+            # Deliberately narrow. This is a rejection of one order, so one order is lost
+            # and the next bar is evaluated normally. Nothing is retried, resized or
+            # resubmitted: the signal was for a price that no longer exists.
+            self._state.rejections += 1
+            # `error`, not `exception`: this is an expected outcome of a market that moved,
+            # and a stack trace per refusal would bury the reason it is logged for.
+            logger.error(  # noqa: TRY400 - a traceback adds nothing to a venue refusal
+                "paper.order_rejected",
+                symbol=str(symbol),
+                direction=signal.direction.value,
+                quantity=str(request.quantity),
+                venue_error=exc.details.get("venue_error"),
+                error=exc.message[:200],
+            )
+            return
         self._orders[order.order_id] = order
+        self._entry_bar[order.order_id] = self._state.bars_seen
         self._risk.record_order()
         self._state.orders += 1
         if request.stop_loss_price is not None or request.take_profit_price is not None:
@@ -603,7 +938,11 @@ class PaperTradingEngine:
         """
         for trade in trades:
             self._risk.record_trade_result(
-                trade.net_pnl, closed_at=trade.exit_time, symbol=trade.symbol
+                trade.net_pnl,
+                closed_at=trade.exit_time,
+                symbol=trade.symbol,
+                side=OrderSide.BUY if trade.side is PositionSide.LONG else OrderSide.SELL,
+                gross_pnl=trade.gross_pnl,
             )
             # A composite strategy scores its members partly on their realised record; a
             # plain strategy ignores this.
@@ -825,7 +1164,7 @@ class PaperTradingEngine:
 
     async def _reconcile_live(
         self, *, initial: bool = False, only: Sequence[Symbol] | None = None
-    ) -> None:
+    ) -> set[Symbol] | None:
         """Pull the venue's orders, executions and positions into the local book.
 
         Everything downstream of a fill happens here for a live session: the portfolio move,
@@ -838,14 +1177,14 @@ class PaperTradingEngine:
         a transient failure into an unmanaged position.
         """
         if self._reconciler is None:
-            return
+            return None
         try:
             outcome = await self._reconciler.reconcile(
                 list(self._orders.values()), initial=initial, only=only
             )
         except Exception as exc:
             logger.exception("paper.live_reconcile_failed", error=str(exc))
-            return
+            return None
 
         for order in outcome.orders:
             self._orders[order.order_id] = order
@@ -868,7 +1207,7 @@ class PaperTradingEngine:
         # directly - at startup, and whenever the book had to be repaired from the venue's
         # own statement rather than from fills.
         if outcome.venue_cash is not None:
-            cash = outcome.venue_cash
+            cash = self._within_allocation(outcome.venue_cash)
             if self._config.market_type is not MarketType.FUTURE:
                 # Spot counts a held asset inside equity, so the capital already spent on
                 # open positions comes out of cash or it is counted twice.
@@ -878,9 +1217,38 @@ class PaperTradingEngine:
                 reason="startup reconciliation" if initial else "venue state repair",
             )
 
+        self._last_reconcile_at = self._clock.now()
+        # What the venue said it holds, so ownership can be synchronised against the venue
+        # rather than against a local book that lags a fresh fill by seconds. `None` when
+        # the position endpoint could not be read.
+        return outcome.venue_symbols
+
     # ------------------------------------------------------------------ #
     # Persistence and events
     # ------------------------------------------------------------------ #
+    async def _session_created_at(self) -> datetime:
+        """When this session row was first inserted, or now if it does not exist yet.
+
+        Falling back to *now* is the conservative direction: a session whose row cannot be
+        read adopts nothing historical, rather than adopting a day of someone else's fills.
+        """
+        now = self._clock.now()
+        if self._database is None:
+            return now
+        try:
+            async with self._database.read_session() as session:
+                from quantflow.persistence.models import TradingSessionRecord
+
+                record = await session.get(TradingSessionRecord, self._config.session_id)
+                # Read inside the session. Touching a mapped attribute after the context
+                # closes detaches the instance and raises DetachedInstanceError, which at
+                # startup takes the whole process down.
+                created: datetime | None = record.created_at if record is not None else None
+        except Exception as exc:
+            logger.warning("paper.session_created_at_unavailable", error=str(exc)[:160])
+            return now
+        return created if created is not None else now
+
     async def _restore(self) -> None:
         """Rebuild portfolio state from the database, if a prior session exists.
 
@@ -979,6 +1347,29 @@ class PaperTradingEngine:
             fees_paid=str(fees),
             peak_equity=str(peak),
         )
+
+    def _within_allocation(self, venue_cash: Decimal) -> Decimal:
+        """Clamp a venue wallet balance to the capital this session may actually deploy.
+
+        ``min(venue available equity, configured allocation)`` — the rule the whole scoping
+        mechanism rests on, applied at the ONE point that previously bypassed it.
+
+        The defect this closes, measured live on 2026-08-21: the session was configured with
+        an allocation of 100 USDT and its startup line correctly reported
+        ``allocation=100 starting_equity=100``. Reconciliation then anchored cash to the raw
+        wallet — 49,427.92 — and every percentage limit silently re-based onto it. The
+        sizer produced a BTC position of 9,844 notional and logged ``capped_by=
+        max_position_pct``, which was true and useless: the cap was 20% of the wallet, not
+        of the allocation. Two positions totalling 18,569 were opened against a "100 USDT"
+        experiment.
+
+        The wallet remains an upper availability constraint — the allocation cannot deploy
+        money the account does not have — but it can no longer set the size of a trade.
+        """
+        allocation = self._config.allocation
+        if allocation is None:
+            return venue_cash
+        return min(venue_cash, allocation)
 
     def _anchor_cash_to_venue(self, restored: Decimal, positions: Sequence[Position]) -> Decimal:
         """Replace restored cash with the venue's balance when the venue is authoritative.

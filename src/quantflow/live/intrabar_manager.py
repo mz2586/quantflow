@@ -165,14 +165,65 @@ def _optional_price(value: Any) -> Decimal | None:
     return parsed if parsed > 0 else None
 
 
-def parse_venue_positions(rows: Iterable[Mapping[str, Any]]) -> dict[Symbol, VenuePosition]:
+def resolve_protection(
+    symbol: Symbol, orders: Iterable[Any] | None
+) -> tuple[Decimal | None, Decimal | None]:
+    """A position's stop and target, read from the orders that actually protect it.
+
+    Bybit keeps protection in one of two places. Under ``tpslMode: Full`` it sits on the
+    position row. Under ``Partial`` — which is what a maker take-profit requires, and
+    therefore what this engine uses — it is a pair of separate reduce-only trigger orders
+    and the position row's own fields stay empty.
+
+    Reading only the row is why a live ETH position with a venue stop at 1893.45 and a
+    target at 1939.47 was reported as having neither, and was refused adoption with
+    ``intrabar.adopt_skipped_no_stop``. The position was protected the whole time; the
+    manager simply could not see it, so it declined to ratchet a winner it believed was
+    naked.
+
+    Which order is which is decided by its TYPE, not by where its trigger sits relative to
+    entry. A take-profit is a limit order and carries a price; a stop is a market order and
+    does not. That distinction is stable; position relative to entry is not.
+
+    Deciding it by position was a real defect, live for 78 minutes on 2026-08-17. Once the
+    trail ratchets a stop into profit — which is precisely what happens when a winner is
+    running — that stop sits *above* entry on a long and was misread as the take-profit.
+    A BTC position entered at 64,301.40 with a genuine target of 65,274.20 had its stop
+    ratcheted to 64,378.50 at 18:23:21 and was closed two seconds later for "reaching
+    target 64,378.5". The trail had been turned into a premature exit, cutting the winner
+    at a fifth of its intended move.
+    """
+    stop = target = None
+    for order in orders or []:
+        if not getattr(order, "reduce_only", False):
+            continue
+        trigger = getattr(order, "trigger_price", None)
+        if trigger is None:
+            continue
+        if str(getattr(order, "symbol", "")).split(":")[0] != str(symbol).split(":")[0]:
+            continue
+        if getattr(order, "price", None):
+            target = trigger
+        else:
+            stop = trigger
+    return stop, target
+
+
+def parse_venue_positions(
+    rows: Iterable[Mapping[str, Any]], protective_orders: Iterable[Any] | None = None
+) -> dict[Symbol, VenuePosition]:
     """Turn a raw ``fetch_positions`` payload into the open book, keyed by symbol.
 
     Flat rows are dropped rather than represented: the venue reports a closed position as a
     row with zero contracts, and carrying that through as an entry would mean every caller
     has to remember to check. "Absent from the book" is the single, unambiguous way this
     module says *there is no position here*.
+
+    ``protective_orders`` supplies the resting reduce-only orders, consulted when the
+    position row carries no stop or target of its own. Without them a position protected in
+    ``Partial`` mode reads as unprotected.
     """
+    protective = list(protective_orders) if protective_orders is not None else None
     book: dict[Symbol, VenuePosition] = {}
     for raw in rows:
         try:
@@ -192,17 +243,25 @@ def parse_venue_positions(rows: Iterable[Mapping[str, Any]]) -> dict[Symbol, Ven
             logger.warning("intrabar.venue_symbol_unparsed", symbol=str(raw.get("symbol"))[:40])
             continue
         info = raw.get("info") or {}
+        side = (
+            PositionSide.LONG
+            if str(raw.get("side") or "").lower() == "long"
+            else PositionSide.SHORT
+        )
+        stop = _optional_price(info.get("stopLoss"))
+        target = _optional_price(info.get("takeProfit"))
+        if stop is None or target is None:
+            # Nothing on the row: look at what is actually resting against this position.
+            resting_stop, resting_target = resolve_protection(symbol, protective)
+            stop = stop if stop is not None else resting_stop
+            target = target if target is not None else resting_target
         book[symbol] = VenuePosition(
             symbol=symbol,
-            side=(
-                PositionSide.LONG
-                if str(raw.get("side") or "").lower() == "long"
-                else PositionSide.SHORT
-            ),
+            side=side,
             quantity=abs(quantity),
             entry_price=entry,
-            stop=_optional_price(info.get("stopLoss")),
-            target=_optional_price(info.get("takeProfit")),
+            stop=stop,
+            target=target,
         )
     return book
 
@@ -460,7 +519,8 @@ class IntrabarManager:
         except Exception as exc:
             logger.warning("intrabar.reconcile_fetch_failed", error=str(exc)[:200])
             return
-        self._apply(parse_venue_positions(rows or []))
+        orders = await self._resting_protection()
+        self._apply(parse_venue_positions(rows or [], orders))
 
     def _apply(self, venue: dict[Symbol, VenuePosition]) -> None:
         """Fold a venue snapshot into local state. The venue wins every disagreement."""
@@ -510,6 +570,22 @@ class IntrabarManager:
                 entry=str(state.entry_price),
                 quantity=str(state.quantity),
             )
+
+    async def _resting_protection(self) -> list[Any] | None:
+        """Resting orders, for resolving protection the position row does not carry.
+
+        Never raises: a failed order read must leave management as it was, not take the
+        loop down. ``None`` means "not known", which is deliberately distinct from an empty
+        list — an empty list would assert the position is unprotected.
+        """
+        fetch = getattr(self._gateway, "fetch_open_orders", None)
+        if fetch is None:
+            return None
+        try:
+            return list(await fetch())
+        except Exception as exc:
+            logger.warning("intrabar.protection_read_failed", error=str(exc)[:160])
+            return None
 
     def _adopt(self, position: VenuePosition, now: datetime) -> None:
         """Start managing a position the venue holds and this manager does not."""
@@ -694,7 +770,8 @@ class IntrabarManager:
         again is the difference between noticing and being told twenty thousand times.
         """
         rows = await self._gateway.fetch_positions()
-        self._venue = parse_venue_positions(rows or [])
+        orders = await self._resting_protection()
+        self._venue = parse_venue_positions(rows or [], orders)
         return self._venue.get(symbol)
 
     def _amendment_cooling_off(self, symbol: Symbol) -> bool:
@@ -1000,7 +1077,10 @@ async def adopt_open_positions(gateway: Any, now: Any) -> list[PositionState]:
     remembers.
     """
     adopted: list[PositionState] = []
-    for position in parse_venue_positions(await gateway.fetch_positions() or []).values():
+    fetch_orders = getattr(gateway, "fetch_open_orders", None)
+    orders = await fetch_orders() if fetch_orders is not None else None
+    positions = parse_venue_positions(await gateway.fetch_positions() or [], orders)
+    for position in positions.values():
         state = state_from_venue(position, now)
         if state is None:
             logger.warning("intrabar.adopt_skipped_no_stop", symbol=str(position.symbol))

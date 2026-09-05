@@ -23,7 +23,7 @@ from quantflow.exchange.bybit.mapping import parse_fill
 BTC = Symbol.parse("BTC/USDT")
 
 
-def raw_fill(closed_pnl: str | None) -> dict:
+def raw_fill(closed_pnl: str | None) -> dict[str, object]:
     info: dict[str, object] = {}
     if closed_pnl is not None:
         info["closedPnl"] = closed_pnl

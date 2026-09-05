@@ -48,7 +48,7 @@ def snapshot(cash: str = "10000") -> PortfolioSnapshot:
     )
 
 
-async def approve(risk: RiskEngine, symbol: Symbol, price: str):  # type: ignore[no-untyped-def]
+async def approve(risk: RiskEngine, symbol: Symbol, price: str):
     return await risk.evaluate_signal(
         entry_for(symbol, price),
         portfolio=snapshot(),

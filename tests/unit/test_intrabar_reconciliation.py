@@ -337,7 +337,7 @@ class TestPositionAppears:
         gateway.book = [new_xrp()]
         await mgr.reconcile()
 
-        assert mgr.monitored == (XRP,)
+        assert list(mgr.monitored) == [XRP]
 
     async def test_it_is_adopted_with_the_venue_stop_and_target(self) -> None:
         gateway = FakeGateway([])
@@ -1111,3 +1111,55 @@ class TestParsingTheVenueBook:
         )
 
         assert list(book) == [XRP]
+
+
+class TestProtectionIsClassifiedByOrderType:
+    """A ratcheted stop must never be mistaken for a take-profit."""
+
+    @staticmethod
+    def _order(symbol: str, trigger: str, price: str | None) -> SimpleNamespace:
+        return SimpleNamespace(
+            symbol=symbol,
+            reduce_only=True,
+            trigger_price=Decimal(trigger),
+            price=Decimal(price) if price is not None else None,
+        )
+
+    def test_a_stop_ratcheted_above_entry_is_still_a_stop(self) -> None:
+        # The live regression, 2026-08-17: a BTC long entered at 64,301.40 had its trail
+        # ratchet the stop to 64,378.50 — above entry, because it was locking in profit.
+        # Classifying by position relative to entry read that as the take-profit, and the
+        # manager closed the winner two seconds later at a fifth of its real target.
+        from quantflow.live.intrabar_manager import resolve_protection
+
+        stop, target = resolve_protection(
+            Symbol.parse("BTC/USDT"),
+            [
+                self._order("BTC/USDT", "64378.5", None),  # ratcheted stop, market
+                self._order("BTC/USDT", "65274.2", "65274.2"),  # real target, limit
+            ],
+        )
+        assert stop == Decimal("64378.5")
+        assert target == Decimal("65274.2")
+
+    def test_a_normal_stop_below_entry_is_a_stop(self) -> None:
+        from quantflow.live.intrabar_manager import resolve_protection
+
+        stop, target = resolve_protection(
+            Symbol.parse("ETH/USDT"),
+            [
+                self._order("ETH/USDT", "1892.40", None),
+                self._order("ETH/USDT", "1938.21", "1938.21"),
+            ],
+        )
+        assert stop == Decimal("1892.40")
+        assert target == Decimal("1938.21")
+
+    def test_orders_for_other_symbols_are_ignored(self) -> None:
+        from quantflow.live.intrabar_manager import resolve_protection
+
+        stop, target = resolve_protection(
+            Symbol.parse("BTC/USDT"), [self._order("ETH/USDT", "1892.40", None)]
+        )
+        assert stop is None
+        assert target is None

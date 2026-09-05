@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import EXCHANGE_HOSTS, ExchangeEnv, ExchangeSettings
 
@@ -57,7 +58,7 @@ class TestCredentialSelection:
     def test_a_demo_session_without_demo_credentials_has_none(self) -> None:
         """It must not silently fall back to the mainnet key."""
         config = ExchangeSettings(
-            env=ExchangeEnv.DEMO, api_key="main-key", api_secret="main-secret"
+            env=ExchangeEnv.DEMO, api_key=SecretStr("main-key"), api_secret=SecretStr("main-secret")
         )
         assert config.active_api_key is None
         assert config.has_credentials is False

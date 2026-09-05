@@ -9,8 +9,9 @@ from pydantic import ValidationError as PydanticValidationError
 
 from quantflow.domain.enums import SignalDirection, Timeframe
 from quantflow.domain.instruments import Symbol
-from quantflow.domain.market import CandleSeries
+from quantflow.domain.market import Candle, CandleSeries
 from quantflow.domain.portfolio import PortfolioSnapshot
+from quantflow.domain.positions import Position
 from quantflow.strategy.base import StrategyContext
 from quantflow.strategy.indicators import rolling_vwap, stochastic
 from quantflow.strategy.library import (
@@ -26,7 +27,7 @@ from tests.unit.test_strategies import open_long
 SYMBOL = Symbol.parse("BTC/USDT")
 
 
-def context_from(candles: list, position=None) -> StrategyContext:  # type: ignore[no-untyped-def]
+def context_from(candles: list[Candle], position: Position | None = None) -> StrategyContext:
     series = CandleSeries(candles)
     return StrategyContext(
         symbol=SYMBOL,
@@ -44,7 +45,7 @@ def context_from(candles: list, position=None) -> StrategyContext:  # type: igno
     )
 
 
-def bars(specs: list[tuple[str, str, str, str, str]]) -> list:  # type: ignore[no-untyped-def]
+def bars(specs: list[tuple[str, str, str, str, str]]) -> list[Candle]:
     """Build candles from (open, high, low, close, volume) tuples."""
     return [
         make_candle(
@@ -60,7 +61,7 @@ def bars(specs: list[tuple[str, str, str, str, str]]) -> list:  # type: ignore[n
     ]
 
 
-def plus(candles: list, spec: tuple[str, str, str, str, str]) -> list:  # type: ignore[no-untyped-def]
+def plus(candles: list[Candle], spec: tuple[str, str, str, str, str]) -> list[Candle]:
     """Append one bar, continuing the existing series' timestamps."""
     return [
         *candles,

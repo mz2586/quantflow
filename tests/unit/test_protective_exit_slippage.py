@@ -32,7 +32,7 @@ def engine(slippage_rate: str = "0") -> PaperTradingEngine:
     )
 
 
-def candle(*, open_price: str, high: str, low: str, close: str):  # type: ignore[no-untyped-def]
+def candle(*, open_price: str, high: str, low: str, close: str):
     return make_candle(
         BTC,
         open_time=REFERENCE_TIME,

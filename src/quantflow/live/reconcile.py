@@ -361,6 +361,13 @@ class LiveReconciliation:
     #: Whether local state had to be rebuilt from the position endpoint. True means the
     #: fill stream did not account for something the venue is holding.
     repaired: bool = False
+    #: Every symbol the venue reported a live position in on this pass.
+    #:
+    #: ``None`` when the position read failed, which is deliberately not the same value as
+    #: an empty set: "the venue holds nothing" is grounds for releasing ownership, and "the
+    #: venue could not be asked" is grounds for changing nothing. Collapsing the two would
+    #: turn a timeout into a release of every position's owner.
+    venue_symbols: set[Symbol] | None = None
 
     @property
     def changed(self) -> bool:
@@ -504,6 +511,7 @@ class LiveReconciler:
         "_confirmations",
         "_gateway",
         "_lookback",
+        "_not_before",
         "_pending",
         "_portfolio",
         "_quote",
@@ -522,12 +530,25 @@ class LiveReconciler:
         execution_lookback: timedelta = DEFAULT_EXECUTION_LOOKBACK,
         repair_confirmations: int = DEFAULT_REPAIR_CONFIRMATIONS,
         quote: str = "USDT",
+        not_before: datetime | None = None,
     ) -> None:
         self._gateway = gateway
         self._portfolio = portfolio
         self._symbols: list[Symbol] = list(dict.fromkeys(symbols))
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lookback = execution_lookback
+        #: Earliest execution this session may claim, normally when it started.
+        #:
+        #: The lookback exists so a fill missed during a disconnect is still recovered, and
+        #: for a long-running session reaching back a day is exactly right. For a session
+        #: that has just been created it is not: it adopts every fill the venue reports from
+        #: whatever ran before, books them as this session's trades with no strategy
+        #: attribution, and anchors the equity curve to another run's PnL. A session cannot
+        #: have made a fill before it existed.
+        #:
+        #: ``None`` keeps the unfloored behaviour, which is what a restart resuming an
+        #: existing session wants — there the older fills genuinely are its own.
+        self._not_before = not_before
         self._confirmations = max(1, repair_confirmations)
         self._quote = quote
         #: Per-symbol high-water mark for the execution query. Never rewound: the venue
@@ -594,7 +615,17 @@ class LiveReconciler:
             for symbol in scope:
                 self.track(symbol)
             tracked = [order for order in tracked if order.symbol in scope]
-        strategy_by_order = {order.order_id: order.strategy_id for order in tracked}
+        # Keyed by BOTH identities an order has. Executions come back from the venue
+        # referencing the venue's order id, while the engine knows the order by the local
+        # one it generated. Keying on the local id alone meant no venue fill ever matched,
+        # so every trade reconciled from the venue — which on a live session is every trade
+        # there is — was recorded with no strategy at all. Session demo-10k-fresh closed 13
+        # trades, all of them unattributable.
+        strategy_by_order: dict[str, str | None] = {}
+        for order in tracked:
+            strategy_by_order[order.order_id] = order.strategy_id
+            if order.venue_order_id:
+                strategy_by_order[order.venue_order_id] = order.strategy_id
 
         executions = await self._collect_executions(scope)
         by_order: dict[str, list[Fill]] = {}
@@ -685,7 +716,10 @@ class LiveReconciler:
         for symbol in self._symbols:
             if scope is not None and symbol not in scope:
                 continue
-            since = self._since.setdefault(symbol, now - self._lookback)
+            start = now - self._lookback
+            if self._not_before is not None:
+                start = max(start, self._not_before)
+            since = self._since.setdefault(symbol, start)
             try:
                 rows = await self._gateway.fetch_my_trades(symbol, since=since)
             except Exception as exc:
@@ -739,6 +773,7 @@ class LiveReconciler:
             return
 
         venue = {position.symbol: position for position in parse_venue_positions(rows or [])}
+        outcome.venue_symbols = set(venue)
         local = {position.symbol: position for position in self._portfolio.positions}
         now = self._clock()
 

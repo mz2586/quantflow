@@ -27,7 +27,10 @@ WORKDIR /build
 
 # Dependency layer: copy only the metadata first so a source-only change does not
 # invalidate the (slow) dependency install.
-COPY pyproject.toml README.md ./
+# LICENSE and NOTICE are build inputs, not documentation: pyproject declares them
+# via `license-files`, so hatchling fails without them. They also have to ship in
+# the image — Apache-2.0 requires the licence to travel with the distribution.
+COPY pyproject.toml README.md LICENSE NOTICE ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv venv /opt/venv --python 3.12 \
     && mkdir -p src/quantflow \
@@ -63,6 +66,7 @@ RUN apt-get update \
 COPY --from=builder --chown=quantflow:quantflow /opt/venv /opt/venv
 
 WORKDIR /app
+COPY --chown=quantflow:quantflow LICENSE NOTICE ./
 COPY --chown=quantflow:quantflow alembic.ini ./
 COPY --chown=quantflow:quantflow migrations/ ./migrations/
 COPY --chown=quantflow:quantflow scripts/ ./scripts/

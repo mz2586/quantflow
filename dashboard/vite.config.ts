@@ -23,5 +23,9 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "jsdom",
+    // jsdom has no ResizeObserver and no layout; without these shims every Recharts
+    // container throws, the error boundaries contain it, and the suite stays green while
+    // no chart is ever actually rendered.
+    setupFiles: ["./src/test-setup.ts"],
   },
 });

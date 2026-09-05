@@ -413,9 +413,9 @@ class TestAllStrategiesShareTheContract:
         for index in range(strategy.warmup_bars, len(closes), 7):
             signal = strategy.evaluate(make_context(btc, closes[: index + 1]))
             if signal.is_entry:
-                assert signal.stop_loss_price is not None, (
-                    f"{strategy_id} produced an entry with no stop"
-                )
+                assert (
+                    signal.stop_loss_price is not None
+                ), f"{strategy_id} produced an entry with no stop"
 
     @pytest.mark.parametrize("strategy_id", ["ema_cross", "rsi_reversion", "donchian_breakout"])
     def test_signals_are_attributed_correctly(self, strategy_id: str, btc: Symbol) -> None:

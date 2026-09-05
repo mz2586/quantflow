@@ -60,7 +60,8 @@ from quantflow.domain.instruments import Symbol  # noqa: E402
 from quantflow.portfolio.funding import FundingSchedule  # noqa: E402
 from quantflow.strategy.registry import load_builtin_strategies  # noqa: E402
 
-REPO = Path("/Users/muhammadzohaib/quantflow")
+#: Repo root, derived from this file's location so the script works from any checkout.
+REPO = Path(__file__).resolve().parent.parent
 FUNDING_CACHE = REPO / "scratchpad" / "funding-cache.json"
 
 #: Smoke-test only. Caps bars per symbol so the whole pipeline can be exercised in minutes.

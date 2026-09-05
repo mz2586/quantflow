@@ -8,7 +8,9 @@ connection pool and what makes the whole graph substitutable in tests.
 
 from __future__ import annotations
 
+import asyncio
 import secrets
+import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -26,6 +28,12 @@ from quantflow.strategy.registry import StrategyRegistry
 
 logger = get_logger(__name__)
 
+#: Hard limit on an on-demand exchange handshake, so one request cannot hang on a venue.
+GATEWAY_CONNECT_TIMEOUT_SECONDS = 20.0
+
+#: Minimum gap between on-demand reconnect attempts.
+GATEWAY_RECONNECT_COOLDOWN_SECONDS = 60.0
+
 
 @dataclass(slots=True)
 class AppState:
@@ -40,6 +48,46 @@ class AppState:
     portfolio: PortfolioManager | None = None
     registry: StrategyRegistry | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+    #: Monotonic time of the last attempt to build a gateway, for the reconnect cooldown.
+    gateway_attempted_at: float = 0.0
+
+    async def ensure_gateway(self) -> ExchangeGateway | None:
+        """The exchange gateway, reconnecting once per cooldown if startup failed.
+
+        Without this, a venue that was briefly unreachable when the API booted leaves the
+        account panel dead until somebody restarts the process — and because the rest of
+        the dashboard keeps working, the failure looks like a permanent configuration
+        problem rather than a transient one. Retrying on demand lets it heal itself.
+
+        The cooldown matters as much as the retry: the dashboard polls every few seconds,
+        and an unbounded retry would turn a down venue into a handshake storm.
+
+        Returns:
+            The gateway, or ``None`` when no credentials exist or the retry failed.
+
+        """
+        if self.gateway is not None:
+            return self.gateway
+        if not self.settings.exchange.has_credentials:
+            return None
+
+        now = time.monotonic()
+        if now - self.gateway_attempted_at < GATEWAY_RECONNECT_COOLDOWN_SECONDS:
+            return None
+        self.gateway_attempted_at = now
+
+        try:
+            from quantflow.exchange.bybit import BybitGateway
+
+            gateway = BybitGateway(self.settings.exchange)
+            await asyncio.wait_for(gateway.connect(), timeout=GATEWAY_CONNECT_TIMEOUT_SECONDS)
+        except Exception as exc:
+            logger.warning("gateway.reconnect_failed", error=str(exc))
+            return None
+
+        logger.info("gateway.reconnected", venue=gateway.name)
+        self.gateway = gateway
+        return gateway
 
     def require_database(self) -> Database:
         """The database, or a clear error if it was not wired.

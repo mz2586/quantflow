@@ -12,8 +12,10 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-SOURCE = Path("/Users/muhammadzohaib/quantflow/reports/edge-validation.json")
-TARGET = Path("/Users/muhammadzohaib/quantflow/reports/validation_report.md")
+#: Repo root, derived from this file's location so the script works from any checkout.
+REPO = Path(__file__).resolve().parent.parent
+SOURCE = REPO / "reports" / "edge-validation.json"
+TARGET = REPO / "reports" / "validation_report.md"
 
 #: Out-of-sample net PnL a strategy must clear to count as a survivor. Zero, not a
 #: threshold chosen to let something through.

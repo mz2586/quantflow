@@ -16,6 +16,7 @@ That is asserted here so a future change cannot silently shrink the live pool.
 from __future__ import annotations
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import ExchangeEnv, ExchangeSettings, MarketType
 from quantflow.exchange.bybit.rest import BybitGateway
@@ -27,10 +28,10 @@ def gateway_for(env: ExchangeEnv) -> BybitGateway:
     return BybitGateway(
         ExchangeSettings(
             name="bybit",
-            api_key="k" * 18,
-            api_secret="s" * 36,
-            demo_api_key="d" * 18,
-            demo_api_secret="e" * 36,
+            api_key=SecretStr("k" * 18),
+            api_secret=SecretStr("s" * 36),
+            demo_api_key=SecretStr("d" * 18),
+            demo_api_secret=SecretStr("e" * 36),
             env=env,
             market_type=MarketType.FUTURE,
         )

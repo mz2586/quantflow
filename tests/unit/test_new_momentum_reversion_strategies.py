@@ -108,7 +108,9 @@ def context_from(candles: Sequence[Candle], position: Position | None = None) ->
     )
 
 
-def evaluate(strategy: Strategy, closes: Sequence[Decimal], position: Position | None = None):  # type: ignore[no-untyped-def]
+def evaluate(
+    strategy: Strategy, closes: Sequence[Decimal], position: Position | None = None
+) -> Signal:
     """Run a strategy over a close series."""
     return strategy.evaluate(context_from(candles_from(closes), position))
 
@@ -390,7 +392,8 @@ class TestMomentumAcceleration:
         enabled = evaluate(MomentumAccelerationStrategy({"allow_short": True}), falling)
         assert enabled.direction is SignalDirection.SHORT
         assert enabled.stop_loss_price is not None
-        assert enabled.stop_loss_price > enabled.reference_price  # type: ignore[operator]
+        assert enabled.reference_price is not None
+        assert enabled.stop_loss_price > enabled.reference_price
 
 
 # --------------------------------------------------------------------------- #

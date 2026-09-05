@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
+from quantflow.api.dashboard.cache import ResilientCache
 from quantflow.api.deps import DatabaseDep, GatewayDep
 from quantflow.api.schemas import (
     CandleResponse,
@@ -18,6 +19,7 @@ from quantflow.api.schemas import (
 from quantflow.core.errors import NotFoundError
 from quantflow.domain.enums import Timeframe
 from quantflow.domain.instruments import Symbol
+from quantflow.persistence.database import Database
 from quantflow.persistence.repositories import CandleRepository, InstrumentRepository
 
 router = APIRouter(prefix="/market", tags=["market-data"])
@@ -44,9 +46,20 @@ def _parse_symbol(raw: str) -> Symbol:
     return parsed
 
 
-@router.get("/series", response_model=list[SymbolSummary], summary="List stored series")
-async def list_series(database: DatabaseDep) -> list[SymbolSummary]:
-    """Every stored ``(symbol, timeframe)`` pair and its bar count."""
+#: Cache for the stored-series listing.
+#:
+#: This endpoint is the most expensive read in the API by a wide margin: an ungrouped
+#: ``count(*)`` over every candle ever stored, followed by two more queries per series for
+#: the first and last bar. On a million-row table that exceeds the database's statement
+#: timeout, and because the dashboard used to poll it every five seconds, the cancelled
+#: queries piled up until the API stopped answering anything at all — health probe
+#: included. The catalogue of stored series changes when a download runs, not between
+#: renders, so a minute of staleness costs nothing and bounds the damage.
+_series_cache: ResilientCache[list[SymbolSummary]] = ResilientCache(60.0, name="market_series")
+
+
+async def _load_series(database: Database) -> list[SymbolSummary]:
+    """Read every stored ``(symbol, timeframe)`` pair with its extent."""
     async with database.read_session() as session:
         repository = CandleRepository(session)
         series = await repository.available_series()
@@ -62,6 +75,18 @@ async def list_series(database: DatabaseDep) -> list[SymbolSummary]:
                 )
             )
     return summaries
+
+
+@router.get("/series", response_model=list[SymbolSummary], summary="List stored series")
+async def list_series(database: DatabaseDep) -> list[SymbolSummary]:
+    """Every stored ``(symbol, timeframe)`` pair and its bar count.
+
+    Served from a short-lived cache; see :data:`_series_cache`. A failed refresh returns
+    the previous listing rather than an error, because an empty series list makes the
+    market-data panel look as though nothing has ever been downloaded.
+    """
+    cached = await _series_cache.get(lambda: _load_series(database))
+    return cached.value or []
 
 
 @router.get("/candles/{symbol}", response_model=CandlesResponse, summary="Fetch stored candles")

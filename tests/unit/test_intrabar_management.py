@@ -124,6 +124,7 @@ class TestLongStages:
         _, actions = walk(long_state(), ["100.30", "100.60", "100.80"])
         partial = next(a for a in actions if a.kind is ActionKind.PARTIAL_CLOSE)
 
+        assert partial.close_quantity is not None
         assert partial.close_quantity == (QTY * Decimal("0.33")).quantize(partial.close_quantity)
 
     def test_a_reversal_after_stage_two_exits_without_a_candle(self) -> None:

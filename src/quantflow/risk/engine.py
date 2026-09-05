@@ -11,6 +11,7 @@ refusal. It never returns a partially-checked order.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -20,17 +21,19 @@ from quantflow.core.clock import Clock, SystemClock, start_of_utc_day
 from quantflow.core.config import RiskSettings
 from quantflow.core.errors import RiskViolationError, ValidationError
 from quantflow.core.logging import get_logger
-from quantflow.core.precision import ONE, ZERO
+from quantflow.core.precision import ONE, ZERO, round_price
 from quantflow.domain.enums import OrderSide, OrderType, SignalDirection
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.orders import OrderRequest
 from quantflow.domain.portfolio import PortfolioSnapshot
 from quantflow.domain.signals import Signal
 from quantflow.persistence.database import Database
+from quantflow.risk.conviction import allocation_fraction, percentile_of
 from quantflow.risk.correlation import CorrelationMatrix
 from quantflow.risk.killswitch import KillSwitch
 from quantflow.risk.rules import RiskContext, RiskRule, RiskVerdict, build_default_rules
 from quantflow.risk.sizing import PositionSizer, SizingRequest, SizingResult, build_sizer
+from quantflow.risk.targets import cost_aware_target
 
 logger = get_logger(__name__)
 
@@ -91,6 +94,24 @@ class RiskDecision:
         }
 
 
+#: How far inside the touch a passive entry is posted, as a fraction of price.
+#:
+#: The entry price is the bar's CLOSE, and the order reaches the venue after it. If the
+#: market has moved even slightly against the passive side in that gap, a post-only order
+#: priced at the close is now aggressive and the venue refuses it outright.
+#:
+#: Measured on this account 2026-08-17/18: **7 of 15 entry attempts were cancelled** that
+#: way — fully qualified setups, past every gate, refused purely on price staleness. At the
+#: session's +9.47 expectancy per trade that is roughly 66 USDT of foregone profit, and
+#: recovering it requires no gate to be loosened.
+#:
+#: Two basis points is below any meaningful move on a 15m bar yet comfortably clear of the
+#: spread on BTC and ETH, so the order rests as a maker instead of being rejected. It is
+#: deliberately small: a wider offset would fill less often and, when it did fill, would
+#: fill because the market ran past it.
+PASSIVE_ENTRY_OFFSET_PCT = Decimal("0.0002")
+
+
 def as_maker_entry(
     order_type: OrderType,
     *,
@@ -98,6 +119,9 @@ def as_maker_entry(
     reference_price: Decimal,
     enabled: bool,
     is_entry: bool = True,
+    side: OrderSide | None = None,
+    price_tick: Decimal | None = None,
+    passive_offset_pct: Decimal = PASSIVE_ENTRY_OFFSET_PCT,
 ) -> tuple[OrderType, Decimal | None, bool]:
     """Convert an aggressive entry into a passive one, or leave it alone.
 
@@ -125,10 +149,56 @@ def as_maker_entry(
         return order_type, limit_price, False
     if order_type is OrderType.LIMIT and limit_price is not None:
         return order_type, limit_price, True
-    # At the touch: rest where the market currently is rather than trying to guess a
-    # better price. A limit further away fills less often and, when it does fill, fills
-    # precisely because the market ran past it.
-    return OrderType.LIMIT, reference_price, True
+    # Just inside the touch, on the passive side. Resting exactly AT the close was the
+    # defect: the close is already stale by the time the order lands, so any adverse tick
+    # turns a passive order into an aggressive one and the venue cancels it rather than
+    # charging taker. A small offset keeps it a genuine maker order without chasing.
+    if side is None or passive_offset_pct <= ZERO:
+        return OrderType.LIMIT, reference_price, True
+    offset = reference_price * passive_offset_pct
+    passive = reference_price - offset if side is OrderSide.BUY else reference_price + offset
+    # Snapped to the venue's tick grid. An offset computed as a fraction of price almost
+    # never lands on the grid, and the venue rejects the whole order outright: on
+    # 2026-08-18 this produced "price 64296.63810 is not a multiple of tick 0.10" and
+    # blocked eleven consecutive candidates. round_price rounds a buy DOWN and a sell UP,
+    # which is the passive direction here, so snapping cannot make the order aggressive.
+    if price_tick is not None and price_tick > ZERO:
+        passive = round_price(passive, price_tick, side_is_buy=side is OrderSide.BUY)
+    return OrderType.LIMIT, passive, True
+
+
+def _expected_net_edge(
+    *, side: OrderSide, entry: Decimal, target: Decimal | None, cost_rate: Decimal
+) -> Decimal | None:
+    """Expected return to target, less the round-trip cost, as a fraction of notional.
+
+    ``None`` when there is no target to measure against — an unknown edge is not treated as
+    a positive one, so it cannot unlock a larger position.
+    """
+    if target is None or entry <= ZERO:
+        return None
+    move = (target - entry) if side is OrderSide.BUY else (entry - target)
+    return (move / entry) - cost_rate
+
+
+def entry_has_expired(*, bars_resting: int, max_bars: int) -> bool:
+    """Whether a passive entry has rested too long to still be acted on.
+
+    A post-only entry is a bet on a price *and a moment*. The strategy's stop, target and
+    size were all computed from the bar that produced the signal, so a fill several bars
+    later is a position taken on analysis that no longer applies — entered at a price the
+    market has already left behind, protected by levels chosen for different conditions.
+
+    Missing the trade costs nothing. Taking an expired one costs whatever moved in between,
+    which is why this bounds the wait rather than chasing the price.
+
+    A limit of zero or less means "do not rest at all", and is deliberately distinguished
+    from an absent limit: read through a falsy check, zero would mean rest forever, which
+    is the opposite of what it says.
+    """
+    if max_bars <= 0:
+        return bars_resting > 0
+    return bars_resting > max_bars
 
 
 class RiskEngine:
@@ -139,6 +209,7 @@ class RiskEngine:
         "_consecutive_losses",
         "_correlations",
         "_database",
+        "_entry_scores",
         "_halted_until",
         "_kill_switch",
         "_last_loss_at",
@@ -148,6 +219,7 @@ class RiskEngine:
         "_session_id",
         "_settings",
         "_sizer",
+        "_thesis_failures",
         "_week_start_equity",
         "_week_started_at",
     )
@@ -186,6 +258,12 @@ class RiskEngine:
         #: the market that is going against the strategy, not from all of them.
         self._consecutive_losses: dict[Symbol, int] = {}
         self._last_loss_at: dict[Symbol, datetime] = {}
+        # (symbol, side) -> (when it was stopped out, what it scored going in). Keyed by
+        # side because a long failing says nothing about a short in the same market.
+        self._thesis_failures: dict[tuple[Symbol, OrderSide], tuple[datetime, Decimal | None]] = {}
+        # What each symbol/side scored on the way in, so a stop-out can be compared against
+        # the next candidate rather than needing the caller to remember it.
+        self._entry_scores: dict[tuple[Symbol, OrderSide], Decimal | None] = {}
         #: Return correlations between traded symbols. Supplied from outside because the
         #: engine has no market data of its own and must never acquire any.
         self._correlations = CorrelationMatrix(values={})
@@ -286,6 +364,8 @@ class RiskEngine:
         portfolio: PortfolioSnapshot,
         instrument: Instrument,
         reference_price: Decimal,
+        resting_entry_notional: Mapping[str, Decimal] | None = None,
+        candidate_score: Decimal | None = None,
     ) -> RiskDecision:
         """Run every rule against an already-sized order.
 
@@ -298,6 +378,7 @@ class RiskEngine:
         await self.refresh_kill_switch()
 
         now = self._clock.now()
+        thesis_failure = self._thesis_failures.get((request.symbol, request.side), (None, None))
         context = RiskContext(
             request=request,
             portfolio=portfolio,
@@ -311,13 +392,20 @@ class RiskEngine:
             week_start_equity=self._weekly_baseline(portfolio.equity, now),
             consecutive_losses=self._consecutive_losses.get(request.symbol, 0),
             last_loss_at=self._last_loss_at.get(request.symbol),
+            last_thesis_failure_at=thesis_failure[0],
+            last_thesis_failure_score=thesis_failure[1],
             correlated_open_symbols=self._correlated_open(request.symbol, portfolio),
+            resting_entry_notional=resting_entry_notional or {},
+            candidate_score=candidate_score,
         )
 
         verdicts = tuple(rule.evaluate(context) for rule in self._rules)
         denials = tuple(verdict for verdict in verdicts if not verdict.allowed)
 
         if not denials:
+            # Remembered now so that if this trade later stops out, the cooldown can judge
+            # the next candidate against what this one scored.
+            self._entry_scores[(request.symbol, request.side)] = candidate_score
             return RiskDecision(approved=True, request=request, verdicts=verdicts)
 
         should_halt = any(verdict.halts_trading for verdict in denials)
@@ -362,6 +450,7 @@ class RiskEngine:
         instrument: Instrument,
         reference_price: Decimal,
         volatility: Decimal | None = None,
+        resting_entry_notional: Mapping[str, Decimal] | None = None,
     ) -> RiskDecision:
         """Turn a strategy signal into an approved order, or refuse it.
 
@@ -379,6 +468,24 @@ class RiskEngine:
         side = OrderSide.BUY if signal.direction is SignalDirection.LONG else OrderSide.SELL
         stop_loss = signal.stop_loss_price or self._default_stop(side, reference_price)
 
+        # Conviction, resolved before sizing so it can be applied inside the sizer's caps.
+        # The orchestrator ranked this candidate against the whole field and attached its
+        # score; this turns that ranking into a share of the allowed position. Every trade
+        # before this was identically sized whatever the score.
+        #
+        # Gated on expected net edge: a candidate can top a weak field and still not be
+        # worth more capital. Increases require the trade to be expected to pay for its own
+        # execution; reductions do not, because trusting a marginal setup less is safe.
+        raw_score = signal.metadata.get("orchestrator_score")
+        score = Decimal(raw_score) if raw_score else None
+        expected_edge = _expected_net_edge(
+            side=side,
+            entry=reference_price,
+            target=signal.take_profit_price,
+            cost_rate=self._settings.round_trip_cost_rate,
+        )
+        tier, allocation = allocation_fraction(score, expected_net_edge=expected_edge)
+
         try:
             sizing = self._sizer.size(
                 SizingRequest(
@@ -386,7 +493,24 @@ class RiskEngine:
                     price=reference_price,
                     instrument=instrument,
                     stop_loss_price=stop_loss,
-                    conviction=signal.conviction,
+                    # What this symbol already holds, so an additional leg is sized into the
+                    # room left under the SAME cap rather than claiming the whole allowance
+                    # a second time. Zero on a flat symbol, so the ordinary path is
+                    # unchanged.
+                    committed_notional=self._committed_on(
+                        signal.symbol, portfolio, reference_price, resting_entry_notional
+                    ),
+                    # Conviction enters here — before the sizer's caps — because that is
+                    # where the sizer applies it. Scaling after the caps produced sizes the
+                    # next check rejected outright, so the two components contradicted each
+                    # other and nothing was ever placed.
+                    #
+                    # Two independent attenuators, multiplied: the strategy's own
+                    # confidence in this setup, and the orchestrator's ranking of it against
+                    # the field. Both are fractions, so the product is one too and the cap
+                    # still binds. Dropping either would discard information the other does
+                    # not carry.
+                    conviction=signal.conviction * allocation,
                     available_cash=portfolio.cash,
                     volatility=volatility,
                 )
@@ -408,6 +532,42 @@ class RiskEngine:
             limit_price=signal.limit_price,
             reference_price=reference_price,
             enabled=self._settings.maker_first_entries,
+            side=side,
+            price_tick=instrument.price_tick,
+        )
+        # Applied at the same single point as maker conversion, so every strategy gets a
+        # target that clears its own execution cost without any of them knowing about fees.
+        # Widening only: a strategy that already chose a further level keeps it, and the
+        # stop is never touched.
+        target = cost_aware_target(
+            side=side,
+            entry=reference_price,
+            target=signal.take_profit_price,
+            atr=volatility,
+            cost_rate=self._settings.round_trip_cost_rate,
+        )
+        if target is not None and target != signal.take_profit_price:
+            logger.info(
+                "risk.target_widened",
+                symbol=str(signal.symbol),
+                strategy=signal.strategy_id,
+                requested=str(signal.take_profit_price),
+                applied=str(target),
+                reason="the requested target did not clear its round-trip cost",
+            )
+        logger.info(
+            "risk.conviction_sized",
+            symbol=str(signal.symbol),
+            strategy=signal.strategy_id,
+            score=str(score) if score is not None else None,
+            percentile=percentile_of(score) if score is not None else None,
+            tier=tier.value,
+            allocation_fraction=str(allocation),
+            final_quantity=str(sizing.quantity),
+            capped_by=sizing.capped_by,
+            notional=str(sizing.quantity * reference_price),
+            stop_distance=str(abs(reference_price - stop_loss)),
+            expected_net_edge=str(expected_edge) if expected_edge is not None else None,
         )
         request = OrderRequest(
             symbol=signal.symbol,
@@ -417,7 +577,7 @@ class RiskEngine:
             price=entry_price,
             post_only=post_only,
             stop_loss_price=stop_loss,
-            take_profit_price=signal.take_profit_price,
+            take_profit_price=target,
             time_in_force=signal.time_in_force,
             strategy_id=signal.strategy_id,
             signal_id=signal.signal_id,
@@ -429,6 +589,8 @@ class RiskEngine:
             portfolio=portfolio,
             instrument=instrument,
             reference_price=reference_price,
+            resting_entry_notional=resting_entry_notional,
+            candidate_score=score,
         )
         if decision.approved:
             return RiskDecision(
@@ -495,8 +657,16 @@ class RiskEngine:
         """
         self._correlations = matrix
 
-    def record_trade_result(self, net_pnl: Decimal, *, closed_at: datetime, symbol: Symbol) -> None:
-        """Record a closed trade so the loss-streak cooldown can track it.
+    def record_trade_result(
+        self,
+        net_pnl: Decimal,
+        *,
+        closed_at: datetime,
+        symbol: Symbol,
+        side: OrderSide | None = None,
+        gross_pnl: Decimal | None = None,
+    ) -> None:
+        """Record a closed trade so the cooldowns can track it.
 
         A break-even trade counts as a loss: after fees it *is* one, and treating it as a
         reset would let a strategy grind through the streak limit indefinitely.
@@ -507,9 +677,115 @@ class RiskEngine:
         if net_pnl > ZERO:
             self._consecutive_losses.pop(symbol, None)
             self._last_loss_at.pop(symbol, None)
+            if side is not None:
+                # A winner clears the thesis mark: the case has been vindicated, and
+                # holding a cooldown over it would penalise a strategy for being right.
+                self._thesis_failures.pop((symbol, side), None)
             return
         self._consecutive_losses[symbol] = self._consecutive_losses.get(symbol, 0) + 1
         self._last_loss_at[symbol] = closed_at
+
+        # The thesis itself is also marked failed, so the same symbol and side is not
+        # re-entered on unchanged evidence. Recorded here rather than at the call sites so
+        # paper and backtest cannot diverge: both reach this one method.
+        #
+        # Armed on GROSS loss, not net. A mechanical failure is not a failed thesis, and
+        # judging by net cannot tell them apart: on 2026-08-17 a BTC entry filled and was
+        # emergency-flattened 0.4 seconds later because its stop would not attach at the
+        # venue. Gross was exactly 0.00 and the only loss was the 6.51 in fees — the market
+        # never got to express an opinion — yet it armed the cooldown and locked BTC out
+        # for an hour. An aborted entry, a rejected order and a fee-only scratch all reach
+        # this method looking like small losses; only gross separates them from a thesis
+        # the market actually refuted.
+        if gross_pnl is not None and gross_pnl >= ZERO:
+            return
+        if side is not None:
+            self._thesis_failures[(symbol, side)] = (
+                closed_at,
+                self._entry_scores.get((symbol, side)),
+            )
+
+    def export_cooldown_state(self) -> dict[str, Any]:
+        """The thesis-cooldown state, in a form that survives a restart.
+
+        Held in memory it does not. On 2026-08-17 the engine restarted between an entry
+        being approved and its loss being recorded, so the entry score was gone and the
+        cooldown refused a candidate with "no score was recorded to compare against" — the
+        early-clear path, which exists precisely so a materially stronger signal can
+        proceed, could not run at all. A cooldown that cannot be argued with is a harsher
+        rule than the one that was designed.
+        """
+        return {
+            "failures": [
+                {
+                    "symbol": str(symbol),
+                    "side": side.value,
+                    "at": moment.isoformat(),
+                    "score": str(score) if score is not None else None,
+                }
+                for (symbol, side), (moment, score) in self._thesis_failures.items()
+            ],
+            "entry_scores": [
+                {"symbol": str(symbol), "side": side.value, "score": str(score)}
+                for (symbol, side), score in self._entry_scores.items()
+                if score is not None
+            ],
+        }
+
+    def restore_cooldown_state(self, payload: Any) -> int:
+        """Rebuild cooldown state from :meth:`export_cooldown_state`.
+
+        Never raises: a malformed or absent payload leaves the engine exactly as it started,
+        which is the pre-existing behaviour rather than a new failure mode.
+
+        Returns:
+            How many failure records were restored.
+
+        """
+        if not isinstance(payload, dict):
+            return 0
+        restored = 0
+        for row in payload.get("failures") or []:
+            try:
+                key = (Symbol.parse(row["symbol"]), OrderSide(row["side"]))
+                score = row.get("score")
+                self._thesis_failures[key] = (
+                    datetime.fromisoformat(row["at"]),
+                    Decimal(score) if score is not None else None,
+                )
+                restored += 1
+            except (KeyError, TypeError, ValueError, ArithmeticError, ValidationError):
+                continue
+        for row in payload.get("entry_scores") or []:
+            try:
+                self._entry_scores[(Symbol.parse(row["symbol"]), OrderSide(row["side"]))] = Decimal(
+                    row["score"]
+                )
+            except (KeyError, TypeError, ValueError, ArithmeticError, ValidationError):
+                continue
+        return restored
+
+    @staticmethod
+    def _committed_on(
+        symbol: Symbol,
+        portfolio: PortfolioSnapshot,
+        reference_price: Decimal,
+        resting: Mapping[str, Decimal] | None,
+    ) -> Decimal:
+        """Notional already committed on one symbol: open position plus resting entries.
+
+        The same two components :class:`~quantflow.risk.rules.MaxPositionSizeRule` checks
+        against, computed here so the sizer and the rule cannot disagree about how much
+        room is left. A sizer that ignores this produces a leg the rule then refuses, which
+        is how conviction and the position cap contradicted each other once already.
+        """
+        committed = ZERO
+        position = portfolio.position_for(symbol)
+        if position is not None:
+            committed += position.notional(reference_price)
+        if resting:
+            committed += resting.get(str(symbol), ZERO)
+        return committed
 
     def _weekly_baseline(self, equity: Decimal, now: datetime) -> Decimal | None:
         """Equity at the start of the current seven-day window.

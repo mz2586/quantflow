@@ -11,6 +11,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import ExchangeSettings, MarketType
 from quantflow.core.errors import ExchangeError, ValidationError
@@ -105,13 +106,13 @@ class StubGateway(BybitGateway):
         super().__init__(
             ExchangeSettings(
                 name="bybit",
-                api_key="k" * 18,
-                api_secret="s" * 36,
+                api_key=SecretStr("k" * 18),
+                api_secret=SecretStr("s" * 36),
                 testnet=True,
                 market_type=MarketType.FUTURE,
             )
         )
-        self._client = client  # type: ignore[assignment]
+        self._client = client
         self._instruments.put(instrument())
         type(self)._positions_response = positions or []  # type: ignore[attr-defined]
 

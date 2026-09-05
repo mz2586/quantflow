@@ -1,14 +1,27 @@
 /**
  * Typed API client.
  *
- * Every monetary field arrives as a **string**, never a JSON number, and is kept that way
- * until the moment it is formatted for display. `0.1 + 0.2 !== 0.3` in JavaScript, and a
- * dashboard that silently renders a position size or a PnL wrong is worse than one that
- * renders nothing at all.
+ * Two rules run through every type below.
+ *
+ * **Money is a string, end to end.** Every monetary and high-precision value arrives as a
+ * JSON string and stays one until the moment it is formatted for display. `0.1 + 0.2 !==
+ * 0.3` in JavaScript, and a dashboard that silently renders a position size or a PnL
+ * wrong is worse than one that renders nothing.
+ *
+ * **Anything the server may omit is declared optional.** These types describe JSON from a
+ * process deployed separately from this bundle: a stale or half-rebuilt API omits fields
+ * the frontend was written against. That is how the page went blank once — `risk?.
+ * kill_switch.engaged` guarded `risk` and then dereferenced `kill_switch` unguarded,
+ * `undefined.engaged` threw, and a throw during render unmounts React's entire tree.
+ * Marking these optional makes the compiler enforce the handling rather than leaving it
+ * to discipline.
  */
 
-/** A monetary or high-precision value. Kept as a string end to end. */
+/** A monetary or high-precision value. Kept as a string. */
 export type Money = string;
+
+/** A value the engine does not record. Rendered as `NOT RECORDED`, never as zero. */
+export type NotRecorded = null;
 
 export interface HealthResponse {
   status: "ok";
@@ -19,264 +32,549 @@ export interface HealthResponse {
 export interface ComponentHealth {
   name: string;
   healthy: boolean;
-  detail: string | null;
-  latency_ms: number | null;
+  detail?: string | null;
+  latency_ms?: number | null;
 }
 
 export interface ReadinessResponse {
   ready: boolean;
-  components: ComponentHealth[];
-  trading_mode: string;
-  kill_switch_engaged: boolean;
+  components?: ComponentHealth[];
+  trading_mode?: string;
+  kill_switch_engaged?: boolean;
+}
+
+/** Provenance attached to every block that can go stale. */
+export interface Freshness {
+  source?: string;
+  fetched_at?: string | null;
+  age_seconds?: number | null;
+  stale?: boolean;
+  error?: string | null;
+  available?: boolean;
+}
+
+export interface SessionRef {
+  session_id: string;
+  mode?: string;
+  status?: string;
+  strategy_id?: string;
+  timeframe?: string;
+  base_currency?: string;
+  symbols?: string[];
+  starting_equity?: Money;
+  started_at?: string | null;
+  created_at?: string | null;
+  is_running?: boolean;
+  /** Why this session was chosen, shown so the operator never has to guess. */
+  selection_basis?: string;
+}
+
+export interface EngineStatus {
+  state?: string;
+  detail?: string;
+  evidence?: Record<string, unknown>;
+}
+
+/** One non-USDT holding, valued only where an authoritative price existed. */
+export interface OtherAsset {
+  asset: string;
+  free?: Money;
+  locked?: Money;
+  quantity?: Money;
+  price_usdt?: Money | null;
+  value_usdt?: Money | null;
+  valuation_source?: string | null;
+  unpriced_reason?: string | null;
+}
+
+/**
+ * The venue's account, with units kept apart.
+ *
+ * `trading_equity_usdt` and `available_usdt` are the only figures the engine sizes
+ * against. `total_portfolio_value_usdt` is present **only** when every holding could be
+ * priced, and is always accompanied by its method and timestamp. There is deliberately no
+ * field that sums across assets without conversion.
+ */
+export interface VenueAccount {
+  trading_equity_usdt?: Money;
+  available_usdt?: Money;
+  locked_usdt?: Money;
+  quote_asset?: string;
+  other_assets?: OtherAsset[];
+  other_assets_value_usdt?: Money | null;
+  unpriced_assets?: string[];
+  total_portfolio_value_usdt?: Money | null;
+  valuation_method?: string | null;
+  valued_at?: string | null;
+}
+
+export interface VenuePosition {
+  symbol: string;
+  side?: string;
+  quantity?: Money;
+  entry_price?: Money;
+  mark_price?: Money;
+  notional_usdt?: Money;
+  unrealized_pnl?: Money;
+  leverage?: Money;
+  liquidation_price?: Money | null;
+  margin_mode?: string | null;
+  venue_stop_loss?: Money | null;
+  venue_take_profit?: Money | null;
+  opened_at?: string | null;
+}
+
+export interface VenueOrder {
+  order_id: string;
+  venue_order_id?: string | null;
+  client_order_id?: string | null;
+  symbol: string;
+  side?: string;
+  type?: string;
+  /** Read from the venue every refresh, so it never shows NEW for a filled order. */
+  status?: string;
+  time_in_force?: string;
+  quantity?: Money;
+  filled_quantity?: Money;
+  remaining_quantity?: Money;
+  price?: Money | null;
+  trigger_price?: Money | null;
+  average_fill_price?: Money;
+  reduce_only?: boolean;
+  purpose?: "stop_loss" | "take_profit" | null;
+  created_at?: string;
+}
+
+/**
+ * Capital committed to open positions.
+ *
+ * Two figures rather than one: they differ by the leverage multiple, so a panel that
+ * showed only "in trades" without saying which it meant would misstate committed capital
+ * by that factor.
+ */
+export interface Deployed {
+  notional_usdt?: Money;
+  margin_usdt?: Money;
+  position_count?: number;
+  basis?: string;
+}
+
+export interface VenueBlock {
+  venue?: string;
+  network?: string;
+  authenticated?: boolean;
+  account?: VenueAccount;
+  deployed?: Deployed | null;
+  positions?: VenuePosition[];
+  position_count?: number;
+  position_error?: string | null;
+  unrealized_pnl?: Money | null;
+  open_orders?: VenueOrder[];
+  open_order_count?: number;
+  freshness?: Freshness;
+}
+
+export interface TradingPerformance {
+  closed_trades?: number;
+  gross_realized_pnl?: Money;
+  total_fees?: Money;
+  net_realized_pnl?: Money;
+  today_net_pnl?: Money;
+  today_closed_trades?: number;
+  today_fees?: Money;
+  win_count?: number;
+  loss_count?: number;
+  win_rate?: Money | null;
+  profit_factor?: Money | null;
+  gross_profit?: Money;
+  gross_loss?: Money;
+  average_net_pnl?: Money | null;
+  best_trade?: Money | null;
+  worst_trade?: Money | null;
+  average_holding_seconds?: Money;
+  first_exit_at?: string | null;
+  last_exit_at?: string | null;
+  sample_is_thin?: boolean;
+}
+
+export interface SessionEquity {
+  capital_base?: Money;
+  capital_base_source?: string;
+  starting_equity?: Money;
+  latest_equity?: Money | null;
+  latest_cash?: Money | null;
+  latest_unrealized_pnl?: Money | null;
+  latest_realized_pnl?: Money | null;
+  latest_gross_exposure?: Money | null;
+  latest_at?: string | null;
+  peak_equity?: Money | null;
+  current_drawdown_pct?: Money | null;
+  max_drawdown_pct?: Money | null;
+  return_pct?: Money | null;
+  return_basis?: string;
+  snapshot_count?: number;
+  history_from?: string | null;
+  history_to?: string | null;
+}
+
+export interface FeeAnalysis {
+  total_fees?: Money;
+  gross_realized_pnl?: Money;
+  net_realized_pnl?: Money;
+  closed_trades?: number;
+  average_fee_per_trade?: Money | null;
+  total_entry_notional?: Money;
+  average_fee_pct_of_notional?: Money | null;
+  fee_to_gross_ratio?: Money | null;
+  fees_exceed_gross_profit?: boolean;
+  entry_fees?: Money | null;
+  exit_fees?: Money | null;
+  not_recorded?: Record<string, string>;
+}
+
+/** Where QuantFlow's record and the venue disagree about what is open. */
+export interface BookReconciliation {
+  venue_open_positions?: number | null;
+  database_open_positions?: number;
+  venue_open_orders?: number | null;
+  database_open_orders?: number;
+  positions_match?: boolean;
+  orders_match?: boolean;
+  authority?: string;
+}
+
+export interface DecisionSummary {
+  evaluated?: number;
+  selected?: number;
+  declined?: number;
+  by_outcome?: Record<string, number>;
+  by_rejection_category?: Record<string, number>;
+  by_symbol?: Record<string, number>;
+  first_at?: string | null;
+  last_at?: string | null;
+  window?: string;
+  freshness?: Freshness;
+}
+
+export interface SupervisorHistory {
+  available?: boolean;
+  path?: string;
+  error?: string;
+  events?: string[];
+  restart_count?: number;
+  exit_count?: number;
+  /** Exits with rc=137 — SIGKILL, which on this host has meant the OS reclaiming memory. */
+  killed_count?: number;
+}
+
+/** What the running engine reported about itself when it started. */
+export interface EngineFacts {
+  started_at?: string | null;
+  mode?: string | null;
+  env?: string | null;
+  timeframe?: string | null;
+  symbols?: string[];
+  strategy?: string | null;
+  strategy_pool?: string | null;
+  starting_equity?: string | null;
+  equity_source?: string | null;
+  max_concurrent?: string | null;
+  meme_symbols?: string[];
+  meme_discovered?: string | null;
+  agreement_blocked_symbols?: string[];
+  agreement_blocked_at?: string | null;
+  /** Asset classes the venue set aside, named by the engine rather than inferred. */
+  agreement_blocked_classes?: string[];
+  /** The venue codes actually seen — one per agreement still to be signed. */
+  agreement_codes?: string[];
+  class_symbols?: Record<string, string[]>;
+  /** Always null: no pid file exists and the API cannot observe host processes. */
+  pid?: number | null;
+  pid_note?: string;
+  supervisor?: SupervisorHistory;
+}
+
+export interface Coverage {
+  earliest_fill_at?: string | null;
+  orders_without_fills?: number;
+  gap_from?: string | null;
+  gap_to?: string | null;
+  has_gap?: boolean;
+  note?: string;
+}
+
+/** The engine's own liveness, from its Redis heartbeat — never inferred from decisions. */
+export interface EngineHealth {
+  state?: "RUNNING" | "DEGRADED" | "STALE" | "STOPPED" | "UNKNOWN";
+  detail?: string;
+  evidence?: {
+    pid?: number | null;
+    heartbeat_age_seconds?: number;
+    last_candle_at?: string | null;
+    last_decision_at?: string | null;
+    last_reconcile_at?: string | null;
+    open_positions?: number | null;
+  };
+}
+
+export interface Summary {
+  engine_health?: EngineHealth;
+  generated_at?: string;
+  session?: SessionRef;
+  status?: EngineStatus;
+  venue?: VenueBlock;
+  trading_performance?: TradingPerformance;
+  session_equity?: SessionEquity;
+  session_book?: { open_positions?: number; open_orders?: number; source?: string };
+  fees?: FeeAnalysis;
+  book_reconciliation?: BookReconciliation;
+  risk?: { kill_switch_engaged?: boolean; trading_halted?: boolean; available?: boolean };
+  decisions?: DecisionSummary;
+  engine?: EngineFacts;
+}
+
+/** One period's profit and loss, with the fee bill kept visible beside the net. */
+export interface PnlPeriod {
+  closed_trades?: number;
+  gross_profit?: Money;
+  gross_loss?: Money;
+  fees?: Money;
+  net_pnl?: Money;
+  win_count?: number;
+  loss_count?: number;
+  win_rate?: Money | null;
+  profit_factor?: Money | null;
+  sample_is_thin?: boolean;
+  scope?: string;
+}
+
+export interface CumulativePoint {
+  at?: string;
+  cumulative_net?: Money;
+  cumulative_gross?: Money;
+  cumulative_fees?: Money;
+}
+
+export interface PnlResponse {
+  session_id?: string;
+  ranges?: string[];
+  order?: string[];
+  periods?: Record<string, PnlPeriod>;
+  generated_at?: string;
+  cumulative?: {
+    window?: string;
+    points?: CumulativePoint[];
+    point_count?: number;
+    truncated?: boolean;
+    source?: string;
+  };
+}
+
+export interface PositionsResponse {
+  available?: boolean;
+  positions?: VenuePosition[];
+  position_count?: number;
+  unrealized_pnl?: Money | null;
+  deployed?: Deployed;
+  error?: string | null;
+  freshness?: Freshness;
+  not_recorded?: string[];
+}
+
+export interface OrdersResponse {
+  available?: boolean;
+  orders?: VenueOrder[];
+  order_count?: number;
+  error?: string | null;
+  freshness?: Freshness;
+}
+
+export interface EquityPoint {
+  timestamp?: string;
+  equity?: Money;
+  cash?: Money;
+  realized_pnl?: Money;
+  unrealized_pnl?: Money;
+  running_peak?: Money;
+  drawdown_pct?: Money;
+  recorded_drawdown_pct?: Money;
+  position_count?: number;
+}
+
+export interface Discontinuity {
+  at?: string;
+  from_equity?: Money;
+  to_equity?: Money;
+  change_pct?: Money;
+  likely_cause?: string;
+}
+
+export interface EquityResponse {
+  session_id?: string;
+  window?: string;
+  ranges?: string[];
+  points?: EquityPoint[];
+  point_count?: number;
+  stride?: number;
+  available_from?: string | null;
+  available_to?: string | null;
+  total_snapshots?: number;
+  truncated?: boolean;
+  discontinuities?: Discontinuity[];
+  continuous?: boolean;
+  history_note?: string;
+}
+
+export interface LedgerTrade {
+  trade_number?: number;
+  trade_id: string;
+  symbol?: string;
+  asset_class?: string;
+  side?: string;
+  quantity?: Money;
+  entry_time?: string;
+  exit_time?: string;
+  entry_price?: Money;
+  exit_price?: Money;
+  entry_notional?: Money;
+  holding_seconds?: number;
+  gross_pnl?: Money;
+  total_fees?: Money;
+  net_pnl?: Money;
+  return_pct?: Money;
+  fee_share_of_gross?: Money | null;
+  strategy_id?: string | null;
+  regime?: string | null;
+  notes?: string | null;
+  /** Every field below is absent from the schema; rendered as NOT RECORDED. */
+  entry_fee?: NotRecorded;
+  exit_fee?: NotRecorded;
+  exit_reason?: NotRecorded;
+  mfe?: NotRecorded;
+  mae?: NotRecorded;
+  order_ids?: NotRecorded;
+  position_id?: NotRecorded;
+  venue_fill_ids?: NotRecorded;
+}
+
+export interface LedgerResponse {
+  session_id?: string;
+  coverage?: Coverage;
+  trades?: LedgerTrade[];
+  total?: number;
+  limit?: number;
+  offset?: number;
+  not_recorded?: Record<string, string>;
+}
+
+export interface AttributionGroup {
+  key?: string | null;
+  asset_class?: string;
+  trades?: number;
+  gross_pnl?: Money;
+  fees?: Money;
+  net_pnl?: Money;
+  wins?: number;
+  win_rate?: Money;
+  average_net_pnl?: Money;
+  profit_factor?: Money | null;
+  fee_share_of_gross?: Money | null;
+  best?: Money | null;
+  worst?: Money | null;
+  /** False when the sample is too small for the numbers to mean anything. */
+  reliable?: boolean;
+}
+
+export interface AnalyticsResponse {
+  session_id?: string;
+  by_strategy?: AttributionGroup[];
+  by_symbol?: AttributionGroup[];
+  by_side?: AttributionGroup[];
+  by_exit_reason?: AttributionGroup[];
+  exit_reason_available?: boolean;
+  exit_reason_note?: string;
+  strategy_attribution_note?: string | null;
+  min_sample?: number;
+}
+
+export interface DecisionRow {
+  timestamp?: string;
+  event?: string;
+  symbol?: string | null;
+  outcome?: string;
+  strategy?: string | null;
+  direction?: string | null;
+  score?: string | null;
+  confidence?: string | null;
+  candidates?: number | null;
+  regime?: string | null;
+  reason?: string | null;
+  rejection_category?: string | null;
+  component_scores?: Record<string, string>;
+  runner_up?: string | null;
+}
+
+export interface DecisionsResponse {
+  decisions?: DecisionRow[];
+  summary?: DecisionSummary;
+  source?: string;
+  freshness?: Freshness;
+  not_recorded?: Record<string, string>;
+}
+
+export interface CandleFreshness {
+  symbol?: string;
+  last_open_time?: string | null;
+  age_seconds?: number | null;
+}
+
+export interface FreshnessResponse {
+  generated_at?: string;
+  state?: string;
+  session_id?: string;
+  timeframe?: string;
+  venue_sync?: Freshness;
+  engine_log?: Freshness;
+  last_decision_at?: string | null;
+  last_equity_snapshot_at?: string | null;
+  last_equity_snapshot_age_seconds?: number | null;
+  last_order_at?: string | null;
+  last_candle_at?: string | null;
+  candles?: CandleFreshness[];
+  /** Why a stale stored candle does not mean the engine has lost its market data. */
+  candle_note?: string;
+  reconciliation?: { last_venue_read_at?: string | null; note?: string };
+}
+
+export interface AssetClassRow {
+  asset_class?: string;
+  description?: string;
+  /**
+   * ACTIVE | ACTIVE, ORDERS BLOCKED | IMPLEMENTED, BLOCKED | IMPLEMENTED, NOT ENABLED |
+   * IMPLEMENTED, NOT WIRED
+   */
+  state?: string;
+  reason?: string | null;
+  symbols?: string[];
+  symbol_count?: number;
+  open_positions?: number;
+  data_live?: boolean;
+}
+
+export interface AssetClassesResponse {
+  session_id?: string;
+  timeframe?: string;
+  asset_classes?: AssetClassRow[];
+  symbol_count?: number;
+  venue_available?: boolean;
+  source?: string;
 }
 
 export interface KillSwitch {
   engaged: boolean;
-  reason: string | null;
-  engaged_at: string | null;
-  engaged_by: string | null;
-}
-
-export interface RiskLimits {
-  max_position_pct: Money;
-  max_total_exposure_pct: Money;
-  max_concurrent_positions: number;
-  max_daily_loss_pct: Money;
-  max_drawdown_pct: Money;
-  max_leverage: Money;
-  require_stop_loss: boolean;
-  max_order_notional: Money;
-  max_orders_per_minute: number;
-}
-
-/**
- * Nested objects and lists below are declared **optional across these interfaces**, even
- * where the current API always sends them.
- *
- * This is not pedantry. These types describe JSON arriving from a process deployed
- * separately from this bundle: a stale or half-rebuilt API omits fields the frontend was
- * written against. `undefined.engaged` throws, a throw during render unmounts React's
- * whole tree, and the operator gets a blank page instead of a kill switch. Marking them
- * optional makes the compiler enforce the handling rather than leaving it to discipline.
- */
-export interface RiskStatus {
-  trading_halted: boolean;
-  kill_switch?: KillSwitch;
-  limits?: RiskLimits;
-  headroom?: Record<string, string>;
-  sizer?: string;
-  rules?: string[];
-}
-
-export interface RiskEvent {
-  rule: string;
-  severity: string;
-  message: string;
-  symbol: string | null;
-  observed_value: Money | null;
-  limit_value: Money | null;
-  blocked_order: boolean;
-  halted_trading: boolean;
-  created_at: string;
-}
-
-export interface Position {
-  symbol: string;
-  side: string;
-  quantity: Money;
-  average_entry_price: Money;
-  mark_price: Money | null;
-  unrealized_pnl: Money;
-  unrealized_pnl_pct: Money;
-  realized_pnl: Money;
-  stop_loss_price: Money | null;
-  take_profit_price: Money | null;
-  opened_at: string | null;
-  strategy_id: string | null;
-}
-
-export interface Portfolio {
-  base_currency: string;
-  equity: Money;
-  cash: Money;
-  starting_equity: Money;
-  total_return_pct: Money;
-  realized_pnl: Money;
-  unrealized_pnl: Money;
-  fees_paid: Money;
-  gross_exposure: Money;
-  leverage: Money;
-  drawdown_pct: Money;
-  daily_pnl: Money;
-  position_count?: number;
-  positions?: Position[];
-}
-
-export interface Candle {
-  open_time: string;
-  open: Money;
-  high: Money;
-  low: Money;
-  close: Money;
-  volume: Money;
-  quote_volume: Money;
-  trades: number;
-}
-
-export interface CandlesResponse {
-  symbol: string;
-  timeframe: string;
-  count: number;
-  candles?: Candle[];
-  /** Missing bars detected. Non-zero means the chart has holes. */
-  gaps: number;
-}
-
-export interface SeriesSummary {
-  symbol: string;
-  timeframe: string;
-  bars: number;
-  start: string | null;
-  end: string | null;
-}
-
-export interface StrategyDescription {
-  strategy_id: string;
-  description: string;
-  warmup_bars: number;
-  defaults: Record<string, unknown>;
-  schema: Record<string, unknown>;
-}
-
-export interface Trade {
-  symbol: string;
-  side: string;
-  quantity: Money;
-  entry_price: Money;
-  exit_price: Money;
-  entry_time: string;
-  exit_time?: string;
-  gross_pnl: Money;
-  fees: Money;
-  net_pnl: Money;
-  return_pct: Money;
-  holding_hours: Money;
-  strategy_id: string | null;
-}
-
-export interface Attribution {
-  key: string;
-  trade_count: number;
-  net_pnl: Money;
-  gross_pnl: Money;
-  fees: Money;
-  win_count: number;
-  win_rate: Money;
-  average_pnl: Money;
-  best: Money;
-  worst: Money;
-  fee_drag_pct: Money;
-  /** False when the sample is too small for the numbers to mean anything. */
-  reliable: boolean;
-}
-
-export interface PerformanceReview {
-  trade_count: number;
-  by_strategy?: Attribution[];
-  by_symbol?: Attribution[];
-  by_side?: Attribution[];
-  streaks?: { longest_win: number; longest_loss: number; current: number };
-  concentration?: {
-    top_trade_share: Money;
-    profit_without_best: Money;
-    is_concentrated: boolean;
-    rests_on_one_trade: boolean;
-  };
-  /** Plain-language caveats. Rendered prominently rather than buried. */
-  warnings?: string[];
-}
-
-export interface LiveBalance {
-  asset: string;
-  free: Money;
-  locked: Money;
-  total: Money;
-}
-
-export interface LivePosition {
-  symbol: string;
-  side: string;
-  quantity: Money;
-  entry_price: Money;
-  mark_price: Money;
-  unrealized_pnl: Money;
-  leverage: Money;
-}
-
-export interface LiveOrder {
-  order_id: string;
-  venue_order_id: string | null;
-  symbol: string;
-  side: string;
-  type: string;
-  status: string;
-  quantity: Money;
-  filled: Money;
-  price: Money | null;
-  /** What a conditional order is for. Null for ordinary orders, which have no purpose. */
-  purpose: "stop_loss" | "take_profit" | null;
-  trigger_price: Money | null;
-  reduce_only: boolean;
-  created_at: string;
-}
-
-/** Live exchange account, read straight from the venue. Never stored state. */
-export interface LiveAccount {
-  venue?: string;
-  network?: string;
-  authenticated: boolean;
-  total_balance: Money;
-  available_balance: Money;
-  balances?: LiveBalance[];
-  positions?: LivePosition[];
-  position_count?: number;
-  unrealized_pnl: Money;
-  open_orders?: LiveOrder[];
-  open_order_count?: number;
-}
-
-export interface LiveFill {
-  fill_id: string;
-  order_id: string;
-  side: string;
-  price: Money;
-  quantity: Money;
-  fee: Money;
-  fee_currency: string;
-  role: string;
-  timestamp: string;
-}
-
-export interface LiveFills {
-  symbol: string;
-  count: number;
-  realized_pnl: Money;
-  total_fees: Money;
-  fills?: LiveFill[];
-}
-
-export interface Session {
-  session_id: string;
-  mode: string;
-  status: string;
-  strategy_id: string;
-  symbols?: string[];
-  timeframe: string;
-  starting_equity: Money;
-  final_equity: Money | null;
-  started_at: string | null;
-  finished_at: string | null;
-  error: string | null;
+  reason?: string | null;
+  engaged_at?: string | null;
+  engaged_by?: string | null;
 }
 
 export interface ApiErrorBody {
@@ -301,31 +599,20 @@ export class ApiError extends Error {
 const BASE = "/api/v1";
 
 /**
- * Render a symbol for use in a URL path.
- *
- * `BTC/USDT` cannot go in a path segment: percent-encoding it to `BTC%2FUSDT` does not
- * help, because the server decodes it before routing and then sees an extra segment. The
- * hyphenated form round-trips cleanly and the API parses it back to the canonical symbol.
- */
-export function pathSymbol(symbol: string): string {
-  return encodeURIComponent(symbol.replace("/", "-"));
-}
-
-/**
  * How long a single call may hang before it is abandoned.
  *
- * A request with no timeout never fails when the API is merely unreachable — it simply
- * stays pending. The dashboard re-polls every few seconds, so an API that is down (a
- * stopped container still holding its published port, say) leaves the tab accumulating
- * never-resolving requests until it locks up. Comfortably longer than any healthy call,
- * and shorter than the poll interval's patience.
+ * A request with no timeout never fails when the API is merely unreachable — it stays
+ * pending. The dashboard re-polls, so an API that is down leaves the tab accumulating
+ * never-resolving requests until it locks up. This actually happened: one endpoint ran an
+ * unbounded aggregate over a million rows and every poll piled another stuck request on
+ * top of the last.
  */
-const REQUEST_TIMEOUT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 12_000;
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // Built through `Headers` rather than object spread: `HeadersInit` is legitimately a
   // `Headers` instance or an entry array, and spreading either into an object literal
-  // yields `{}` or index keys — the caller's headers would vanish without a word.
+  // yields `{}` — the caller's headers would vanish without a word.
   const headers = new Headers(init?.headers);
   if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
 
@@ -337,13 +624,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       signal: init?.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
   } catch (error) {
-    // Surfaced as an ApiError so callers have one error type to handle, and the panel
-    // says "unreachable" rather than sitting on a spinner forever.
-    const unreachable = error instanceof DOMException && error.name === "TimeoutError";
+    const timedOut = error instanceof DOMException && error.name === "TimeoutError";
     throw new ApiError(
       0,
-      unreachable ? "timeout" : "network_error",
-      unreachable ? `no response from the API within ${REQUEST_TIMEOUT_MS / 1000}s` : "API unreachable",
+      timedOut ? "timeout" : "network_error",
+      timedOut ? `no response from the API within ${REQUEST_TIMEOUT_MS / 1000}s` : "API unreachable",
       null,
     );
   }
@@ -360,8 +645,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         requestId = body.error.request_id ?? requestId;
       }
     } catch {
-      // A non-JSON error body is not itself an error worth reporting; the status is
-      // already the useful part.
+      // A non-JSON error body is not itself worth reporting; the status is the useful part.
     }
     throw new ApiError(response.status, code, message, requestId);
   }
@@ -373,34 +657,21 @@ export const api = {
   health: () => request<HealthResponse>("/healthz"),
   readiness: () => request<ReadinessResponse>("/readyz"),
 
-  portfolio: () => request<Portfolio>(`${BASE}/portfolio`),
-  /**
-   * Closed trades. Pass `sessionId` to scope them to one run.
-   *
-   * Without a session the API falls back to a trailing time window, which silently drops
-   * anything older — a run over backfilled history can then show a single trade out of ten
-   * and read as a working panel. The dashboard always scopes explicitly.
-   */
-  trades: (limit = 100, sessionId?: string | null) =>
-    request<Trade[]>(
-      `${BASE}/portfolio/trades?limit=${limit}` +
-        (sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""),
-    ),
-  sessions: () => request<Session[]>(`${BASE}/portfolio/sessions`),
-
-  riskStatus: () => request<RiskStatus>(`${BASE}/risk/status`),
-  /**
-   * Risk events. Pass `sessionId` to scope them to one run.
-   *
-   * Unscoped, this returns events from every session ever run, so a fresh session shows
-   * hours-old rejections from an unrelated one and reads as though the current session is
-   * being blocked. The API has always supported the filter; the client simply never sent it.
-   */
-  riskEvents: (limit = 50, sessionId?: string | null) =>
-    request<RiskEvent[]>(
-      `${BASE}/risk/events?limit=${limit}` +
-        (sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""),
-    ),
+  /** The polled endpoint: header, status, venue account and session performance. */
+  summary: () => request<Summary>(`${BASE}/dashboard/summary`),
+  equity: (window: string) =>
+    request<EquityResponse>(`${BASE}/dashboard/equity?window=${encodeURIComponent(window)}`),
+  trades: (limit = 200, offset = 0) =>
+    request<LedgerResponse>(`${BASE}/dashboard/trades?limit=${limit}&offset=${offset}`),
+  analytics: () => request<AnalyticsResponse>(`${BASE}/dashboard/analytics`),
+  decisions: (limit = 60) =>
+    request<DecisionsResponse>(`${BASE}/dashboard/decisions?limit=${limit}`),
+  freshness: () => request<FreshnessResponse>(`${BASE}/dashboard/freshness`),
+  pnl: (window: string) =>
+    request<PnlResponse>(`${BASE}/dashboard/pnl?window=${encodeURIComponent(window)}`),
+  positions: () => request<PositionsResponse>(`${BASE}/dashboard/positions`),
+  orders: () => request<OrdersResponse>(`${BASE}/dashboard/orders`),
+  assetClasses: () => request<AssetClassesResponse>(`${BASE}/dashboard/asset-classes`),
 
   /** Engage or clear the kill switch. A reason is mandatory when engaging. */
   setKillSwitch: (engaged: boolean, reason: string, actor = "dashboard") =>
@@ -408,27 +679,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ engaged, reason: reason || null, actor }),
     }),
-
-  strategies: () => request<StrategyDescription[]>(`${BASE}/strategies`),
-  series: () => request<SeriesSummary[]>(`${BASE}/market/series`),
-  candles: (symbol: string, timeframe: string, limit = 300) =>
-    request<CandlesResponse>(
-      `${BASE}/market/candles/${pathSymbol(symbol)}?timeframe=${timeframe}&limit=${limit}`,
-    ),
-
-  /** Performance review. Scoped to one session when given, for the reason above. */
-  /** Live venue account. Fails rather than falling back to stored paper state. */
-  account: () => request<LiveAccount>(`${BASE}/account`),
-  accountFills: (symbol: string, limit = 50) =>
-    request<LiveFills>(
-      `${BASE}/account/fills?symbol=${encodeURIComponent(symbol)}&limit=${limit}`,
-    ),
-
-  review: (days = 90, sessionId?: string | null) =>
-    request<PerformanceReview>(
-      `${BASE}/analytics/review?days=${days}` +
-        (sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : ""),
-    ),
 };
 
 /**
@@ -458,10 +708,7 @@ export function subscribe(
     };
     socket.onmessage = (event) => {
       try {
-        const payload = JSON.parse(event.data as string) as {
-          channel?: string;
-          data?: unknown;
-        };
+        const payload = JSON.parse(event.data as string) as { channel?: string; data?: unknown };
         if (payload.channel) onEvent(payload.channel, payload.data);
       } catch {
         // A malformed frame is dropped rather than tearing down a working stream.
@@ -484,4 +731,14 @@ export function subscribe(
     if (timer) window.clearTimeout(timer);
     socket?.close();
   };
+}
+
+/**
+ * Coerce an API collection to an array before rendering.
+ *
+ * The difference between one empty panel and a blank page: `.map` and `.length` on
+ * `undefined` throw, and a throw during render unmounts the entire tree.
+ */
+export function list<T>(value: readonly T[] | null | undefined): readonly T[] {
+  return Array.isArray(value) ? (value as readonly T[]) : [];
 }

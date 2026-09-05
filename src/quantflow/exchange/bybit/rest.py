@@ -28,7 +28,7 @@ from quantflow.core.errors import (
     ValidationError,
 )
 from quantflow.core.logging import get_logger
-from quantflow.core.precision import ZERO
+from quantflow.core.precision import ZERO, to_decimal
 from quantflow.domain.enums import OrderSide, Timeframe
 from quantflow.domain.instruments import Instrument, Symbol
 from quantflow.domain.market import Candle, OrderBook, OrderBookLevel, Ticker, Trade
@@ -66,6 +66,7 @@ ENDPOINT_WEIGHTS: dict[str, float] = {
     "load_markets": 10.0,
     "fetch_candles": 2.0,
     "fetch_ticker": 2.0,
+    "fetch_tickers": 10.0,
     "fetch_order_book": 5.0,
     "fetch_trades": 2.0,
     "submit_order": 1.0,
@@ -100,8 +101,121 @@ FINISHED_ORDER_FILTERS: tuple[dict[str, Any], ...] = ({}, {"trigger": True})
 #: hard fault rather than something to retry through.
 MAX_CLOCK_DRIFT_SECONDS = 5.0
 
+#: Venue codes and CCXT class names meaning "your request timestamp is unacceptable".
+#:
+#: Matched on the retCode where possible: 10002 is Bybit's signed-request timestamp
+#: rejection, and CCXT raises it as ``InvalidNonce``.
+_CLOCK_SKEW_CODE = "10002"
+_CLOCK_SKEW_CLASS = "InvalidNonce"
+
+
+def _is_clock_skew(exc: BaseException) -> bool:
+    """Whether this failure is the venue refusing our request timestamp."""
+    if type(exc).__name__ == _CLOCK_SKEW_CLASS:
+        return True
+    message = str(exc)
+    return f'"retCode":{_CLOCK_SKEW_CODE}' in message.replace(" ", "")
+
+
 #: An order-book level is [price, quantity].
 ORDER_BOOK_LEVEL_WIDTH = 2
+
+
+def stop_confirmation_is_due(order: Order) -> bool:
+    """Whether an accepted entry already has exposure that must be proven protected.
+
+    Protection is confirmed by finding the stop on an **open position**, which only exists
+    once the entry has filled. A post-only limit rests until the market reaches it, and
+    while it rests the account holds nothing — so there is no position to inspect, and
+    demanding one concludes that the stop failed when in truth no stop was needed yet.
+
+    That is not theoretical: twelve minutes after maker-first went live on 2026-08-15 the
+    session died on *"stop failed to attach on the venue for SOL/USDT"* with no SOL
+    position in existence.
+
+    The invariant is unchanged for anything holding risk. Any fill at all — partial
+    included — is a live position and must be proven protected before this returns. Only a
+    completely unfilled order defers, and its ``stopLoss`` still travelled with the order,
+    so the venue attaches it the instant it fills.
+
+    Exposure is measured by fills and by nothing else. A terminal status is not a proxy for
+    it: Bybit *rejects* a post-only order that would cross rather than filling it as taker,
+    which is the entire purpose of post-only and a perfectly normal outcome. That order
+    comes back terminal with zero fills. Reading terminal as "has a position" made the
+    normal case fatal — the code demanded a stop for an entry that never opened, then tried
+    to flatten it, and the venue answered "current position is zero, cannot fix reduce-only
+    order qty". It killed the session twice on 2026-08-15.
+    """
+    return order.filled_quantity > ZERO
+
+
+def bybit_order_params(request: OrderRequest) -> dict[str, Any]:
+    """Build the V5 parameters for one order.
+
+    Extracted from ``submit_order`` so the mapping can be asserted without a venue. It
+    silently dropping a field is not a hypothetical: ``post_only`` was set correctly by the
+    risk engine, carried by ``OrderRequest`` and ``Order``, and then never read here. The
+    order left as a plain GTC limit priced at the touch, crossed immediately, and was
+    charged the 0.06% taker rate — making maker-first a no-op on the fee bill it exists to
+    reduce. Measured live on 2026-08-15: the first "maker" entry filled at 0.0550%,
+    identical to every taker fill before it.
+
+    Post-only is expressed through ``timeInForce`` rather than a separate flag because that
+    is Bybit's own vocabulary: ``PostOnly`` is a time-in-force value on V5, not an order
+    attribute.
+    """
+    params: dict[str, Any] = {
+        "clientOrderId": request.client_order_id,
+        "newOrderRespType": "RESULT",
+    }
+    if not request.order_type.is_market:
+        # Post-only supersedes the requested time-in-force: an order that must not take
+        # liquidity cannot also be immediate-or-cancel, and the venue would reject the
+        # combination rather than quietly pick one.
+        params["timeInForce"] = (
+            "PostOnly" if request.post_only else TIME_IN_FORCE_TO_CCXT[request.time_in_force]
+        )
+    if request.trigger_price is not None:
+        params["stopPrice"] = float(request.trigger_price)
+    if request.reduce_only:
+        params["reduceOnly"] = True
+
+    # Sent as strings: Bybit accepts them, and a Decimal formatted as str keeps the exact
+    # price the risk engine computed instead of whatever the nearest float happens to be.
+    if request.stop_loss_price is not None:
+        params["stopLoss"] = str(request.stop_loss_price)
+        params["slTriggerBy"] = STOP_TRIGGER_BY
+    if request.take_profit_price is not None:
+        params["takeProfit"] = str(request.take_profit_price)
+        params["tpTriggerBy"] = STOP_TRIGGER_BY
+        # The target rests as a limit and earns the maker rate; the stop keeps market
+        # execution. Exits are roughly half of all fills, so leaving them aggressive threw
+        # away half the saving maker-first exists for.
+        #
+        # The route was found the hard way, and both dead ends cost a live session:
+        #
+        #   tpLimitPrice, no mode           -> 10001 "tpLimitPrice can not have a value
+        #                                      when tpSlMode is empty"
+        #   tpslMode=Full + tpOrderType=Limit -> 10001 "tpOrderType only support Market
+        #                                      when tpSlMode is Full"
+        #
+        # Partial is the mode that accepts a limit target. It was verified against the demo
+        # venue before shipping rather than discovered in production a third time.
+        #
+        # Partial sizes each leg independently, which is the one real hazard here: a stop
+        # sized below the position would leave the remainder naked while every local record
+        # claimed it was covered. Both legs are therefore stated explicitly at the full
+        # quantity rather than left to a venue default. The stop stays Market because it
+        # exists for the case where price is running away, and a stop that waits for a
+        # better price is not protection.
+        quantity = str(request.quantity)
+        params["tpslMode"] = "Partial"
+        params["tpOrderType"] = "Limit"
+        params["tpLimitPrice"] = str(request.take_profit_price)
+        params["tpSize"] = quantity
+        params["slOrderType"] = "Market"
+        params["slSize"] = quantity
+    return params
 
 
 class BybitGateway:
@@ -120,6 +234,7 @@ class BybitGateway:
         "_local_by_venue_id",
         "_quantity_by_order_id",
         "_settings",
+        "_strategy_by_order_id",
         "_venue_ids_by_symbol",
     )
 
@@ -156,6 +271,10 @@ class BybitGateway:
         #: Quantity we submitted, per order id. Bybit's cancel and fetch acknowledgements
         #: omit the amount, so this is the only source for it when parsing them back.
         self._quantity_by_order_id: dict[str, Decimal] = {}
+        #: Order id -> the strategy that produced it, under both local and venue ids.
+        #: The venue cannot supply this, so it has to survive locally or attribution dies
+        #: on the first re-read.
+        self._strategy_by_order_id: dict[str, str] = {}
         #: Venue order ids this gateway has submitted, per symbol - including the conditional
         #: stops Bybit creates alongside an entry. Cleanup and reconciliation need to target
         #: those by venue id; without the registry they are orders we can see but not name.
@@ -303,7 +422,34 @@ class BybitGateway:
             try:
                 return await operation(*args, **kwargs)
             except Exception as exc:
-                raise translate_exception(exc) from exc
+                if not _is_clock_skew(exc):
+                    raise translate_exception(exc) from exc
+                # Drift that appeared after connect. CCXT measures the venue offset once
+                # and caches it, so a host that suspends and wakes several seconds ahead
+                # invalidates that offset with nothing to correct it — every signed request
+                # is then rejected, indefinitely. Measured live on 2026-08-15: 2h40m of
+                # total venue blackout from a 4.3s skew.
+                #
+                # Reloaded and retried exactly once. A second failure is a clock that is
+                # genuinely wrong rather than merely drifted, and must surface rather than
+                # become a silent retry loop.
+                logger.warning(
+                    "exchange.clock_skew_detected",
+                    exchange=self.name,
+                    action="reloading the venue time offset and retrying once",
+                    error=str(exc)[:200],
+                )
+                try:
+                    await self._client.load_time_difference()
+                except Exception as reload_error:
+                    logger.warning("exchange.clock_resync_failed", error=str(reload_error)[:160])
+                    raise translate_exception(exc) from exc
+                try:
+                    result = await operation(*args, **kwargs)
+                except Exception as retry_error:
+                    raise translate_exception(retry_error) from retry_error
+                logger.info("exchange.clock_resynced", exchange=self.name)
+                return result
 
         return await retry_async(
             invoke,
@@ -390,6 +536,47 @@ class BybitGateway:
         )
         return _parse_ticker(symbol, raw, self._clock.now())
 
+    async def fetch_quote_turnover_24h(self) -> dict[Symbol, Decimal]:
+        """Rolling 24h traded value per symbol, in the quote asset, for the whole category.
+
+        One request for the entire universe. The per-symbol alternative is a request each,
+        and ranking ~800 linear markets by liquidity at startup that way would take longer
+        than the bar it is trying to start inside — quite apart from what it would do to
+        the rate limiter.
+
+        ``turnover24h`` is read from the venue's own payload rather than reconstructed by
+        summing candles. A 96-bar sum is an approximation that silently degrades whenever a
+        bar is missing, and it answers a slightly different question: the venue's figure is
+        a true rolling window, while the sum is however many bars happened to come back.
+
+        Symbols the venue reports without a usable turnover are omitted rather than
+        recorded as zero. Absent means "not measured"; zero means "nothing traded", and a
+        liquidity filter that confuses the two rejects markets for having no data.
+        """
+        raw = await self._call("fetch_tickers", self._data_client.fetch_tickers)
+        turnover: dict[Symbol, Decimal] = {}
+        for ccxt_symbol, ticker in (raw or {}).items():
+            info = ticker.get("info") if isinstance(ticker, dict) else None
+            value = info.get("turnover24h") if isinstance(info, dict) else None
+            if value in (None, ""):
+                continue
+            try:
+                amount = to_decimal(value)
+                symbol = from_ccxt_symbol(str(ccxt_symbol))
+            except Exception as exc:
+                # One malformed row must not lose the other 800. Logged rather than passed
+                # over in silence: a symbol that never appears in the ranking would
+                # otherwise look like a market the venue does not list.
+                logger.debug(
+                    "exchange.turnover_row_skipped",
+                    symbol=str(ccxt_symbol),
+                    error=str(exc)[:120],
+                )
+                continue
+            if amount >= ZERO:
+                turnover[symbol] = amount
+        return turnover
+
     async def fetch_order_book(self, symbol: Symbol, *, depth: int = 20) -> OrderBook:
         """Fetch an L2 order-book snapshot."""
         raw = await self._call(
@@ -450,25 +637,7 @@ class BybitGateway:
                 symbol=str(normalised.symbol),
             )
 
-        params: dict[str, Any] = {
-            "clientOrderId": normalised.client_order_id,
-            "newOrderRespType": "RESULT",
-        }
-        if not normalised.order_type.is_market:
-            params["timeInForce"] = TIME_IN_FORCE_TO_CCXT[normalised.time_in_force]
-        if normalised.trigger_price is not None:
-            params["stopPrice"] = float(normalised.trigger_price)
-        if normalised.reduce_only:
-            params["reduceOnly"] = True
-
-        # Sent as strings: Bybit accepts them, and a Decimal formatted as str keeps the exact
-        # price the risk engine computed instead of whatever the nearest float happens to be.
-        if normalised.stop_loss_price is not None:
-            params["stopLoss"] = str(normalised.stop_loss_price)
-            params["slTriggerBy"] = STOP_TRIGGER_BY
-        if normalised.take_profit_price is not None:
-            params["takeProfit"] = str(normalised.take_profit_price)
-            params["tpTriggerBy"] = STOP_TRIGGER_BY
+        params = bybit_order_params(normalised)
 
         raw = await self._call(
             "submit_order",
@@ -505,6 +674,12 @@ class BybitGateway:
             fallback_quantity=normalised.quantity,
         )
         self._quantity_by_order_id[order.order_id] = normalised.quantity
+        # Recorded before any venue read can blank it. Everything downstream — the enrich
+        # below, reconciliation, fill attribution — re-parses from venue payloads that have
+        # never heard of a strategy.
+        self.remember_strategy(
+            order.order_id, normalised.strategy_id, venue_order_id=acknowledged.venue_order_id
+        )
         if acknowledged.venue_order_id:
             self._local_by_venue_id[acknowledged.venue_order_id] = order.order_id
             self._venue_ids_by_symbol.setdefault(normalised.symbol, []).append(
@@ -525,8 +700,22 @@ class BybitGateway:
             status=acknowledged.status.value,
         )
 
-        if not normalised.reduce_only and normalised.stop_loss_price is not None:
+        if (
+            not normalised.reduce_only
+            and normalised.stop_loss_price is not None
+            and stop_confirmation_is_due(acknowledged)
+        ):
             await self._require_stop_on_venue(normalised, acknowledged, raw)
+        elif not normalised.reduce_only and normalised.stop_loss_price is not None:
+            logger.info(
+                "exchange.stop_confirmation_deferred",
+                symbol=str(normalised.symbol),
+                order_id=acknowledged.order_id,
+                reason=(
+                    "the entry is resting unfilled, so no position exists to protect; the "
+                    "venue holds the stop in the order and attaches it on fill"
+                ),
+            )
         return acknowledged
 
     def submitted_venue_ids(self, symbol: Symbol | None = None) -> list[str]:
@@ -771,7 +960,7 @@ class BybitGateway:
             if not _is_order_not_found(exc):
                 raise
             raw = await self._fetch_finished_order(venue_id, ccxt_symbol, order_id=order_id)
-        return parse_order(raw, local_order_id=order_id)
+        return parse_order(raw, local_order_id=order_id, strategy_id=self.strategy_for(order_id))
 
     async def _fetch_finished_order(
         self, venue_id: str, ccxt_symbol: str, *, order_id: str
@@ -852,7 +1041,14 @@ class BybitGateway:
         orders: list[Order] = []
         for raw in rows or []:
             venue_id = str(raw.get("id") or "")
-            orders.append(parse_order(raw, local_order_id=self._local_by_venue_id.get(venue_id)))
+            local_id = self._local_by_venue_id.get(venue_id)
+            orders.append(
+                parse_order(
+                    raw,
+                    local_order_id=local_id,
+                    strategy_id=self.strategy_for(local_id or venue_id),
+                )
+            )
         return orders
 
     async def fetch_my_trades(
@@ -1007,6 +1203,27 @@ class BybitGateway:
                 return venue_id
         return order_id
 
+    def remember_strategy(
+        self, order_id: str, strategy_id: str | None, *, venue_order_id: str | None = None
+    ) -> None:
+        """Record which strategy produced an order, under both of its identities.
+
+        The venue never returns this. Every read of an order from Bybit reconstructs it
+        from a payload that has no notion of a strategy, so without a local memory the
+        attribution is lost the first time the order is re-read — which happens
+        immediately, because ``submit_order`` enriches from the venue for authoritative
+        fill data.
+        """
+        if not strategy_id:
+            return
+        self._strategy_by_order_id[order_id] = strategy_id
+        if venue_order_id:
+            self._strategy_by_order_id[venue_order_id] = strategy_id
+
+    def strategy_for(self, order_id: str) -> str | None:
+        """The strategy behind an order, or ``None`` if this gateway never saw it."""
+        return self._strategy_by_order_id.get(order_id)
+
     def register_venue_id(self, order_id: str, venue_order_id: str) -> None:
         """Record a local-to-venue id mapping recovered from the database on restart."""
         self._local_by_venue_id[venue_order_id] = order_id
@@ -1030,8 +1247,6 @@ def _is_order_not_found(exc: ExchangeError) -> bool:
 # Parsing helpers
 # --------------------------------------------------------------------------- #
 def _safe_decimal(value: Any) -> Decimal:
-    from quantflow.core.precision import to_decimal
-
     if value is None or value == "":
         return ZERO
     return to_decimal(value)

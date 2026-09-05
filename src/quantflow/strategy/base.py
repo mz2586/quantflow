@@ -150,6 +150,22 @@ class Strategy(ABC):
     description: ClassVar[str] = ""
     #: Parameter schema.
     params_model: ClassVar[type[StrategyParams]] = StrategyParams
+    #: Asset classes this strategy is willing to run on. Empty means every class.
+    #:
+    #: Plain strings matching :class:`quantflow.universe.assets.AssetClass` values, not the
+    #: enum itself, so the strategy layer does not import the universe layer — the
+    #: orchestrator already imports both and is where the two are compared. ``AssetClass``
+    #: is a :class:`~enum.StrEnum`, so a member and its value hash identically and the
+    #: membership test works whichever side holds which.
+    #:
+    #: Empty by default, and deliberately permissive: the library predates the asset-class
+    #: taxonomy and none of its strategies was written with one in mind, so declaring them
+    #: crypto-only here would be inventing an opinion nobody holds. This attribute is for a
+    #: strategy with a *genuine* instrument dependency to narrow itself. The broader,
+    #: automatic restriction is by family — what a strategy actually reads — and lives in
+    #: :data:`quantflow.universe.assets.ALLOWED_FAMILIES_BY_CLASS`. The two are ANDed, so
+    #: staying silent here does not mean a strategy runs on everything.
+    supported_asset_classes: ClassVar[frozenset[str]] = frozenset()
 
     def __init__(self, params: StrategyParams | dict[str, Any] | None = None) -> None:
         if not self.strategy_id:
@@ -258,6 +274,7 @@ class Strategy(ABC):
             "strategy_id": self.strategy_id,
             "description": self.description,
             "warmup_bars": self.warmup_bars,
+            "supported_asset_classes": sorted(self.supported_asset_classes),
             "params": self.params.to_dict(),
         }
 

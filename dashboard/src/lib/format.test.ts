@@ -1,111 +1,114 @@
-/**
- * Formatting tests.
- *
- * The load-bearing property: a high-precision decimal arriving as a string must never be
- * silently corrupted. JavaScript numbers cannot represent these values exactly, so the
- * client keeps them as strings and only parses at the moment of display.
- */
-
 import { describe, expect, it } from "vitest";
-import { pathSymbol } from "./api";
-import { ago, chartValue, money, percent, quantity, signed, time, tone } from "./format";
+import {
+  NOT_RECORDED,
+  absent,
+  ago,
+  clock,
+  count,
+  duration,
+  money,
+  percent,
+  quantity,
+  ratio,
+  signed,
+  time,
+  tone,
+} from "./format";
 
-describe("money", () => {
-  it("formats a decimal string", () => {
-    expect(money("1234.5")).toBe("1,234.50");
+describe("absence versus zero", () => {
+  // The distinction this suite exists to protect: a field the engine does not record must
+  // never render as 0. A ledger showing 0.00 for an unmeasured quantity is indistinguishable
+  // from one that measured zero, and the reader has no way to tell it is looking at a gap.
+  it("renders NOT RECORDED for null and undefined, not zero", () => {
+    expect(money(null)).toBe(NOT_RECORDED);
+    expect(money(undefined)).toBe(NOT_RECORDED);
+    expect(signed(null)).toBe(NOT_RECORDED);
+    expect(percent(null)).toBe(NOT_RECORDED);
+    expect(ratio(null)).toBe(NOT_RECORDED);
+    expect(quantity(null)).toBe(NOT_RECORDED);
+    expect(count(null)).toBe(NOT_RECORDED);
+    expect(duration(null)).toBe(NOT_RECORDED);
+    expect(time(null)).toBe(NOT_RECORDED);
   });
 
-  it("appends a currency when given", () => {
-    expect(money("100", "USDT")).toBe("100.00 USDT");
+  it("renders a real zero as zero", () => {
+    expect(money("0")).toBe("0.00");
+    expect(signed("0")).toBe("+0.00");
+    expect(percent("0")).toBe("0.00%");
+    expect(count(0)).toBe("0");
+    expect(duration(0)).toBe("0s");
   });
 
-  it("renders an em dash for missing values", () => {
-    expect(money(null)).toBe("—");
-    expect(money(undefined)).toBe("—");
-  });
-
-  it("does not throw on an unparseable value", () => {
-    expect(money("not-a-number")).toBe("0.00");
+  it("identifies absence without treating zero as absent", () => {
+    expect(absent(null)).toBe(true);
+    expect(absent(undefined)).toBe(true);
+    expect(absent("")).toBe(true);
+    expect(absent(0)).toBe(false);
+    expect(absent("0")).toBe(false);
   });
 });
 
-describe("percent", () => {
-  it("converts a fraction", () => {
-    expect(percent("0.1234")).toBe("12.34%");
+describe("money", () => {
+  it("formats with thousands separators and two decimals", () => {
+    expect(money("49899.34635401")).toBe("49,899.35");
+    expect(money("49899.34635401", "USDT")).toBe("49,899.35 USDT");
   });
 
-  it("honours the digit count", () => {
-    expect(percent("0.1", 0)).toBe("10%");
+  it("does not lose the integer part of a large balance", () => {
+    expect(money("164459.161")).toContain("164,459");
+  });
+
+  it("survives an unparseable value rather than throwing", () => {
+    expect(money("not-a-number")).toBe("0.00");
   });
 });
 
 describe("signed", () => {
   it("always shows a sign", () => {
-    expect(signed("100")).toBe("+100.00");
-    expect(signed("-100")).toBe("−100.00");
-    expect(signed("0")).toBe("+0.00");
+    expect(signed("6.28955")).toBe("+6.29");
+    expect(signed("-64.805979")).toBe("−64.81");
+  });
+});
+
+describe("percent", () => {
+  it("treats the wire value as a fraction", () => {
+    expect(percent("0.4", 1)).toBe("40.0%");
+    expect(percent("0.00090140", 3)).toBe("0.090%");
   });
 });
 
 describe("quantity", () => {
-  it("trims trailing zeros without losing precision", () => {
-    expect(quantity("0.10000000")).toBe("0.1");
-    expect(quantity("1.23456789")).toBe("1.23456789");
-  });
-
-  it("leaves integers alone", () => {
-    expect(quantity("5")).toBe("5");
+  it("trims trailing zeros without losing significant digits", () => {
+    expect(quantity("4.120000000000")).toBe("4.12");
+    expect(quantity("18186")).toBe("18186");
+    expect(quantity("0.039000")).toBe("0.039");
   });
 });
 
 describe("tone", () => {
-  it("colours by sign", () => {
-    expect(tone("1")).toContain("emerald");
-    expect(tone("-1")).toContain("rose");
-    expect(tone("0")).toContain("zinc");
+  it("colours by sign and stays neutral for an absent value", () => {
+    expect(tone("1")).toContain("0ca30c");
+    expect(tone("-1")).toContain("d03b3b");
+    expect(tone(null)).toContain("zinc");
   });
 });
 
-describe("time and ago", () => {
-  it("renders an em dash for missing input", () => {
-    expect(time(null)).toBe("—");
-    expect(ago(null)).toBe("—");
-  });
-
-  it("renders an em dash for an invalid date", () => {
-    expect(time("nonsense")).toBe("—");
-  });
-
-  it("reports a recent time in seconds", () => {
-    expect(ago(new Date(Date.now() - 5000).toISOString())).toMatch(/s ago$/);
+describe("duration", () => {
+  it("formats compactly across scales", () => {
+    expect(duration(45)).toBe("45s");
+    expect(duration(4087)).toBe("1h 8m");
+    expect(duration(90_000)).toBe("1d 1h");
   });
 });
 
-describe("precision", () => {
-  it("keeps full precision in the source string", () => {
-    // The value itself is never mutated; only its rendering is lossy.
-    const exact = "50000.123456789012";
-    expect(quantity(exact)).toBe(exact);
+describe("time helpers", () => {
+  it("returns a placeholder for an unparseable timestamp instead of Invalid Date", () => {
+    expect(time("nonsense")).toBe(NOT_RECORDED);
+    expect(ago("nonsense")).toBe(NOT_RECORDED);
+    expect(clock("nonsense")).toBe("—");
   });
 
-  it("chartValue is display-only and never fed back into arithmetic", () => {
-    expect(chartValue("1.5")).toBe(1.5);
-    expect(chartValue(null)).toBe(0);
-  });
-});
-
-describe("pathSymbol", () => {
-  it("converts a slashed symbol to a path-safe form", () => {
-    // BTC%2FUSDT does not work: the server decodes it before routing and then sees an
-    // extra path segment, so the route never matches.
-    expect(pathSymbol("BTC/USDT")).toBe("BTC-USDT");
-  });
-
-  it("leaves an already-safe symbol alone", () => {
-    expect(pathSymbol("BTCUSDT")).toBe("BTCUSDT");
-  });
-
-  it("still encodes anything else unsafe", () => {
-    expect(pathSymbol("A B")).toBe("A%20B");
+  it("formats a wall clock for the last-successful-update line", () => {
+    expect(clock("2026-08-14T13:45:00Z")).toMatch(/\d{2}:\d{2}:\d{2}/);
   });
 });

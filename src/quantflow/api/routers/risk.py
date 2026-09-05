@@ -7,7 +7,8 @@ audited, and never silently a no-op.
 
 from __future__ import annotations
 
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
 
@@ -21,6 +22,7 @@ from quantflow.api.schemas import (
 )
 from quantflow.core.errors import ValidationError
 from quantflow.core.logging import get_logger
+from quantflow.live.heartbeat import RISK_LIMITS_CURRENT_KEY
 from quantflow.persistence.repositories import RiskEventRepository
 from quantflow.risk.engine import summarise_headroom
 
@@ -40,7 +42,13 @@ async def get_status(state: StateDep, risk: RiskDep) -> RiskStatusResponse:
     normally is worse than one that reports nothing: it is confidently wrong about the one
     control an operator reaches for in an emergency.
     """
+    # The limits reported must be the ones being ENFORCED. This process loads its own
+    # settings and they are not the engine's — the engine takes them from the supervisor's
+    # environment — so on 2026-08-17 this endpoint advertised max_position_pct 0.02 and
+    # max_order_notional 5000 while the running engine enforced 0.20 and 20000. A tenfold
+    # error on the two numbers an operator checks before intervening.
     settings = state.settings.risk
+    published = await _published_limits(state)
     await risk.refresh_kill_switch()
     switch = risk.kill_switch.state
 
@@ -61,20 +69,53 @@ async def get_status(state: StateDep, risk: RiskDep) -> RiskStatusResponse:
             engaged_by=switch.engaged_by,
         ),
         limits=RiskLimits(
-            max_position_pct=settings.max_position_pct,
-            max_total_exposure_pct=settings.max_total_exposure_pct,
-            max_concurrent_positions=settings.max_concurrent_positions,
-            max_daily_loss_pct=settings.max_daily_loss_pct,
-            max_drawdown_pct=settings.max_drawdown_pct,
-            max_leverage=settings.max_leverage,
-            require_stop_loss=settings.require_stop_loss,
-            max_order_notional=settings.max_order_notional,
-            max_orders_per_minute=settings.max_orders_per_minute,
+            max_position_pct=_limit(published, "max_position_pct", settings.max_position_pct),
+            max_total_exposure_pct=_limit(
+                published, "max_total_exposure_pct", settings.max_total_exposure_pct
+            ),
+            max_concurrent_positions=int(
+                _limit(published, "max_concurrent_positions", settings.max_concurrent_positions)
+            ),
+            max_daily_loss_pct=_limit(published, "max_daily_loss_pct", settings.max_daily_loss_pct),
+            max_drawdown_pct=_limit(published, "max_drawdown_pct", settings.max_drawdown_pct),
+            max_leverage=_limit(published, "max_leverage", settings.max_leverage),
+            require_stop_loss=bool(
+                published.get("require_stop_loss", settings.require_stop_loss)
+                if published
+                else settings.require_stop_loss
+            ),
+            max_order_notional=_limit(published, "max_order_notional", settings.max_order_notional),
+            max_orders_per_minute=int(
+                _limit(published, "max_orders_per_minute", settings.max_orders_per_minute)
+            ),
         ),
         headroom=headroom,
-        sizer=str(described["sizer"]),
-        rules=tuple(described["rules"]),
+        sizer=str(published.get("sizer") or described["sizer"]),
+        rules=tuple(published.get("rules") or described["rules"]),
+        limits_source=("running engine" if published else "this API process"),
     )
+
+
+def _limit(published: dict[str, Any], name: str, fallback: Any) -> Any:
+    """One limit, preferring what the engine published over this process's own setting."""
+    raw = (published.get("limits") or {}).get(name) if published else None
+    if raw is None:
+        return fallback
+    return Decimal(str(raw)) if isinstance(fallback, Decimal) else raw
+
+
+async def _published_limits(state: Any) -> dict[str, Any]:
+    """What the running engine reports it is enforcing, or ``{}`` when nothing is published.
+
+    Empty means "no engine has published", and the caller falls back to its own settings
+    while labelling them as such — never presenting a guess as the enforced configuration.
+    """
+    try:
+        raw = await state.cache.get(RISK_LIMITS_CURRENT_KEY)
+    except Exception as exc:
+        logger.info("risk.published_limits_unavailable", error=str(exc)[:160])
+        return {}
+    return raw if isinstance(raw, dict) else {}
 
 
 @router.post(

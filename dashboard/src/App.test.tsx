@@ -1,235 +1,261 @@
 /**
- * Resilience tests for the dashboard shell.
+ * Whole-app resilience tests.
  *
- * These exist because of a real outage: a stale API returned a `/risk/status` payload with
- * no `kill_switch` object, `risk?.kill_switch.engaged` threw during render, React unmounted
- * the entire tree, and the operator got a blank white page — no equity, no positions, no
- * kill switch, and no clue why. A dashboard for a live trading system must degrade, not
- * disappear, so "the API sent something incomplete" is asserted here rather than trusted.
+ * The failure these exist to prevent has happened: `risk?.kill_switch.engaged` guarded
+ * `risk` and then dereferenced `kill_switch` unguarded. `undefined.engaged` threw, React
+ * unmounted the entire tree, and the operator got a blank page — which during an incident
+ * is indistinguishable from a dead machine.
+ *
+ * Every case below feeds the app a payload shaped like something a stale, half-rebuilt or
+ * failing API would send, and asserts the page still renders.
  */
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
-/** A complete, well-formed payload for every endpoint the dashboard calls. */
-function completePayloads(): Record<string, unknown> {
+function respond(body: unknown): Response {
   return {
-    "/readyz": { ready: true, components: [], trading_mode: "live", kill_switch_engaged: false },
-    "/api/v1/portfolio/sessions": [
-      {
-        session_id: "live-15m-test",
-        mode: "live",
-        status: "running",
-        strategy_id: "orchestrator",
-        symbols: ["ETH/USDT"],
-        timeframe: "15m",
-        starting_equity: "10000",
-        final_equity: null,
-        started_at: "2026-08-10T00:00:00Z",
-        finished_at: null,
-        error: null,
-      },
-    ],
-    "/api/v1/portfolio/trades": [],
-    "/api/v1/portfolio": {
-      base_currency: "USDT",
-      equity: "10000",
-      cash: "9000",
-      starting_equity: "10000",
-      total_return_pct: "0",
-      realized_pnl: "0",
-      unrealized_pnl: "0",
-      fees_paid: "0",
-      gross_exposure: "0",
-      leverage: "0",
-      drawdown_pct: "0",
-      daily_pnl: "0",
-      position_count: 0,
-      positions: [],
-    },
-    "/api/v1/risk/status": {
-      trading_halted: false,
-      kill_switch: { engaged: false, reason: null, engaged_at: null, engaged_by: null },
-      limits: {
-        max_position_pct: "0.1",
-        max_total_exposure_pct: "0.5",
-        max_concurrent_positions: 5,
-        max_daily_loss_pct: "0.05",
-        max_drawdown_pct: "0.2",
-        max_leverage: "3",
-        require_stop_loss: true,
-        max_order_notional: "5000",
-        max_orders_per_minute: 10,
-      },
-      headroom: {},
-      sizer: "fixed_fractional",
-      rules: ["daily_loss"],
-    },
-    "/api/v1/risk/events": [],
-    "/api/v1/strategies": [],
-    "/api/v1/market/series": [],
-    "/api/v1/analytics/review": {
-      trade_count: 0,
-      by_strategy: [],
-      by_symbol: [],
-      by_side: [],
-      streaks: { longest_win: 0, longest_loss: 0, current: 0 },
-      concentration: {
-        top_trade_share: "0",
-        profit_without_best: "0",
-        is_concentrated: false,
-        rests_on_one_trade: false,
-      },
-      warnings: [],
-    },
-    "/api/v1/account/fills": {
-      symbol: "BTC/USDT",
-      count: 0,
-      realized_pnl: "0",
-      total_fees: "0",
-      fills: [],
-    },
-    "/api/v1/account": {
-      venue: "bybit",
-      network: "demo",
-      authenticated: true,
-      total_balance: "10000",
-      available_balance: "9000",
-      balances: [],
-      positions: [],
-      position_count: 0,
-      unrealized_pnl: "0",
-      open_orders: [],
-      open_order_count: 0,
-    },
-  };
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: new Headers(),
+    json: () => Promise.resolve(body),
+  } as Response;
 }
 
-/**
- * Route a request to its payload. Longest match wins, so `/api/v1/account/fills` is not
- * served by the `/api/v1/account` entry.
- */
-function install(payloads: Record<string, unknown>): void {
+/** Route each endpoint to a fixture, defaulting to an empty object. */
+function stubApi(routes: Record<string, unknown>): void {
   vi.stubGlobal(
     "fetch",
-    vi.fn((input: unknown) => {
-      const url = String(input).split("?")[0] ?? "";
-      const key = Object.keys(payloads)
-        .filter((candidate) => url.endsWith(candidate))
-        .sort((a, b) => b.length - a.length)[0];
-      return Promise.resolve(
-        new Response(JSON.stringify(key === undefined ? {} : payloads[key]), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-      );
+    vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const key = Object.keys(routes).find((route) => url.includes(route));
+      if (key === undefined) return Promise.resolve(respond({}));
+      const value = routes[key];
+      if (value instanceof Error) return Promise.reject(value);
+      return Promise.resolve(respond(value));
     }),
   );
-}
-
-beforeEach(() => {
-  // recharts measures its container; jsdom has neither observer.
-  vi.stubGlobal(
-    "ResizeObserver",
-    class {
-      observe(): void {
-        // no-op: nothing here depends on layout measurement
-      }
-      unobserve(): void {
-        // no-op
-      }
-      disconnect(): void {
-        // no-op
-      }
-    },
-  );
-  // The dashboard opens a websocket for live updates. It is a latency improvement only,
-  // and none of these assertions depend on it.
+  // The websocket is a latency improvement, never the source of truth; stubbed so the
+  // tests exercise the polling path.
   vi.stubGlobal(
     "WebSocket",
     class {
       close(): void {
-        // no-op: the socket is never opened in these tests
+        // The socket is a latency improvement; these tests exercise the polling path.
       }
     },
   );
-});
+}
 
 afterEach(() => {
-  cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
-describe("App resilience to incomplete API payloads", () => {
-  it("renders the dashboard when every payload is well-formed", async () => {
-    install(completePayloads());
+describe("blank-page resistance", () => {
+  it("renders when every endpoint returns an empty object", async () => {
+    stubApi({});
     render(<App />);
-
-    expect(await screen.findByText("QuantFlow")).toBeTruthy();
     await waitFor(() => {
-      expect(screen.getByText("Halt trading")).toBeTruthy();
+      expect(screen.getByText("QuantFlow")).toBeTruthy();
     });
   });
 
-  it("still renders when /risk/status omits kill_switch — the blank-page regression", async () => {
-    const payloads = completePayloads();
-    // Exactly what a stale API returned: a risk status with no kill switch object at all.
-    const stale = { ...(payloads["/api/v1/risk/status"] as Record<string, unknown>) };
-    delete stale.kill_switch;
-    payloads["/api/v1/risk/status"] = stale;
-    install(payloads);
-
-    render(<App />);
-
-    // The page must still be there. Before the fix this threw and unmounted everything.
-    expect(await screen.findByText("QuantFlow")).toBeTruthy();
-    await waitFor(() => {
-      expect(screen.getByText("Registered strategies (0)")).toBeTruthy();
+  it("renders when every endpoint returns null fields", async () => {
+    stubApi({
+      "/dashboard/summary": {
+        session: null,
+        status: null,
+        venue: null,
+        risk: null,
+        trading_performance: null,
+        session_equity: null,
+        fees: null,
+        book_reconciliation: null,
+        decisions: null,
+        engine: null,
+      },
+      "/dashboard/equity": { points: null },
+      "/dashboard/trades": { trades: null },
+      "/dashboard/analytics": { by_strategy: null, by_symbol: null, by_side: null },
+      "/dashboard/decisions": { decisions: null, summary: null },
+      "/dashboard/freshness": {},
+      "/dashboard/asset-classes": { asset_classes: null },
     });
-    // A missing kill switch reads as "not engaged" rather than taking the page down.
-    expect(screen.getByText("Halt trading")).toBeTruthy();
-  });
-
-  it("still renders when payloads omit every nested object and list", async () => {
-    // The general case: an API a version behind, or one returning half-built responses.
-    install({
-      "/readyz": { ready: false, trading_mode: "live", kill_switch_engaged: false },
-      "/api/v1/portfolio/sessions": [
-        { session_id: "s1", mode: "live", status: "running", strategy_id: "x", timeframe: "15m" },
-      ],
-      "/api/v1/portfolio/trades": [],
-      "/api/v1/portfolio": { base_currency: "USDT", equity: "1", cash: "1", daily_pnl: "0" },
-      "/api/v1/risk/status": { trading_halted: false },
-      "/api/v1/risk/events": [],
-      "/api/v1/strategies": [],
-      "/api/v1/market/series": [],
-      "/api/v1/analytics/review": { trade_count: 0 },
-      "/api/v1/account/fills": { symbol: "BTC/USDT", count: 0 },
-      "/api/v1/account": { authenticated: true, total_balance: "1", available_balance: "1" },
-    });
-
     render(<App />);
-
-    expect(await screen.findByText("QuantFlow")).toBeTruthy();
     await waitFor(() => {
-      expect(screen.getByText("Registered strategies (0)")).toBeTruthy();
+      expect(screen.getByText("QuantFlow")).toBeTruthy();
     });
   });
 
-  it("still renders when list endpoints return objects instead of arrays", async () => {
-    const payloads = completePayloads();
-    payloads["/api/v1/strategies"] = { unexpected: "shape" };
-    payloads["/api/v1/risk/events"] = { unexpected: "shape" };
-    payloads["/api/v1/portfolio/trades"] = { unexpected: "shape" };
-    install(payloads);
-
-    render(<App />);
-
-    expect(await screen.findByText("QuantFlow")).toBeTruthy();
-    await waitFor(() => {
-      expect(screen.getByText("Registered strategies (0)")).toBeTruthy();
+  it("renders when lists arrive as objects instead of arrays", async () => {
+    stubApi({
+      "/dashboard/summary": {
+        venue: { positions: { nope: true }, open_orders: "not-an-array" },
+      },
+      "/dashboard/trades": { trades: { nope: true } },
+      "/dashboard/analytics": { by_strategy: 42 },
+      "/dashboard/equity": { points: "oops" },
     });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("QuantFlow")).toBeTruthy();
+    });
+  });
+
+  /** The exact original crash: `risk` present, `kill_switch` absent. */
+  it("renders when risk is present but its nested object is missing", async () => {
+    stubApi({ "/dashboard/summary": { risk: {} } });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("QuantFlow")).toBeTruthy();
+    });
+  });
+
+  it("renders when every request fails", async () => {
+    stubApi({
+      "/dashboard/summary": new TypeError("Failed to fetch"),
+      "/dashboard/equity": new TypeError("Failed to fetch"),
+      "/dashboard/trades": new TypeError("Failed to fetch"),
+      "/dashboard/analytics": new TypeError("Failed to fetch"),
+      "/dashboard/decisions": new TypeError("Failed to fetch"),
+      "/dashboard/freshness": new TypeError("Failed to fetch"),
+      "/dashboard/asset-classes": new TypeError("Failed to fetch"),
+      "/readyz": new TypeError("Failed to fetch"),
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("QuantFlow")).toBeTruthy();
+    });
+    await waitFor(() => {
+      expect(screen.getAllByText(/temporarily unavailable/i).length).toBeGreaterThan(0);
+    });
+  });
+});
+
+describe("live state", () => {
+  const summary = {
+    generated_at: "2026-08-14T13:48:00+00:00",
+    session: { session_id: "demo-15m-20260813", status: "running", timeframe: "15m" },
+    status: { state: "TRADING", detail: "5 position(s) open on the venue" },
+    venue: {
+      venue: "bybit",
+      network: "demo",
+      account: {
+        trading_equity_usdt: "49899.34635401",
+        available_usdt: "37470.99081325",
+        total_portfolio_value_usdt: null,
+        unpriced_assets: [],
+        other_assets: [],
+      },
+      position_count: 5,
+      open_order_count: 10,
+      freshness: { available: true, stale: false, fetched_at: "2026-08-14T13:48:00+00:00" },
+    },
+    trading_performance: {
+      closed_trades: 70,
+      net_realized_pnl: "-64.805979060000",
+      gross_realized_pnl: "6.289550000000",
+      total_fees: "71.095529060000",
+      win_rate: "0.4",
+      profit_factor: "0.3743",
+    },
+    session_equity: { peak_equity: "49940.479558200000", current_drawdown_pct: "0.0009014" },
+    book_reconciliation: { venue_open_positions: 5, venue_open_orders: 10 },
+    risk: { kill_switch_engaged: false, trading_halted: false },
+    engine: { timeframe: "15m", pid: null, symbols: ["BTC/USDT"] },
+  };
+
+  it("shows the derived trading status prominently", async () => {
+    stubApi({ "/dashboard/summary": summary });
+    render(<App />);
+    await waitFor(() => {
+      // Twice by design: the headline tile above the fold, and the full state in the
+      // trading-status panel that explains it.
+      expect(screen.getAllByText("TRADING").length).toBeGreaterThanOrEqual(2);
+    });
+    expect(screen.getByText(/5 position\(s\) open on the venue/)).toBeTruthy();
+  });
+
+  it("labels a demo venue as virtual funds, never as real money", async () => {
+    stubApi({ "/dashboard/summary": summary });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/demo · virtual funds/i)).toBeTruthy();
+    });
+    expect(screen.queryByText(/REAL MONEY/)).toBeNull();
+  });
+
+  it("never renders the naive cross-asset total anywhere on the page", async () => {
+    stubApi({ "/dashboard/summary": summary });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("TRADING").length).toBeGreaterThan(0);
+    });
+    const body = document.body.textContent;
+    expect(body).not.toContain("99,904.01");
+    expect(body).not.toContain("99,901.35");
+  });
+
+  it("reports the engine PID as NOT RECORDED rather than inventing one", async () => {
+    stubApi({ "/dashboard/summary": summary });
+    render(<App />);
+    // Engine internals moved off the first screen: the operator opens Diagnostics for
+    // them, and the claim under test is that the panel still refuses to invent a pid.
+    await waitFor(() => {
+      expect(screen.getAllByText("TRADING").length).toBeGreaterThan(0);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Diagnostics" }));
+    await waitFor(() => {
+      expect(screen.getByText(/engine pid/i)).toBeTruthy();
+    });
+    expect(screen.getByText(/no pid file/i)).toBeTruthy();
+  });
+
+  it("surfaces a stale venue reading instead of presenting it as live", async () => {
+    stubApi({
+      "/dashboard/summary": {
+        ...summary,
+        venue: {
+          ...summary.venue,
+          freshness: {
+            available: true,
+            stale: true,
+            error: "timed out after 8s",
+            fetched_at: "2026-08-14T13:20:00+00:00",
+          },
+        },
+      },
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText(/STALE/i).length).toBeGreaterThan(0);
+    });
+  });
+
+  it("shows DISCONNECTED when the venue cannot be reached", async () => {
+    stubApi({
+      "/dashboard/summary": {
+        ...summary,
+        status: { state: "DISCONNECTED", detail: "the venue could not be reached" },
+        venue: { freshness: { available: false, stale: false, error: "connection refused" } },
+      },
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("DISCONNECTED").length).toBeGreaterThan(0);
+    });
+  });
+
+  it("polls without any user interaction", async () => {
+    stubApi({ "/dashboard/summary": summary });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("TRADING").length).toBeGreaterThan(0);
+    });
+    const calls = (globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+    expect(calls).toBeGreaterThan(1);
   });
 });

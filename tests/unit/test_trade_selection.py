@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from quantflow.orchestrator.scoring import SOLO_FAMILY_MIN_NET_EDGE
 from quantflow.orchestrator.selection import (
     MIN_INDEPENDENT_FAMILIES,
     MIN_SAMPLES_FOR_EXPECTANCY,
@@ -183,3 +184,47 @@ class TestConfluenceScalesWithThePool:
         verdict = assess_candidate(inputs(agreeing_families=1))
 
         assert not verdict.accepted
+
+
+class TestSoloFamilyConfluenceWaiver:
+    """One family may carry a trade, but only by paying for the missing corroboration."""
+
+    def test_a_strong_lone_family_is_accepted(self) -> None:
+        verdict = assess_candidate(inputs(agreeing_families=1, net_edge=SOLO_FAMILY_MIN_NET_EDGE))
+        assert verdict.accepted
+        assert any("confluence waived" in reason for reason in verdict.reasons)
+
+    def test_a_lone_family_just_below_the_bar_is_refused(self) -> None:
+        edge = SOLO_FAMILY_MIN_NET_EDGE - Decimal("0.0001")
+        verdict = assess_candidate(inputs(agreeing_families=1, net_edge=edge))
+        assert not verdict.accepted
+        assert any("does not reach" in reason for reason in verdict.reasons)
+
+    def test_an_unmeasured_edge_never_buys_a_waiver(self) -> None:
+        # An unknown edge is not a strong one. Waiving on None would turn the missing
+        # measurement into a free pass, which is the opposite of what this gate is for.
+        verdict = assess_candidate(inputs(agreeing_families=1, net_edge=None))
+        assert not verdict.accepted
+
+    def test_a_waived_candidate_scores_below_a_corroborated_one(self) -> None:
+        # It competes; it does not jump the queue. Two agreeing families must still win a
+        # tie against one, or the waiver would quietly prefer weaker evidence.
+        waived = assess_candidate(
+            inputs(agreeing_families=1, net_edge=SOLO_FAMILY_MIN_NET_EDGE * 2)
+        )
+        corroborated = assess_candidate(inputs(agreeing_families=2, net_edge=None))
+        assert waived.accepted
+        assert corroborated.accepted
+        assert waived.score < corroborated.score
+
+    def test_the_waiver_does_not_excuse_any_other_objection(self) -> None:
+        # Confluence is the only thing it forgives. A correlation breach still refuses.
+        verdict = assess_candidate(
+            inputs(
+                agreeing_families=1,
+                net_edge=SOLO_FAMILY_MIN_NET_EDGE * 4,
+                max_correlation=Decimal("0.99"),
+            )
+        )
+        assert not verdict.accepted
+        assert any("correlation" in reason for reason in verdict.reasons)

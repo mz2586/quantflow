@@ -1,15 +1,16 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "quantflow"
 version = "0.1.0"
-description = "AI-powered algorithmic trading platform for Binance"
+description = "Event-driven algorithmic trading platform for Bybit, with backtest, paper and demo trading"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-license = { text = "Proprietary" }
-authors = [{ name = "QuantFlow Engineering" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "The QuantFlow Authors" }]
 
 dependencies = [
   # --- Web / API ---
@@ -195,6 +196,11 @@ ignore_missing_imports = true
 module = "tests.*"
 disallow_untyped_defs = true
 disable_error_code = ["no-untyped-def"]
+# Off for tests only; `src` keeps it. A test that asserts a flag is false, performs the
+# action, then asserts it is now true reads as unreachable to mypy: the first assert
+# narrows the attribute and nothing in between visibly rewidens it. The pattern is the
+# point of the test, so the check is dropped here rather than the assertions weakened.
+warn_unreachable = false
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

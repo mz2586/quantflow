@@ -12,8 +12,11 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
-  # Never let a CI run touch a real venue.
+  # Never let a CI run touch a real venue. All three, belt and braces: the mode forbids
+  # order flow, the env pins a non-mainnet host, and no confirmation token is set, so an
+  # accidental `live` would refuse to start rather than trade.
   QF_ENV: test
+  QF_EXCHANGE__ENV: testnet
   QF_EXCHANGE__TESTNET: "true"
   QF_TRADING__MODE: backtest
 
@@ -146,3 +149,93 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Smoke test the image
         run: docker run --rm quantflow:ci python -c "import quantflow; print(quantflow.__version__)"
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret removed in the tip commit is still a leaked secret.
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  licence:
+    name: Licence headers present
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: LICENSE and NOTICE exist and name Apache-2.0
+        run: |
+          test -f LICENSE
+          test -f NOTICE
+          grep -q "Apache License" LICENSE
+          grep -q "Version 2.0" LICENSE
+          grep -q 'license = "Apache-2.0"' pyproject.toml
+
+  safety-defaults:
+    name: Safe defaults are still safe
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: pyproject.toml
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Install project
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }} .venv
+          uv pip install --python .venv/bin/python -e ".[dev,ai]"
+      - name: Defaults must be paper + non-mainnet + disarmed
+        # Runs with a clean environment so the CI-wide QF_* vars cannot mask a bad default.
+        run: |
+          env -u QF_ENV -u QF_EXCHANGE__ENV -u QF_EXCHANGE__TESTNET -u QF_TRADING__MODE \
+            .venv/bin/python - <<'EOF'
+          from quantflow.core.config import ExchangeSettings, Settings, TradingSettings
+
+          exchange, trading = ExchangeSettings(), TradingSettings()
+          assert not exchange.resolved_env.is_mainnet, exchange.resolved_env
+          assert trading.mode.value == "paper", trading.mode
+          assert not trading.is_live_armed
+          assert Settings.model_fields["api_host"].default == "127.0.0.1"
+          print("safe defaults OK:", exchange.resolved_env.value, trading.mode.value)
+          EOF
+
+      - name: .env.example must ship no filled-in credential
+        # Deliberately excludes QF_DATABASE__PASSWORD: that is a documented
+        # loopback-only local default, not a credential, and the file says so.
+        run: |
+          if grep -nE '^QF_[A-Z_]*(API_KEY|API_SECRET|BOT_TOKEN|SECRET_KEY)=.+' .env.example; then
+            echo "::error::.env.example contains a non-empty credential"
+            exit 1
+          fi
+          echo ".env.example carries placeholders only"
+
+      - name: Live trading must ship commented out
+        run: |
+          if grep -nE '^QF_TRADING__MODE=live' .env.example; then
+            echo "::error::.env.example ships with live mode enabled"
+            exit 1
+          fi
+          if grep -nE '^QF_TRADING__LIVE_CONFIRMATION=.+' .env.example; then
+            echo "::error::.env.example ships with the live confirmation token set"
+            exit 1
+          fi
+          grep -qE '^QF_TRADING__MODE=paper' .env.example
+          grep -qE '^QF_EXCHANGE__ENV=demo' .env.example
+          echo ".env.example ships paper + demo"
+
+      - name: No local filesystem paths in tracked files
+        run: |
+          if git grep -nE '/(Users|home)/[a-z][a-z0-9_-]+/' -- . ':!*.lock' ':!*package-lock.json'; then
+            echo "::error::a local filesystem path is committed"
+            exit 1
+          fi
+          echo "no local paths committed"

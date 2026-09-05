@@ -19,7 +19,7 @@ from decimal import Decimal
 from quantflow.exchange.bybit.mapping import parse_order
 
 
-def raw_order(stop_order_type: str | None) -> dict:
+def raw_order(stop_order_type: str | None) -> dict[str, object]:
     info: dict[str, object] = {}
     if stop_order_type is not None:
         info["stopOrderType"] = stop_order_type

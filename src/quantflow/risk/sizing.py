@@ -18,7 +18,7 @@ from decimal import Decimal
 from quantflow.core.config import RiskSettings
 from quantflow.core.errors import ValidationError
 from quantflow.core.logging import get_logger
-from quantflow.core.precision import ONE, ZERO, safe_divide
+from quantflow.core.precision import ONE, ZERO, quantize_up, safe_divide
 from quantflow.domain.instruments import Instrument
 
 logger = get_logger(__name__)
@@ -33,6 +33,14 @@ class SizingRequest:
     instrument: Instrument
     stop_loss_price: Decimal | None = None
     conviction: Decimal = ONE
+    #: Notional already committed on this symbol — open position plus resting entries.
+    #:
+    #: Subtracted from the position cap so a second leg is sized into the room that is
+    #: LEFT, not given the whole allowance again. Without this, pyramiding is impossible
+    #: rather than merely limited: leg one takes ~17.6% of a 20% cap, leg two is sized to
+    #: another ~17.6%, and the aggregate check refuses it every time. The ceiling does not
+    #: move; the legs share it.
+    committed_notional: Decimal = ZERO
     available_cash: Decimal | None = None
     volatility: Decimal | None = None
     """ATR in price units, for volatility-targeting sizers."""
@@ -97,28 +105,45 @@ class PositionSizer(ABC):
     def size(self, request: SizingRequest) -> SizingResult:
         """Compute a final, venue-legal, risk-capped quantity.
 
-        The pipeline is: raw size → conviction scaling → hard caps → venue lot rounding →
+        The pipeline is: raw size → hard caps → conviction scaling → venue lot rounding →
         minimum-viability check. Caps are applied *before* rounding so rounding can only
         ever reduce the position, never push it back over a limit.
+
+        Conviction attenuates *after* the caps, and the order matters. Scaling first made
+        conviction inert: the raw risk-based size is routinely two to three times
+        ``max_position_pct`` allows, so the clamp that followed discarded the scaling and
+        every tier landed on the identical capped quantity. Measured on the live account —
+        equity 49,608, cap 9,921 — WEAK and VERY_STRONG both produced 16.35 BNB. Because
+        conviction is a fraction in ``[0, 1]`` it can only ever reduce, so applying it last
+        preserves every cap invariant while letting the full range of the gradient reach the
+        order.
         """
         raw, method = self._raw_quantity(request)
         if raw <= ZERO:
             return SizingResult(ZERO, ZERO, ZERO, method, capped_by="non_positive_raw_size")
 
-        scaled = raw * request.conviction
-        capped, reason = self._apply_caps(scaled, request)
+        allowed, cap_reason = self._apply_caps(raw, request)
+        capped = allowed * request.conviction
+        # Conviction is the binding constraint only when it cut below what the caps allowed.
+        reason = "conviction" if capped < allowed else cap_reason
         instrument = request.instrument
         quantity = instrument.normalize_quantity(capped)
 
-        if quantity < instrument.min_quantity:
-            # Rounding down has taken the order under the venue's lot minimum. Rounding UP to
-            # that minimum is allowed only when the larger position still respects every
-            # hard cap - otherwise honouring the venue's floor would breach our own ceiling,
-            # which is not a trade worth making. Skipping is the correct outcome, and it is
-            # logged rather than silently dropped.
-            bumped = instrument.min_quantity
+        floor = self._venue_floor_quantity(instrument, request.price)
+        if quantity < floor:
+            # Rounding down has taken the order under the venue's smallest legal order.
+            # Rounding UP to it is allowed only when the larger position still respects
+            # every hard cap - otherwise honouring the venue's floor would breach our own
+            # ceiling, which is not a trade worth making. Skipping is the correct outcome,
+            # and it is logged rather than silently dropped.
+            bumped = floor
             bumped_notional = instrument.notional(bumped, request.price)
-            max_position_value = request.equity * self.settings.max_position_pct
+            # Net of what the symbol already holds, for the same reason _apply_caps is:
+            # otherwise the bump-to-venue-minimum path can round a leg UP past a cap the
+            # sizer had just correctly reduced it below.
+            max_position_value = (
+                request.equity * self.settings.max_position_pct - request.committed_notional
+            )
             if (
                 bumped_notional <= max_position_value
                 and bumped_notional <= self.settings.max_order_notional
@@ -208,21 +233,62 @@ class PositionSizer(ABC):
             capped_by=reason,
         )
 
+    @staticmethod
+    def _venue_floor_quantity(instrument: Instrument, price: Decimal) -> Decimal:
+        """The smallest step-aligned quantity the venue will actually accept at ``price``.
+
+        A venue states two independent floors and satisfying one does not satisfy the
+        other. Bybit's ``XAUUSDT`` has a minimum quantity of 0.001 and a minimum notional
+        of 5 USDT; with gold near 3,400 that smallest lot is worth 3.40, so the lot minimum
+        is *below* the notional minimum and an order sized to it is rejected. Bumping to
+        ``min_quantity`` alone therefore produced a quantity that passed the lot check and
+        then failed the notional check immediately afterwards, and the sizer returned zero
+        for a market it could have traded perfectly well at 0.002.
+
+        Taking the maximum of the two floors - with the notional-derived one rounded *up*
+        onto the lot grid, since rounding it down would land back under the minimum it was
+        computed to clear - yields the true smallest legal order. On instruments where the
+        lot minimum already dominates, which is most of them, this returns exactly
+        ``min_quantity`` and nothing changes.
+
+        The result is not asserted to be tradable: it is still checked against every
+        position and order cap by the caller, which may well refuse it.
+        """
+        step = instrument.quantity_step
+        floor = instrument.min_quantity
+        unit_value = price * instrument.contract_size
+        if unit_value > ZERO and instrument.min_notional > ZERO:
+            needed = quantize_up(instrument.min_notional / unit_value, step)
+            floor = max(floor, needed)
+        return floor
+
     def _apply_caps(self, quantity: Decimal, request: SizingRequest) -> tuple[Decimal, str | None]:
         """Clamp a quantity to every configured hard cap."""
         price = request.price
         candidates: list[tuple[Decimal, str]] = [(quantity, "")]
 
-        max_position_value = request.equity * self.settings.max_position_pct
+        max_position_value = (
+            request.equity * self.settings.max_position_pct - request.committed_notional
+        )
+        if max_position_value <= ZERO:
+            return ZERO, "max_position_pct"
         candidates.append((max_position_value / price, "max_position_pct"))
 
         candidates.append((self.settings.max_order_notional / price, "max_order_notional"))
 
+        # Leverage is capped by whichever of us and the venue permits less. The venue's
+        # ceiling genuinely varies by instrument - Bybit allows 100x on metals and crypto,
+        # 50x on large-cap single names and 25x on the quieter index ETFs - so a configured
+        # limit that happens to exceed it would size an order the venue rejects outright.
+        # In practice the configured limit is the tighter of the two and this changes
+        # nothing; it exists so that stops being true loudly rather than at the exchange.
+        leverage = min(self.settings.max_leverage, request.instrument.max_leverage)
+
         # Cash is the binding constraint on spot: you cannot buy what you cannot pay for.
-        if self.settings.max_leverage <= ONE:
+        if leverage <= ONE:
             candidates.append((request.cash / price, "available_cash"))
         else:
-            candidates.append(((request.cash * self.settings.max_leverage) / price, "max_leverage"))
+            candidates.append(((request.cash * leverage) / price, "max_leverage"))
 
         if request.instrument.max_quantity is not None:
             candidates.append((request.instrument.max_quantity, "venue_max_quantity"))

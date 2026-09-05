@@ -8,7 +8,7 @@ from decimal import Decimal
 import pytest
 
 from quantflow.core.errors import ValidationError
-from quantflow.domain.enums import MarketRegime, SignalDirection
+from quantflow.domain.enums import MarketRegime, PositionSide, SignalDirection
 from quantflow.domain.instruments import Symbol
 from quantflow.domain.positions import ClosedTrade
 from quantflow.domain.signals import Signal
@@ -298,13 +298,89 @@ class TestOpenPositionOwnership:
         orchestrator.evaluate(make_context(SYMBOL, [100] * 30, position=open_long(SYMBOL)))
         assert SYMBOL not in orchestrator.owners
 
+
+class TestOwnershipFollowsTheVenue:
+    """The venue decides what is open. Ownership must follow it, not the other way round.
+
+    Ownership was released in exactly one place: the owning member returning ``CLOSE`` on a
+    bar where the engine still saw a position. Every other way a position ends — a venue
+    stop, a take-profit, an intrabar exit, a manual close, a liquidation — left the symbol
+    owned forever.
+
+    An owned symbol counts as an open position in the duplicate guard, so the effect was
+    total: on 2026-08-14 the live engine declined 52 of 52 candidates citing correlation
+    with open positions while the venue held **zero**. Nothing could ever be entered again.
+    """
+
+    def test_ownership_is_released_when_the_venue_no_longer_holds_the_position(self) -> None:
+        orchestrator = StrategyOrchestrator(members=[StubStrategy("owner", entry("owner"))])
+        orchestrator.adopt(SYMBOL, "owner")
+        assert orchestrator.owners[SYMBOL] == "owner"
+
+        released = orchestrator.sync_owners(())
+
+        assert released == (SYMBOL,)
+        assert orchestrator.owners == {}
+
+    def test_a_symbol_the_venue_still_holds_keeps_its_owner(self) -> None:
+        orchestrator = StrategyOrchestrator(members=[StubStrategy("owner", entry("owner"))])
+        orchestrator.adopt(SYMBOL, "owner")
+
+        released = orchestrator.sync_owners([SYMBOL])
+
+        assert released == ()
+        assert orchestrator.owners[SYMBOL] == "owner"
+
+    def test_syncing_does_not_invent_ownership_for_an_unowned_venue_position(self) -> None:
+        # An adopted position needs a strategy to manage it, and this function has no way
+        # to know which. Claiming one would hand the position to an arbitrary member.
+        orchestrator = StrategyOrchestrator(members=[StubStrategy("owner", entry("owner"))])
+
+        orchestrator.sync_owners([SYMBOL])
+
+        assert SYMBOL not in orchestrator.owners
+
+    def test_a_released_symbol_can_be_entered_again(self) -> None:
+        # The point of the fix: after release the duplicate guard must stop firing.
+        orchestrator = StrategyOrchestrator(members=[StubStrategy("owner", entry("owner"))])
+        orchestrator.adopt(SYMBOL, "owner")
+        orchestrator.sync_owners(())
+
+        signal = orchestrator.evaluate(make_context(SYMBOL, [100] * 30))
+
+        assert signal.is_actionable
+        assert orchestrator.owners[SYMBOL] == "owner"
+
+    def test_a_closed_round_trip_releases_its_symbol(self) -> None:
+        # The local signal, ahead of the next venue read: a completed round-trip is proof
+        # the position is gone, so ownership should not survive until the next sync.
+        orchestrator = StrategyOrchestrator(members=[StubStrategy("owner", entry("owner"))])
+        orchestrator.adopt(SYMBOL, "owner")
+
+        orchestrator.on_trade_closed(
+            ClosedTrade(
+                symbol=SYMBOL,
+                side=PositionSide.LONG,
+                quantity=Decimal("1"),
+                entry_price=Decimal("100"),
+                exit_price=Decimal("101"),
+                entry_time=REFERENCE_TIME,
+                exit_time=REFERENCE_TIME,
+                gross_pnl=Decimal("1"),
+                fees=Decimal("0"),
+                strategy_id="owner",
+            )
+        )
+
+        assert SYMBOL not in orchestrator.owners
+
     def test_record_trade_accumulates_per_strategy(self) -> None:
         orchestrator = StrategyOrchestrator(members=[StubStrategy("a")])
         for pnl in ("5", "-2", "3"):
             orchestrator.record_trade(
                 ClosedTrade(
                     symbol=SYMBOL,
-                    side="long",
+                    side=PositionSide.LONG,
                     quantity=Decimal("1"),
                     entry_price=Decimal("100"),
                     exit_price=Decimal("101"),

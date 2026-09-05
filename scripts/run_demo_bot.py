@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,12 @@ from quantflow.domain.instruments import Symbol
 from quantflow.exchange.bybit.rest import BybitGateway
 from quantflow.live.equity import resolve_starting_equity
 from quantflow.live.runner import RunnerConfig, check_live_arming, run_session
+from quantflow.universe.assets import (
+    AssetClass,
+    AssetEligibilityInputs,
+    discover_asset_universe,
+)
+from quantflow.universe.assets import assess_eligibility as assess_asset_eligibility
 from quantflow.universe.meme import (
     DEFAULT_ELIGIBILITY_LIMITS,
     EligibilityInputs,
@@ -163,6 +170,198 @@ async def eligible_meme_symbols(gateway: BybitGateway, logger: Any) -> list[Symb
     return chosen
 
 
+#: Env flags that admit a non-crypto asset class into the traded set, one per class.
+#:
+#: Separate flags rather than one list so a class can be turned off on its own at 3am
+#: without editing a comma-separated string and risking the others. Every one defaults to
+#: off: a class trades because someone enabled it, never because a deploy shipped it.
+ASSET_CLASS_FLAGS: dict[str, AssetClass] = {
+    "QF_BOT_METALS": AssetClass.METAL,
+    "QF_BOT_ENERGY": AssetClass.ENERGY,
+    "QF_BOT_EQUITIES": AssetClass.EQUITY,
+    "QF_BOT_INDICES": AssetClass.INDEX,
+}
+
+#: How many markets each enabled class may contribute.
+#:
+#: Two. Every symbol is another websocket stream to keep alive and another candidate field
+#: to evaluate every bar, and the four classes together would otherwise add however many
+#: of the venue's 193 equities happened to clear the filter that morning. Ranked by 24h
+#: turnover, so the two that survive are the two most liquid — which for a class whose
+#: whole risk is thin books is the right axis to rank on.
+MAX_SYMBOLS_PER_CLASS = int(os.environ.get("QF_BOT_MAX_PER_CLASS", "2"))
+
+
+async def eligible_class_symbols(
+    gateway: BybitGateway,
+    logger: Any,
+    classes: list[AssetClass],
+    timeframe: Timeframe,
+) -> list[Symbol]:
+    """Markets from the requested asset classes that pass eligibility now, per class.
+
+    Measured, not assumed, exactly as :func:`eligible_meme_symbols` is: every input comes
+    from live venue metadata, a live quote or a freshly fetched bar, and a market that
+    cannot be measured is skipped rather than admitted on the assumption that missing data
+    is fine.
+
+    Two differences from the meme scan, both forced by the size of the universe. The venue
+    lists 193 equities against 30 curated meme roots, so 24h turnover is read once in bulk
+    and used to rank *before* any per-symbol request is made — only the top few per class
+    are then measured in detail. And the eligibility band is the one for the market's own
+    class, since the meme thresholds would reject gold, crude and the S&P alike.
+    """
+    turnover = await gateway.fetch_quote_turnover_24h()
+    markets = discover_asset_universe(gateway.instruments.all().values(), classes=classes)
+    if not markets:
+        return []
+
+    chosen: list[Symbol] = []
+    for asset_class in classes:
+        # Rank first, measure second. A market with no reported turnover sorts last rather
+        # than being dropped outright, so a class whose turnover feed is unavailable still
+        # gets assessed on its bars instead of silently vanishing.
+        ranked = sorted(
+            (market for market in markets if market.asset_class is asset_class),
+            key=lambda market: turnover.get(market.symbol, Decimal("0")),
+            reverse=True,
+        )
+        # Measure a few more than the cap so that a rejection near the top does not leave
+        # the class short when a perfectly good market sat just below the cut.
+        eligible: list[Symbol] = []
+        for market in ranked[: MAX_SYMBOLS_PER_CLASS * 3]:
+            quote_volume_24h = turnover.get(market.symbol, Decimal("0"))
+            try:
+                ticker = await gateway.fetch_ticker(market.symbol)
+                bars = await gateway.fetch_candles(market.symbol, timeframe, limit=40)
+            except Exception as exc:
+                logger.info(
+                    "asset.skipped",
+                    symbol=str(market.symbol),
+                    asset_class=market.asset_class.value,
+                    error=str(exc)[:120],
+                )
+                continue
+            if len(bars) < MIN_BARS_TO_ASSESS or ticker.bid <= 0 or ticker.ask <= 0:
+                continue
+
+            ranges = [bar.high - bar.low for bar in bars[:-1]]
+            typical = sum(ranges, Decimal("0")) / Decimal(len(ranges))
+            last = bars[-1]
+            reference = last.close or ticker.last
+            volatility = (typical / reference) if reference else Decimal("0")
+            last_return = (last.close - last.open) / last.open if last.open else Decimal("0")
+            bar_quote_volume = last.volume * reference
+            # The same nominal probe size the meme scan uses: the smallest slice the sizer
+            # would realistically ask for. Filtering on a size we would never send would
+            # answer a question nobody asked.
+            intended_price = ticker.ask
+            intended_quantity = (
+                (Decimal("500") / intended_price) if intended_price else Decimal("0")
+            )
+            # Bars arrive closed, so the newest one opened a full timeframe ago and the
+            # feed is at least that far behind. Claiming a one-minute age here, as the meme
+            # scan does, would understate staleness by a whole bar on the class where
+            # staleness is the point — an equity perpetual quoting through a closed cash
+            # session is exactly what the freshness check exists to catch.
+            candle_age = datetime.now(UTC) - last.open_time
+            verdict = assess_asset_eligibility(
+                AssetEligibilityInputs(
+                    market=market,
+                    quote_volume_24h=quote_volume_24h,
+                    bid=ticker.bid,
+                    ask=ticker.ask,
+                    ticker_age=timedelta(seconds=0),
+                    candle_age=candle_age,
+                    volatility=volatility,
+                    last_bar_range=last.high - last.low,
+                    typical_bar_range=typical,
+                    last_bar_return=last_return,
+                    bar_quote_volume=bar_quote_volume,
+                    intended_quantity=intended_quantity,
+                    intended_price=intended_price,
+                    stop_distance=typical,
+                )
+            )
+            if verdict.eligible:
+                eligible.append(market.symbol)
+                if len(eligible) >= MAX_SYMBOLS_PER_CLASS:
+                    break
+            else:
+                logger.info(
+                    "asset.rejected",
+                    symbol=str(market.symbol),
+                    asset_class=market.asset_class.value,
+                    turnover_24h=str(quote_volume_24h),
+                    reasons="; ".join(verdict.reasons)[:300],
+                )
+
+        logger.critical(
+            "asset.class_selected",
+            asset_class=asset_class.value,
+            discovered=sum(1 for m in markets if m.asset_class is asset_class),
+            enabled=[str(s) for s in eligible],
+        )
+        chosen.extend(eligible)
+
+    return chosen
+
+
+async def enabled_class_symbols(settings: Any, logger: Any, timeframe: Timeframe) -> list[Symbol]:
+    """Scan whichever non-crypto classes the environment has switched on.
+
+    Metals, energy, equities and indices join the SAME traded set on the SAME terms as the
+    memes: one orchestrator, one gate, one risk engine, no reserved capital and no relaxed
+    thresholds. They are ordinary USDT linear perpetuals — all that differs is which
+    eligibility band and which strategy families apply to them.
+
+    A scan that fails returns nothing rather than propagating. The non-crypto classes are
+    an addition to a book that trades perfectly well without them, so a venue hiccup during
+    the startup scan must cost the session those symbols, not the session itself.
+    """
+    enabled = [
+        asset_class
+        for flag, asset_class in ASSET_CLASS_FLAGS.items()
+        if os.environ.get(flag, "false").strip().lower() == "true"
+    ]
+    if not enabled:
+        return []
+
+    gateway = BybitGateway(settings.exchange)
+    try:
+        await gateway.load_instruments()
+        return await eligible_class_symbols(gateway, logger, enabled, timeframe)
+    except Exception as exc:
+        logger.warning("asset.scan_failed", error=str(exc)[:200])
+        return []
+    finally:
+        await gateway.aclose()
+
+
+def _entry_universe() -> tuple[Symbol, ...] | None:
+    """Symbols permitted to OPEN new positions, from ``QF_BOT_ENTRY_SYMBOLS``.
+
+    Three states, and the difference between two of them is load-bearing:
+
+    * unset — every traded symbol may open;
+    * ``none`` / ``paused`` / ``off`` — NEW ENTRIES ARE PAUSED;
+    * a list — only those symbols may open.
+
+    An empty value cannot mean "paused", because unset already means the opposite. Making a
+    missing variable silently halt trading would be the worst possible default.
+
+    A pause is not a stop. Exits are never gated by the entry universe, so open positions
+    keep their stops, targets, trailing and reconciliation, and the engine goes on
+    evaluating both symbols and recording what it would have done.
+    """
+    raw = os.environ.get("QF_BOT_ENTRY_SYMBOLS", "").strip()
+    if raw.lower() in {"none", "paused", "off"}:
+        return ()
+    if raw:
+        return tuple(Symbol.parse(item.strip()) for item in raw.split(",") if item.strip())
+    return None
+
+
 async def main() -> int:
     refuse_mainnet()
 
@@ -208,11 +407,19 @@ async def main() -> int:
         finally:
             await meme_gateway.aclose()
 
+    symbols = symbols + tuple(await enabled_class_symbols(settings, logger, timeframe))
+
     # Size against the capital that is actually there. A hardcoded 10,000 against a ~100k
     # account meant a "2% position" was 0.2% of the book: the limits were honoured, but
     # against a number unrelated to the account.
     configured_equity = Decimal(os.environ.get("QF_BOT_EQUITY", "10000"))
-    starting_equity = configured_equity
+    # An explicit ceiling on the capital this session may use. The demo wallet holds far
+    # more; scoping the run to a fixed allocation is what makes every percentage limit mean
+    # a percentage of the book being traded rather than of the whole wallet. Unset means no
+    # cap, which is the previous behaviour.
+    raw_allocation = os.environ.get("QF_BOT_ALLOCATION", "").strip()
+    allocation = Decimal(raw_allocation) if raw_allocation else None
+    starting_equity = min(configured_equity, allocation) if allocation else configured_equity
     # Tracked separately from the value: a venue read that fails, or an account with no
     # quote balance, leaves `starting_equity` at the configured constant, and a constant
     # must never be treated as the truth about the account.
@@ -225,6 +432,7 @@ async def main() -> int:
                 balances,
                 configured=configured_equity,
                 quote=settings.trading.base_currency,
+                allocation=allocation,
             )
             quote_balance = balances.get(settings.trading.base_currency)
             equity_is_authoritative = (
@@ -235,9 +443,24 @@ async def main() -> int:
         finally:
             await gateway.aclose()
 
+    # New entries may be restricted to a subset of what is traded. Everything stays
+    # subscribed and managed — a symbol holding a position needs its marks, its intrabar
+    # stop management and its reconciliation — and this narrows only what may be OPENED.
+    entry_symbols = _entry_universe()
+    if entry_symbols is not None:
+        logger.critical(
+            "demo_bot.entry_universe",
+            entry_symbols=[str(item) for item in entry_symbols],
+            subscribed=[str(item) for item in symbols],
+            disabled_for_entry=[str(item) for item in symbols if item not in set(entry_symbols)],
+            note="disabled symbols keep their stops, targets and reconciliation",
+        )
+
     config = RunnerConfig(
         strategy_id=os.environ.get("QF_BOT_STRATEGY", "orchestrator"),
         symbols=symbols,
+        entry_symbols=entry_symbols,
+        allocation=allocation,
         timeframe=timeframe,
         mode=TradingMode.LIVE,
         starting_equity=starting_equity,
@@ -250,6 +473,7 @@ async def main() -> int:
 
     logger.critical(
         "demo_bot.starting",
+        allocation=str(allocation) if allocation else None,
         env=settings.exchange.resolved_env.value,
         mode=config.mode.value,
         strategy=config.strategy_id,

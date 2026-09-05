@@ -25,6 +25,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
 from quantflow.core.config import ExchangeEnv, ExchangeSettings, MarketType, RiskSettings
 from quantflow.core.errors import ValidationError
@@ -436,8 +437,8 @@ class TestRefusalsRemainHonest:
     ) -> None:
         """The exact defect: one symbol, four venue markets, only one of them tradable."""
         settings = ExchangeSettings(
-            api_key="demo-key",
-            api_secret="demo-secret",
+            api_key=SecretStr("demo-key"),
+            api_secret=SecretStr("demo-secret"),
             env=ExchangeEnv.DEMO,
             market_type=MarketType.FUTURE,
         )

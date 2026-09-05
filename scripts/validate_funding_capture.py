@@ -37,7 +37,8 @@ from quantflow.neutral.funding_capture import (
     simulate_funding_capture,
 )
 
-REPO = Path("/Users/muhammadzohaib/quantflow")
+#: Repo root, derived from this file's location so the script works from any checkout.
+REPO = Path(__file__).resolve().parent.parent
 FUNDING_CACHE = REPO / "scratchpad" / "funding-cache.json"
 OUT = REPO / "reports" / "funding-capture-validation.json"
 

@@ -385,9 +385,20 @@ class TestBalance:
     def test_total(self) -> None:
         assert Balance(asset="USDT", free=Decimal("10"), locked=Decimal("5")).total == Decimal("15")
 
-    def test_rejects_negative(self) -> None:
-        with pytest.raises(ValidationError, match="negative balance"):
-            Balance(asset="USDT", free=Decimal("-1"))
+    def test_allows_negative_free_for_cross_margin(self) -> None:
+        # On a cross-margin Unified account the venue allocates margin across every
+        # collateral asset, so one asset's margin can exceed its own equity while the
+        # account is healthy. Rejecting it took out the entire venue read and left the
+        # dashboard serving a seven-hour-old wallet and position snapshot.
+        balance = Balance(asset="USDT", free=Decimal("-2951.95"), locked=Decimal("0"))
+        assert balance.free == Decimal("-2951.95")
+        assert balance.total == Decimal("-2951.95")
+
+    def test_still_rejects_negative_locked(self) -> None:
+        # Locked is a quantity held against open orders. Negative has no meaning in any
+        # margin mode, so this stays a hard error.
+        with pytest.raises(ValidationError, match="negative locked balance"):
+            Balance(asset="USDT", free=Decimal("10"), locked=Decimal("-1"))
 
 
 class TestEquityCurve:

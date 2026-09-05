@@ -17,9 +17,13 @@ logger = get_logger(__name__)
 
 
 def resolve_starting_equity(
-    balances: dict[str, Balance], *, configured: Decimal, quote: str
+    balances: dict[str, Balance],
+    *,
+    configured: Decimal,
+    quote: str,
+    allocation: Decimal | None = None,
 ) -> Decimal:
-    """The quote-currency capital actually available, or ``configured`` if unknown.
+    """The quote-currency capital this session may size against.
 
     Free plus locked: margin held against an open position is still this account's money,
     and excluding it would shrink apparent equity every time a position was opened.
@@ -31,6 +35,18 @@ def resolve_starting_equity(
     Falls back rather than guessing. An unreadable or empty balance yields the configured
     figure: sizing off capital the account does not have is the failure that matters, and
     it is worse than sizing off too little.
+
+    Args:
+        balances: Venue balances by asset.
+        configured: The fallback figure when the venue cannot be read.
+        quote: The quote currency the book is denominated in.
+        allocation: An upper bound on the capital this session may use. The wallet may hold
+            more; the session is scoped to this. Applied last, and to the fallback as well
+            as to the venue reading — an unreadable venue must not become the one moment
+            the cap stops applying. Never raises equity above what the account holds:
+            allocating capital that is not there would size positions against margin that
+            cannot be posted.
+
     """
     balance = balances.get(quote)
     available = (balance.free + balance.locked) if balance is not None else ZERO
@@ -42,7 +58,7 @@ def resolve_starting_equity(
             configured=str(configured),
             reason="no positive quote balance; falling back to the configured equity",
         )
-        return configured
+        return min(configured, allocation) if allocation is not None else configured
 
     logger.info(
         "equity.resolved_from_venue",
@@ -50,7 +66,22 @@ def resolve_starting_equity(
         venue_balance=str(available),
         configured=str(configured),
     )
-    return available
+    if allocation is None:
+        return available
+
+    capped = min(available, allocation)
+    logger.critical(
+        "equity.allocation_applied",
+        quote=quote,
+        venue_balance=str(available),
+        allocation=str(allocation),
+        session_equity=str(capped),
+        note=(
+            "the session sizes and risk-limits against this figure, not the wallet; "
+            "no funds were moved"
+        ),
+    )
+    return capped
 
 
 __all__ = ["resolve_starting_equity"]

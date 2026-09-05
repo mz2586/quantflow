@@ -406,9 +406,9 @@ class TestNoLookAhead:
 
         for cut in cuts[::7]:
             fresh = factory()
-            assert fingerprint(fresh.evaluate(context_from(bars[:cut]))) == reference[cut], (
-                f"{walked.strategy_id} decided differently at bar {cut - 1}"
-            )
+            assert (
+                fingerprint(fresh.evaluate(context_from(bars[:cut]))) == reference[cut]
+            ), f"{walked.strategy_id} decided differently at bar {cut - 1}"
 
 
 class TestDegenerateInput:
